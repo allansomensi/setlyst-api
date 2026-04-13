@@ -1,6 +1,7 @@
 pub mod artist;
 pub mod auth;
 pub mod migrations;
+pub mod song;
 pub mod status;
 pub mod swagger;
 pub mod user;
@@ -16,6 +17,7 @@ pub fn create_routes(state: Arc<AppState>) -> Router {
             Router::new()
                 .nest("/users", user::create_routes(state.clone()))
                 .nest("/artists", artist::create_routes(state.clone()))
+                .nest("/songs", song::create_routes(state.clone()))
                 .layer(middleware::from_fn_with_state(state.clone(), authenticate))
                 .nest("/auth", auth::create_routes(state.clone()))
                 .nest("/status", status::create_routes(state.clone()))

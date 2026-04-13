@@ -1,6 +1,6 @@
 use crate::{
-    controllers::{artist, auth, migrations, status, user},
-    models::{artist::Artist, status::Status, user::User},
+    controllers::{artist, auth, migrations, song, status, user},
+    models::{artist::Artist, song::Song, status::Status, user::User},
 };
 use serde::Serialize;
 use utoipa::{
@@ -50,9 +50,17 @@ use utoipa::{
         artist::create_artist,
         artist::update_artist,
         artist::delete_artist,
+
+        // Songs
+        song::count_songs,
+        song::find_song_by_id,
+        song::find_all_songs,
+        song::create_song,
+        song::update_song,
+        song::delete_song,
     ),
     components(
-        schemas(Status, User, Artist)
+        schemas(Status, User, Artist, Song)
     ),
     tags(
         (name = "Status", description = "Status endpoints"),
@@ -60,6 +68,7 @@ use utoipa::{
         (name = "Auth", description = "Auth endpoints"),
         (name = "Users", description = "Users endpoints"),
         (name = "Artists", description = "Artists endpoints"),
+        (name = "Songs", description = "Songs endpoints"),
     )
 )]
 pub struct ApiDoc;

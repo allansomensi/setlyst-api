@@ -1,5 +1,6 @@
 pub mod artist;
 pub mod auth;
+pub mod song;
 pub mod status;
 pub mod user;
 
