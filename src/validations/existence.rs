@@ -17,3 +17,19 @@ pub async fn user_exists(state: &AppState, user_id: Uuid) -> Result<(), ApiError
         Ok(())
     }
 }
+
+/// Checks if the artist is already registered according to his ID.
+pub async fn artist_exists(state: &AppState, id: Uuid) -> Result<(), ApiError> {
+    let exists = sqlx::query("SELECT id FROM artists WHERE id = $1;")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .is_some();
+
+    if !exists {
+        error!("Artist ID not found.");
+        Err(ApiError::NotFound)
+    } else {
+        Ok(())
+    }
+}

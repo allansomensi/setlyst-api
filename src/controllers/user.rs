@@ -2,16 +2,16 @@ use crate::database::AppState;
 use crate::models::auth::access::AccessControl;
 use crate::models::user::{Role, UserPublic};
 use crate::models::{
-    user::{CreateUserPayload, UpdateUserPayload},
     DeletePayload,
+    user::{CreateUserPayload, UpdateUserPayload},
 };
 use crate::validations::{existence::user_exists, uniqueness::is_user_unique};
 use crate::{errors::api_error::ApiError, models::user::User};
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
 };
 use std::sync::Arc;
 use tracing::{debug, error, info};
