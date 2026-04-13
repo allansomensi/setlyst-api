@@ -1,0 +1,35 @@
+[package]
+name = "setlyst-api"
+version = "0.1.0"
+edition = "2024"
+default-run = "setlyst-api"
+
+[[bin]]
+name = "create_superuser"
+path = "src/bin/create_superuser.rs"
+
+[dependencies]
+argon2 = { version = "0.5", features = ["std"] }
+async-trait = "0.1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+dotenvy = "0.15"
+serde = { version = "1", features = ["derive"] }
+sqlx = { version = "0.8", features = [
+    "chrono",
+    "postgres",
+    "runtime-tokio-native-tls",
+    "uuid",
+] }
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+thiserror = "2"
+tokio = { version = "1.45", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+utoipa = { version = "5.3", features = ["chrono", "uuid"] }
+utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
+uuid = { version = "1.17", features = ["serde", "v4", "v7"] }
+validator = { version = "0.20", features = ["derive"] }
