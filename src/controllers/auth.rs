@@ -2,7 +2,7 @@ use crate::{
     database::AppState,
     errors::api_error::ApiError,
     models::{
-        auth::{token::VerifyTokenPayload, LoginPayload},
+        auth::{LoginPayload, token::VerifyTokenPayload},
         user::{CreateUserPayload, RegisterPayload, Role, Status, User},
     },
     utils::{
@@ -11,7 +11,7 @@ use crate::{
     },
     validations::uniqueness::is_user_unique,
 };
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use std::sync::Arc;
 use tracing::{debug, error, info};
 use validator::Validate;
@@ -34,31 +34,20 @@ pub async fn login(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<LoginPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_status: Option<Status> =
-        sqlx::query_scalar(r#"SELECT status FROM users WHERE username = $1;"#)
+    let user_data: Option<(Status, String, Role)> =
+        sqlx::query_as(r#"SELECT status, password_hash, role FROM users WHERE username = $1;"#)
             .bind(&payload.username)
             .fetch_optional(&state.db)
             .await?;
 
-    let user_status = match user_status {
-        Some(status) => status,
+    let (user_status, password_hash, user_role) = match user_data {
+        Some(data) => data,
         None => return Err(ApiError::NotFound),
     };
 
     if user_status != Status::Active {
         return Err(ApiError::Unauthorized);
     }
-
-    let password_hash: Option<String> =
-        sqlx::query_scalar(r#"SELECT password_hash FROM users WHERE username = $1;"#)
-            .bind(&payload.username)
-            .fetch_optional(&state.db)
-            .await?;
-
-    let password_hash = match password_hash {
-        Some(hash) => hash,
-        None => return Err(ApiError::NotFound),
-    };
 
     let is_password_correct = verify_password(&payload.password, &password_hash)?;
 
@@ -67,19 +56,7 @@ pub async fn login(
         return Err(ApiError::Unauthorized);
     }
 
-    let user_role: Option<Role> =
-        sqlx::query_scalar(r#"SELECT role FROM users WHERE username = $1;"#)
-            .bind(&payload.username)
-            .fetch_optional(&state.db)
-            .await?;
-
-    let user_role = match user_role {
-        Some(role) => role,
-        None => return Err(ApiError::NotFound),
-    };
-    let user_role = user_role.to_string();
-
-    let token = generate_jwt(&payload.username, &user_role)?;
+    let token = generate_jwt(&payload.username, &user_role.to_string())?;
 
     info!("Login successful for user: {}", payload.username);
 

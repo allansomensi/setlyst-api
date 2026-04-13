@@ -8,6 +8,7 @@ use crate::{
     },
 };
 use chrono::Utc;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[async_trait::async_trait]
@@ -42,25 +43,54 @@ impl SetlistRepository for SetlistRepositoryImpl {
         .fetch_all(&state.db)
         .await?;
 
-        let mut result = Vec::new();
-        for s in setlists {
-            let songs = sqlx::query_as::<_, SongPublic>(
-                "SELECT s.* FROM songs s JOIN setlist_songs ss ON s.id = ss.song_id WHERE ss.setlist_id = $1 ORDER BY ss.position",
-            )
-            .bind(s.id)
-            .fetch_all(&state.db)
-            .await?;
-
-            result.push(SetlistPublic {
-                id: s.id,
-                title: s.title,
-                description: s.description,
-                user_id: s.user_id,
-                songs,
-                created_at: s.created_at,
-                updated_at: s.updated_at,
-            });
+        if setlists.is_empty() {
+            return Ok(Vec::new());
         }
+
+        let setlist_ids: Vec<Uuid> = setlists.iter().map(|s| s.id).collect();
+
+        #[derive(sqlx::FromRow)]
+        struct SongWithSetlist {
+            setlist_id: Uuid,
+            #[sqlx(flatten)]
+            song: SongPublic,
+        }
+
+        let songs_with_setlists = sqlx::query_as::<_, SongWithSetlist>(
+            "SELECT ss.setlist_id, s.id, s.title, s.artist_id, s.user_id, s.created_at, s.updated_at 
+             FROM songs s 
+             JOIN setlist_songs ss ON s.id = ss.song_id 
+             WHERE ss.setlist_id = ANY($1) 
+             ORDER BY ss.position"
+        )
+        .bind(&setlist_ids)
+        .fetch_all(&state.db)
+        .await?;
+
+        let mut songs_map: HashMap<Uuid, Vec<SongPublic>> = HashMap::new();
+        for item in songs_with_setlists {
+            songs_map
+                .entry(item.setlist_id)
+                .or_default()
+                .push(item.song);
+        }
+
+        let result = setlists
+            .into_iter()
+            .map(|s| {
+                let songs = songs_map.remove(&s.id).unwrap_or_default();
+                SetlistPublic {
+                    id: s.id,
+                    title: s.title,
+                    description: s.description,
+                    user_id: s.user_id,
+                    songs,
+                    created_at: s.created_at,
+                    updated_at: s.updated_at,
+                }
+            })
+            .collect();
+
         Ok(result)
     }
 

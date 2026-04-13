@@ -28,9 +28,13 @@ pub async fn authenticate(
 
     let mut header = auth_header?.split_whitespace();
 
-    let (_bearer, token) = (header.next(), header.next());
+    let _bearer = header.next();
 
-    let token_data = match decode_jwt(token.expect("Error reading token").to_string()) {
+    let token = header
+        .next()
+        .ok_or(ApiError::from(AuthError::MissingToken))?;
+
+    let token_data = match decode_jwt(token.to_string()) {
         Ok(data) => data,
         Err(_) => return Err(ApiError::from(AuthError::InvalidToken)),
     };
