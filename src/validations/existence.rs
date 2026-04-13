@@ -49,3 +49,19 @@ pub async fn song_exists(state: &AppState, id: Uuid) -> Result<(), ApiError> {
         Ok(())
     }
 }
+
+/// Checks if the setlist is already registered according to his ID.
+pub async fn setlist_exists(state: &AppState, id: Uuid) -> Result<(), ApiError> {
+    let exists = sqlx::query(r#"SELECT id FROM setlists WHERE id = $1;"#)
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .is_some();
+
+    if !exists {
+        tracing::error!("Setlist ID not found.");
+        Err(ApiError::NotFound)
+    } else {
+        Ok(())
+    }
+}
