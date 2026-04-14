@@ -1,5 +1,5 @@
 use crate::{controllers::auth, database::AppState};
-use axum::{routing::post, Router};
+use axum::{Router, routing::post};
 use std::sync::Arc;
 
 pub fn create_routes(state: Arc<AppState>) -> Router {

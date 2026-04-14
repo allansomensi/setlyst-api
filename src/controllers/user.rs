@@ -52,7 +52,7 @@ pub async fn count_users(
         }
         Err(e) => {
             error!("Failed to retrieve user count: {e}");
-            Err(ApiError::from(e))
+            Err(e)
         }
     }
 }
@@ -92,7 +92,7 @@ pub async fn find_all_users(
         }
         Err(e) => {
             error!("Error retrieving all users: {e}");
-            Err(ApiError::from(e))
+            Err(e)
         }
     }
 }
@@ -140,7 +140,7 @@ pub async fn find_user_by_id(
         }
         Err(e) => {
             error!("Error retrieving user with id {id}: {e}");
-            Err(ApiError::from(e))
+            Err(e)
         }
     }
 }
@@ -194,7 +194,7 @@ pub async fn create_user(
                 "Error creating user with username {}: {e}",
                 payload.username
             );
-            Err(ApiError::from(e))
+            Err(e)
         }
     }
 }
@@ -245,7 +245,7 @@ pub async fn update_user(
         }
         Err(e) => {
             error!("Error updating user with ID {}: {e}", payload.id);
-            Err(ApiError::from(e))
+            Err(e)
         }
     }
 }
@@ -291,7 +291,7 @@ pub async fn delete_user(
         }
         Err(e) => {
             error!("Error deleting user with ID {}: {e}", payload.id);
-            Err(ApiError::from(e))
+            Err(e)
         }
     }
 }

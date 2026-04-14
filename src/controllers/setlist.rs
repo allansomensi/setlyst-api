@@ -80,7 +80,8 @@ pub async fn create_setlist(
     }
 
     let user_id = access.user().id;
-    let id = SetlistRepositoryImpl::create(&state, &payload, user_id).await?;
+    let setlist = SetlistRepositoryImpl::create(&state, &payload, user_id).await?;
+    let id = setlist.id;
 
     tracing::info!("Setlist created: {id}");
     Ok((StatusCode::CREATED, Json(id)))

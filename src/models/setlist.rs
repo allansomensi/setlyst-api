@@ -1,5 +1,12 @@
-use crate::models::song::SongPublic;
-use chrono::NaiveDateTime;
+use crate::{
+    database::{
+        AppState,
+        repositories::setlist_repository::{SetlistRepository, SetlistRepositoryImpl},
+    },
+    errors::api_error::ApiError,
+    models::{DeletePayload, song::SongPublic},
+};
+use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::prelude::FromRow;
 use utoipa::ToSchema;
@@ -42,4 +49,49 @@ pub struct UpdateSetlistPayload {
     pub title: Option<String>,
     pub description: Option<String>,
     pub song_ids: Option<Vec<Uuid>>,
+}
+
+impl Setlist {
+    pub fn new(title: &str, description: Option<String>, user_id: Uuid) -> Self {
+        let now = Utc::now().naive_utc();
+        Self {
+            id: Uuid::new_v4(),
+            title: title.to_string(),
+            description,
+            user_id,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    pub async fn count(state: &AppState) -> Result<i64, ApiError> {
+        SetlistRepositoryImpl::count(state).await
+    }
+
+    pub async fn find_all(state: &AppState) -> Result<Vec<SetlistPublic>, ApiError> {
+        SetlistRepositoryImpl::find_all(state).await
+    }
+
+    pub async fn find_by_id(state: &AppState, id: Uuid) -> Result<Option<SetlistPublic>, ApiError> {
+        SetlistRepositoryImpl::find_by_id(state, id).await
+    }
+
+    pub async fn create(
+        state: &AppState,
+        payload: &CreateSetlistPayload,
+        user_id: Uuid,
+    ) -> Result<Setlist, ApiError> {
+        SetlistRepositoryImpl::create(state, payload, user_id).await
+    }
+
+    pub async fn update(
+        state: &AppState,
+        payload: &UpdateSetlistPayload,
+    ) -> Result<Uuid, ApiError> {
+        SetlistRepositoryImpl::update(state, payload).await
+    }
+
+    pub async fn delete(state: &AppState, payload: &DeletePayload) -> Result<(), ApiError> {
+        SetlistRepositoryImpl::delete(state, payload).await
+    }
 }

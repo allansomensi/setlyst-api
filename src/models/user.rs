@@ -13,43 +13,34 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 use validator::Validate;
 
-#[derive(ToSchema, PartialEq, Debug, Clone, Serialize, Deserialize, Type)]
+#[derive(ToSchema, PartialEq, Debug, Clone, Default, Serialize, Deserialize, Type)]
 #[serde(rename_all(serialize = "lowercase", deserialize = "lowercase"))]
 #[sqlx(type_name = "user_role", rename_all = "lowercase")]
 pub enum Role {
+    #[default]
     User,
     Moderator,
     Admin,
 }
 
-impl Default for Role {
-    fn default() -> Self {
-        Self::User
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Role::User => "user",
+            Role::Moderator => "moderator",
+            Role::Admin => "admin",
+        };
+        f.write_str(s)
     }
 }
 
-impl ToString for Role {
-    fn to_string(&self) -> String {
-        match &self {
-            Self::User => String::from("user"),
-            Self::Moderator => String::from("moderator"),
-            Self::Admin => String::from("admin"),
-        }
-    }
-}
-
-#[derive(ToSchema, PartialEq, Debug, Clone, Serialize, Deserialize, Type)]
+#[derive(ToSchema, PartialEq, Debug, Clone, Default, Serialize, Deserialize, Type)]
 #[serde(rename_all(serialize = "lowercase", deserialize = "lowercase"))]
 #[sqlx(type_name = "user_status", rename_all = "lowercase")]
 pub enum Status {
+    #[default]
     Active,
     Inactive,
-}
-
-impl Default for Status {
-    fn default() -> Self {
-        Self::Active
-    }
 }
 
 #[derive(ToSchema, Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -205,34 +196,34 @@ impl User {
             password_hash: password.to_string(),
             first_name,
             last_name,
-            role: role.unwrap_or(Role::default()),
-            status: status.unwrap_or(Status::default()),
+            role: role.unwrap_or_default(),
+            status: status.unwrap_or_default(),
             created_at: Utc::now().naive_utc(),
             updated_at: Utc::now().naive_utc(),
         }
     }
 
     pub async fn count(state: &AppState) -> Result<i64, ApiError> {
-        Ok(UserRepositoryImpl::count(state).await?)
+        UserRepositoryImpl::count(state).await
     }
 
     pub async fn find_all(state: &AppState) -> Result<Vec<UserPublic>, ApiError> {
-        Ok(UserRepositoryImpl::find_all(state).await?)
+        UserRepositoryImpl::find_all(state).await
     }
 
     pub async fn find_by_id(state: &AppState, id: Uuid) -> Result<Option<UserPublic>, ApiError> {
-        Ok(UserRepositoryImpl::find_by_id(state, id).await?)
+        UserRepositoryImpl::find_by_id(state, id).await
     }
 
     pub async fn create(state: &AppState, payload: &CreateUserPayload) -> Result<Self, ApiError> {
-        Ok(UserRepositoryImpl::create(state, payload).await?)
+        UserRepositoryImpl::create(state, payload).await
     }
 
     pub async fn update(state: &AppState, payload: &UpdateUserPayload) -> Result<Uuid, ApiError> {
-        Ok(UserRepositoryImpl::update(state, payload).await?)
+        UserRepositoryImpl::update(state, payload).await
     }
 
     pub async fn delete(state: &AppState, payload: &DeletePayload) -> Result<(), ApiError> {
-        Ok(UserRepositoryImpl::delete(state, payload).await?)
+        UserRepositoryImpl::delete(state, payload).await
     }
 }

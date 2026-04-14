@@ -2,9 +2,9 @@ use super::Config;
 use chrono::{DateTime, FixedOffset, Utc};
 use tracing_appender::rolling;
 use tracing_subscriber::{
+    EnvFilter, Layer, Registry,
     fmt::{self, format::Writer, time::FormatTime},
     layer::SubscriberExt,
-    EnvFilter, Layer, Registry,
 };
 
 impl Config {

@@ -1,3 +1,11 @@
+use crate::{
+    database::{
+        AppState,
+        repositories::artist_repository::{ArtistRepository, ArtistRepositoryImpl},
+    },
+    errors::api_error::ApiError,
+    models::DeletePayload,
+};
 use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::prelude::FromRow;
@@ -51,5 +59,32 @@ impl Artist {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    pub async fn count(state: &AppState) -> Result<i64, ApiError> {
+        ArtistRepositoryImpl::count(state).await
+    }
+
+    pub async fn find_all(state: &AppState) -> Result<Vec<ArtistPublic>, ApiError> {
+        ArtistRepositoryImpl::find_all(state).await
+    }
+
+    pub async fn find_by_id(state: &AppState, id: Uuid) -> Result<Option<ArtistPublic>, ApiError> {
+        ArtistRepositoryImpl::find_by_id(state, id).await
+    }
+
+    pub async fn create(
+        state: &AppState,
+        payload: &CreateArtistPayload,
+    ) -> Result<Artist, ApiError> {
+        ArtistRepositoryImpl::create(state, payload).await
+    }
+
+    pub async fn update(state: &AppState, payload: &UpdateArtistPayload) -> Result<Uuid, ApiError> {
+        ArtistRepositoryImpl::update(state, payload).await
+    }
+
+    pub async fn delete(state: &AppState, payload: &DeletePayload) -> Result<(), ApiError> {
+        ArtistRepositoryImpl::delete(state, payload).await
     }
 }

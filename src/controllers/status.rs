@@ -3,7 +3,7 @@ use crate::{
     errors::api_error::ApiError,
     models::status::{Database, Dependencies, Status},
 };
-use axum::{extract::State, response::IntoResponse, Json};
+use axum::{Json, extract::State, response::IntoResponse};
 use chrono::Utc;
 use std::{env, sync::Arc};
 use tracing::info;

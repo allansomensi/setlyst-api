@@ -106,7 +106,7 @@ pub async fn register(
                 "Error creating user with username {}: {e}",
                 user_payload.username
             );
-            Err(ApiError::from(e))
+            Err(e)
         }
     }
 }

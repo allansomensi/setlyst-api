@@ -1,6 +1,6 @@
 use crate::{errors::api_error::ApiError, models::auth::token::Claims};
 use chrono::{Duration, TimeDelta, Utc};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, TokenData, Validation};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, TokenData, Validation, decode, encode};
 use std::env;
 
 pub fn generate_jwt(username: &str, role: &str) -> Result<String, ApiError> {

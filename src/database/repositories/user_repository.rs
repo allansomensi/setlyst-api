@@ -141,7 +141,7 @@ impl UserRepository for UserRepositoryImpl {
 
         // Encrypt and update the `password` if provided
         if let Some(password) = new_password {
-            let encrypted_password = encrypt_password(&password)?;
+            let encrypted_password = encrypt_password(password)?;
 
             sqlx::query(r#"UPDATE users SET password_hash = $1 WHERE id = $2;"#)
                 .bind(&encrypted_password)

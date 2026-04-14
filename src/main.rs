@@ -14,5 +14,5 @@ async fn main() -> Result<(), errors::api_error::ApiError> {
         }
     }
 
-    Ok(server::run().await?)
+    server::run().await
 }

@@ -1,5 +1,5 @@
 use crate::{
-    database::{connection::create_pool, AppState},
+    database::{AppState, connection::create_pool},
     errors::api_error::ApiError,
     routes,
 };

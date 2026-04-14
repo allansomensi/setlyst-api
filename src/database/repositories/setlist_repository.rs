@@ -20,7 +20,7 @@ pub trait SetlistRepository {
         state: &AppState,
         payload: &CreateSetlistPayload,
         user_id: Uuid,
-    ) -> Result<Uuid, ApiError>;
+    ) -> Result<Setlist, ApiError>;
     async fn update(state: &AppState, payload: &UpdateSetlistPayload) -> Result<Uuid, ApiError>;
     async fn delete(state: &AppState, payload: &DeletePayload) -> Result<(), ApiError>;
 }
@@ -128,26 +128,26 @@ impl SetlistRepository for SetlistRepositoryImpl {
         state: &AppState,
         payload: &CreateSetlistPayload,
         user_id: Uuid,
-    ) -> Result<Uuid, ApiError> {
+    ) -> Result<Setlist, ApiError> {
         let mut tx = state.db.begin().await?;
-        let setlist_id = Uuid::new_v4();
-        let now = Utc::now().naive_utc();
+
+        let new_setlist = Setlist::new(&payload.title, payload.description.clone(), user_id);
 
         sqlx::query("INSERT INTO setlists (id, title, description, user_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6)")
-            .bind(setlist_id)
-            .bind(&payload.title)
-            .bind(&payload.description)
-            .bind(user_id)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+        .bind(new_setlist.id)
+        .bind(&new_setlist.title)
+        .bind(&new_setlist.description)
+        .bind(new_setlist.user_id)
+        .bind(new_setlist.created_at)
+        .bind(new_setlist.updated_at)
+        .execute(&mut *tx)
+        .await?;
 
         for (pos, song_id) in payload.song_ids.iter().enumerate() {
             sqlx::query(
                 "INSERT INTO setlist_songs (setlist_id, song_id, position) VALUES ($1, $2, $3)",
             )
-            .bind(setlist_id)
+            .bind(new_setlist.id)
             .bind(song_id)
             .bind(pos as i32)
             .execute(&mut *tx)
@@ -155,7 +155,8 @@ impl SetlistRepository for SetlistRepositoryImpl {
         }
 
         tx.commit().await?;
-        Ok(setlist_id)
+
+        Ok(new_setlist)
     }
 
     async fn update(state: &AppState, payload: &UpdateSetlistPayload) -> Result<Uuid, ApiError> {

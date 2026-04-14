@@ -1,5 +1,5 @@
 use crate::{database::AppState, errors::api_error::ApiError};
-use axum::{extract::State, response::IntoResponse, Json};
+use axum::{Json, extract::State, response::IntoResponse};
 use sqlx::migrate;
 use std::sync::Arc;
 use tracing::{error, info};
