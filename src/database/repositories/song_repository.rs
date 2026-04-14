@@ -10,9 +10,13 @@ use uuid::Uuid;
 
 #[async_trait::async_trait]
 pub trait SongRepository {
-    async fn count(state: &AppState) -> Result<i64, ApiError>;
-    async fn find_all(state: &AppState) -> Result<Vec<SongPublic>, ApiError>;
-    async fn find_by_id(state: &AppState, id: Uuid) -> Result<Option<SongPublic>, ApiError>;
+    async fn count(state: &AppState, user_id: Uuid) -> Result<i64, ApiError>;
+    async fn find_all(state: &AppState, user_id: Uuid) -> Result<Vec<SongPublic>, ApiError>;
+    async fn find_by_id(
+        state: &AppState,
+        id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<SongPublic>, ApiError>;
     async fn create(
         state: &AppState,
         payload: &CreateSongPayload,
@@ -26,27 +30,34 @@ pub struct SongRepositoryImpl;
 
 #[async_trait::async_trait]
 impl SongRepository for SongRepositoryImpl {
-    async fn count(state: &AppState) -> Result<i64, ApiError> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM songs;")
+    async fn count(state: &AppState, user_id: Uuid) -> Result<i64, ApiError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM songs WHERE user_id = $1;")
+            .bind(user_id)
             .fetch_one(&state.db)
             .await?;
         Ok(count)
     }
 
-    async fn find_all(state: &AppState) -> Result<Vec<SongPublic>, ApiError> {
+    async fn find_all(state: &AppState, user_id: Uuid) -> Result<Vec<SongPublic>, ApiError> {
         let songs = sqlx::query_as::<_, SongPublic>(
-            "SELECT id, title, artist_id, user_id, created_at, updated_at FROM songs ORDER BY title ASC"
+            "SELECT id, title, artist_id, user_id, created_at, updated_at FROM songs WHERE user_id = $1 ORDER BY title ASC"
         )
+        .bind(user_id)
         .fetch_all(&state.db)
         .await?;
         Ok(songs)
     }
 
-    async fn find_by_id(state: &AppState, id: Uuid) -> Result<Option<SongPublic>, ApiError> {
+    async fn find_by_id(
+        state: &AppState,
+        id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<SongPublic>, ApiError> {
         let song = sqlx::query_as::<_, SongPublic>(
-            "SELECT id, title, artist_id, user_id, created_at, updated_at FROM songs WHERE id = $1",
+            "SELECT id, title, artist_id, user_id, created_at, updated_at FROM songs WHERE id = $1 AND user_id = $2",
         )
         .bind(id)
+        .bind(user_id)
         .fetch_optional(&state.db)
         .await?;
         Ok(song)
@@ -57,7 +68,7 @@ impl SongRepository for SongRepositoryImpl {
         payload: &CreateSongPayload,
         user_id: Uuid,
     ) -> Result<Song, ApiError> {
-        let new_song = Song::new(&payload.title, payload.artist_id, Some(user_id));
+        let new_song = Song::new(&payload.title, payload.artist_id, user_id);
         sqlx::query("INSERT INTO songs (id, title, artist_id, user_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6)")
             .bind(new_song.id)
             .bind(&new_song.title)

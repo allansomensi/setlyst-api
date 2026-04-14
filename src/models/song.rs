@@ -18,7 +18,7 @@ pub struct Song {
     pub id: Uuid,
     pub title: String,
     pub artist_id: Uuid,
-    pub user_id: Option<Uuid>,
+    pub user_id: Uuid,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -28,7 +28,7 @@ pub struct SongPublic {
     pub id: Uuid,
     pub title: String,
     pub artist_id: Uuid,
-    pub user_id: Option<Uuid>,
+    pub user_id: Uuid,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -57,7 +57,8 @@ pub struct UpdateSongPayload {
 }
 
 impl Song {
-    pub fn new(title: &str, artist_id: Uuid, user_id: Option<Uuid>) -> Self {
+    pub fn new(title: &str, artist_id: Uuid, user_id: Uuid) -> Self {
+        // REMOVIDO OPTION
         let now = Utc::now().naive_utc();
         Self {
             id: Uuid::new_v4(),
@@ -69,16 +70,20 @@ impl Song {
         }
     }
 
-    pub async fn count(state: &AppState) -> Result<i64, ApiError> {
-        SongRepositoryImpl::count(state).await
+    pub async fn count(state: &AppState, user_id: Uuid) -> Result<i64, ApiError> {
+        SongRepositoryImpl::count(state, user_id).await
     }
 
-    pub async fn find_all(state: &AppState) -> Result<Vec<SongPublic>, ApiError> {
-        SongRepositoryImpl::find_all(state).await
+    pub async fn find_all(state: &AppState, user_id: Uuid) -> Result<Vec<SongPublic>, ApiError> {
+        SongRepositoryImpl::find_all(state, user_id).await
     }
 
-    pub async fn find_by_id(state: &AppState, id: Uuid) -> Result<Option<SongPublic>, ApiError> {
-        SongRepositoryImpl::find_by_id(state, id).await
+    pub async fn find_by_id(
+        state: &AppState,
+        id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<SongPublic>, ApiError> {
+        SongRepositoryImpl::find_by_id(state, id, user_id).await
     }
 
     pub async fn create(

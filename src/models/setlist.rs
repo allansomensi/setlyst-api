@@ -64,16 +64,20 @@ impl Setlist {
         }
     }
 
-    pub async fn count(state: &AppState) -> Result<i64, ApiError> {
-        SetlistRepositoryImpl::count(state).await
+    pub async fn count(state: &AppState, user_id: Uuid) -> Result<i64, ApiError> {
+        SetlistRepositoryImpl::count(state, user_id).await
     }
 
-    pub async fn find_all(state: &AppState) -> Result<Vec<SetlistPublic>, ApiError> {
-        SetlistRepositoryImpl::find_all(state).await
+    pub async fn find_all(state: &AppState, user_id: Uuid) -> Result<Vec<SetlistPublic>, ApiError> {
+        SetlistRepositoryImpl::find_all(state, user_id).await
     }
 
-    pub async fn find_by_id(state: &AppState, id: Uuid) -> Result<Option<SetlistPublic>, ApiError> {
-        SetlistRepositoryImpl::find_by_id(state, id).await
+    pub async fn find_by_id(
+        state: &AppState,
+        id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<SetlistPublic>, ApiError> {
+        SetlistRepositoryImpl::find_by_id(state, id, user_id).await
     }
 
     pub async fn create(

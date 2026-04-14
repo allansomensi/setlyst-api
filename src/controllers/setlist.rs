@@ -21,89 +21,125 @@ use std::sync::Arc;
 use uuid::Uuid;
 use validator::Validate;
 
-#[utoipa::path(get,
+#[utoipa::path(
+    get,
     path = "/api/v1/setlists/count",
     tags = ["Setlists"],
-    security((), ("jwt_token" = ["jwt_token"])),
-    responses((status = 200, body = i64)))]
+    security(
+        (),
+        ("jwt_token" = ["jwt_token"])
+    ),
+    responses(
+        (status = 200, body = i64)
+    )
+)]
 pub async fn count_setlists(
     State(state): State<Arc<AppState>>,
-    _access: AccessControl,
+    access: AccessControl,
 ) -> Result<impl IntoResponse, ApiError> {
-    let count = SetlistRepositoryImpl::count(&state).await?;
+    let count = SetlistRepositoryImpl::count(&state, access.user().id).await?;
     Ok(Json(count))
 }
 
-#[utoipa::path(get,
+#[utoipa::path(
+    get,
     path = "/api/v1/setlists",
     tags = ["Setlists"],
-    security((), ("jwt_token" = ["jwt_token"])),
-    responses((status = 200, body = Vec<SetlistPublic>)))]
+    security(
+        (),
+        ("jwt_token" = ["jwt_token"])
+    ),
+    responses(
+        (status = 200, body = Vec<SetlistPublic>)
+    )
+)]
 pub async fn find_all_setlists(
     State(state): State<Arc<AppState>>,
-    _access: AccessControl,
+    access: AccessControl,
 ) -> Result<impl IntoResponse, ApiError> {
-    let setlists = SetlistRepositoryImpl::find_all(&state).await?;
+    let setlists = SetlistRepositoryImpl::find_all(&state, access.user().id).await?;
     Ok(Json(setlists))
 }
 
-#[utoipa::path(get,
+#[utoipa::path(
+    get,
     path = "/api/v1/setlists/{id}",
     tags = ["Setlists"],
-    security((), ("jwt_token" = ["jwt_token"])),
-    responses((status = 200, body = SetlistPublic), (status = 404, description = "Not Found")))]
+    security(
+        (),
+        ("jwt_token" = ["jwt_token"])
+    ),
+    responses(
+        (status = 200, body = SetlistPublic),
+        (status = 404, description = "Not Found")
+    )
+)]
 pub async fn find_setlist_by_id(
     Path(id): Path<Uuid>,
     State(state): State<Arc<AppState>>,
-    _access: AccessControl,
+    access: AccessControl,
 ) -> Result<impl IntoResponse, ApiError> {
-    match SetlistRepositoryImpl::find_by_id(&state, id).await? {
+    match SetlistRepositoryImpl::find_by_id(&state, id, access.user().id).await? {
         Some(setlist) => Ok(Json(setlist)),
         None => Err(ApiError::NotFound),
     }
 }
 
-#[utoipa::path(post,
+#[utoipa::path(
+    post,
     path = "/api/v1/setlists",
     tags = ["Setlists"],
     request_body = CreateSetlistPayload,
-    security((), ("jwt_token" = ["jwt_token"])),
-    responses((status = 201, body = Uuid)))]
+    security(
+        (),
+        ("jwt_token" = ["jwt_token"])
+    ),
+    responses(
+        (status = 201, body = Uuid)
+    )
+)]
 pub async fn create_setlist(
     State(state): State<Arc<AppState>>,
     access: AccessControl,
     Json(payload): Json<CreateSetlistPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
     payload.validate()?;
+    let user_id = access.user().id;
+
     for song_id in &payload.song_ids {
-        song_exists(&state, *song_id).await?;
+        song_exists(&state, *song_id, user_id).await?;
     }
 
-    let user_id = access.user().id;
     let setlist = SetlistRepositoryImpl::create(&state, &payload, user_id).await?;
-    let id = setlist.id;
-
-    tracing::info!("Setlist created: {id}");
-    Ok((StatusCode::CREATED, Json(id)))
+    Ok((StatusCode::CREATED, Json(setlist.id)))
 }
 
-#[utoipa::path(put,
+#[utoipa::path(
+    put,
     path = "/api/v1/setlists",
     tags = ["Setlists"],
     request_body = UpdateSetlistPayload,
-    security((), ("jwt_token" = ["jwt_token"])),
-    responses((status = 200, body = Uuid)))]
+    security(
+        (),
+        ("jwt_token" = ["jwt_token"])
+    ),
+    responses(
+        (status = 200, body = Uuid)
+    )
+)]
 pub async fn update_setlist(
     State(state): State<Arc<AppState>>,
-    _access: AccessControl,
+    access: AccessControl,
     Json(payload): Json<UpdateSetlistPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
     payload.validate()?;
-    setlist_exists(&state, payload.id).await?;
+    let user_id = access.user().id;
+
+    setlist_exists(&state, payload.id, user_id).await?;
 
     if let Some(song_ids) = &payload.song_ids {
         for song_id in song_ids {
-            song_exists(&state, *song_id).await?;
+            song_exists(&state, *song_id, user_id).await?;
         }
     }
 
@@ -111,18 +147,25 @@ pub async fn update_setlist(
     Ok(Json(id))
 }
 
-#[utoipa::path(delete,
+#[utoipa::path(
+    delete,
     path = "/api/v1/setlists",
     tags = ["Setlists"],
     request_body = DeletePayload,
-    security((), ("jwt_token" = ["jwt_token"])),
-    responses((status = 204, description = "No Content")))]
+    security(
+        (),
+        ("jwt_token" = ["jwt_token"])
+    ),
+    responses(
+        (status = 204, description = "No Content")
+    )
+)]
 pub async fn delete_setlist(
     State(state): State<Arc<AppState>>,
-    _access: AccessControl,
+    access: AccessControl,
     Json(payload): Json<DeletePayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    setlist_exists(&state, payload.id).await?;
+    setlist_exists(&state, payload.id, access.user().id).await?;
     SetlistRepositoryImpl::delete(&state, &payload).await?;
     Ok(StatusCode::NO_CONTENT)
 }

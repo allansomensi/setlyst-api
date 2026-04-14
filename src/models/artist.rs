@@ -17,6 +17,7 @@ use validator::Validate;
 pub struct Artist {
     pub id: Uuid,
     pub name: String,
+    pub user_id: Uuid,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -25,6 +26,7 @@ pub struct Artist {
 pub struct ArtistPublic {
     pub id: Uuid,
     pub name: String,
+    pub user_id: Uuid,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -51,33 +53,39 @@ pub struct UpdateArtistPayload {
 }
 
 impl Artist {
-    pub fn new(name: &str) -> Self {
+    pub fn new(name: &str, user_id: Uuid) -> Self {
         let now = Utc::now().naive_utc();
         Self {
             id: Uuid::new_v4(),
             name: name.to_string(),
+            user_id,
             created_at: now,
             updated_at: now,
         }
     }
 
-    pub async fn count(state: &AppState) -> Result<i64, ApiError> {
-        ArtistRepositoryImpl::count(state).await
+    pub async fn count(state: &AppState, user_id: Uuid) -> Result<i64, ApiError> {
+        ArtistRepositoryImpl::count(state, user_id).await
     }
 
-    pub async fn find_all(state: &AppState) -> Result<Vec<ArtistPublic>, ApiError> {
-        ArtistRepositoryImpl::find_all(state).await
+    pub async fn find_all(state: &AppState, user_id: Uuid) -> Result<Vec<ArtistPublic>, ApiError> {
+        ArtistRepositoryImpl::find_all(state, user_id).await
     }
 
-    pub async fn find_by_id(state: &AppState, id: Uuid) -> Result<Option<ArtistPublic>, ApiError> {
-        ArtistRepositoryImpl::find_by_id(state, id).await
+    pub async fn find_by_id(
+        state: &AppState,
+        id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<ArtistPublic>, ApiError> {
+        ArtistRepositoryImpl::find_by_id(state, id, user_id).await
     }
 
     pub async fn create(
         state: &AppState,
         payload: &CreateArtistPayload,
+        user_id: Uuid,
     ) -> Result<Artist, ApiError> {
-        ArtistRepositoryImpl::create(state, payload).await
+        ArtistRepositoryImpl::create(state, payload, user_id).await
     }
 
     pub async fn update(state: &AppState, payload: &UpdateArtistPayload) -> Result<Uuid, ApiError> {

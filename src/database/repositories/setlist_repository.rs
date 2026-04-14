@@ -13,9 +13,13 @@ use uuid::Uuid;
 
 #[async_trait::async_trait]
 pub trait SetlistRepository {
-    async fn count(state: &AppState) -> Result<i64, ApiError>;
-    async fn find_all(state: &AppState) -> Result<Vec<SetlistPublic>, ApiError>;
-    async fn find_by_id(state: &AppState, id: Uuid) -> Result<Option<SetlistPublic>, ApiError>;
+    async fn count(state: &AppState, user_id: Uuid) -> Result<i64, ApiError>;
+    async fn find_all(state: &AppState, user_id: Uuid) -> Result<Vec<SetlistPublic>, ApiError>;
+    async fn find_by_id(
+        state: &AppState,
+        id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<SetlistPublic>, ApiError>;
     async fn create(
         state: &AppState,
         payload: &CreateSetlistPayload,
@@ -29,17 +33,19 @@ pub struct SetlistRepositoryImpl;
 
 #[async_trait::async_trait]
 impl SetlistRepository for SetlistRepositoryImpl {
-    async fn count(state: &AppState) -> Result<i64, ApiError> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM setlists;")
+    async fn count(state: &AppState, user_id: Uuid) -> Result<i64, ApiError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM setlists WHERE user_id = $1;")
+            .bind(user_id)
             .fetch_one(&state.db)
             .await?;
         Ok(count)
     }
 
-    async fn find_all(state: &AppState) -> Result<Vec<SetlistPublic>, ApiError> {
+    async fn find_all(state: &AppState, user_id: Uuid) -> Result<Vec<SetlistPublic>, ApiError> {
         let setlists = sqlx::query_as::<_, Setlist>(
-            "SELECT id, title, description, user_id, created_at, updated_at FROM setlists ORDER BY created_at DESC"
+            "SELECT id, title, description, user_id, created_at, updated_at FROM setlists WHERE user_id = $1 ORDER BY created_at DESC"
         )
+        .bind(user_id)
         .fetch_all(&state.db)
         .await?;
 
@@ -94,11 +100,16 @@ impl SetlistRepository for SetlistRepositoryImpl {
         Ok(result)
     }
 
-    async fn find_by_id(state: &AppState, id: Uuid) -> Result<Option<SetlistPublic>, ApiError> {
+    async fn find_by_id(
+        state: &AppState,
+        id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<SetlistPublic>, ApiError> {
         let setlist = sqlx::query_as::<_, Setlist>(
-            "SELECT id, title, description, user_id, created_at, updated_at FROM setlists WHERE id = $1"
+            "SELECT id, title, description, user_id, created_at, updated_at FROM setlists WHERE id = $1 AND user_id = $2"
         )
         .bind(id)
+        .bind(user_id)
         .fetch_optional(&state.db)
         .await?;
 
