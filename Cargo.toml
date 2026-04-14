@@ -1,7 +1,14 @@
 [package]
 name = "setlyst-api"
 version = "0.1.0"
+authors = ["Allan Somensi <allansomensidev@proton.me>"]
+description = "A simple REST API for setlist management."
+homepage = "https://github.com/allansomensi/setlyst"
+repository = "https://github.com/allansomensi/setlyst"
+readme = "README.md"
+keywords = ["api"]
 edition = "2024"
+license = "MIT"
 default-run = "setlyst-api"
 
 [[bin]]
@@ -33,3 +40,15 @@ utoipa = { version = "5.3", features = ["chrono", "uuid"] }
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 uuid = { version = "1.17", features = ["serde", "v4", "v7"] }
 validator = { version = "0.20", features = ["derive"] }
+
+[dev-dependencies.cargo-husky]
+version = "1.5"
+default-features = false
+features = [
+    "run-for-all",
+    "prepush-hook",
+    "precommit-hook",
+    "run-cargo-test",
+    "run-cargo-clippy",
+    "run-cargo-fmt",
+]
