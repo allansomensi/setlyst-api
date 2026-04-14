@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 pub fn create_routes(state: Arc<AppState>) -> axum::Router {
     axum::Router::new()
-        .route("/count", get(artist::count_artists))
         .route(
             "/{id}",
             get(artist::find_artist_by_id)

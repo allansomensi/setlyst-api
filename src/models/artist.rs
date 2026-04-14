@@ -62,12 +62,13 @@ impl Artist {
         }
     }
 
-    pub async fn count(state: &AppState, user_id: Uuid) -> Result<i64, ApiError> {
-        ArtistRepositoryImpl::count(state, user_id).await
-    }
-
-    pub async fn find_all(state: &AppState, user_id: Uuid) -> Result<Vec<ArtistPublic>, ApiError> {
-        ArtistRepositoryImpl::find_all(state, user_id).await
+    pub async fn find_all(
+        state: &AppState,
+        user_id: Uuid,
+        page: i64,
+        size: i64,
+    ) -> Result<(Vec<ArtistPublic>, i64), ApiError> {
+        ArtistRepositoryImpl::find_all(state, user_id, page, size).await
     }
 
     pub async fn find_by_id(

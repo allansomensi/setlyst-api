@@ -2,6 +2,7 @@ use crate::{
     database::AppState,
     errors::api_error::ApiError,
     models::{
+        PaginatedResponse, PaginationMeta, PaginationQuery,
         artist::{Artist, ArtistPublic, CreateArtistPayload, UpdateArtistPayload},
         auth::access::AccessControl,
     },
@@ -9,7 +10,7 @@ use crate::{
 };
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header::LOCATION},
     response::IntoResponse,
 };
@@ -18,73 +19,53 @@ use tracing::{debug, error, info};
 use uuid::Uuid;
 use validator::Validate;
 
-/// Retrieves the total count of artists.
-///
-/// This endpoint counts all artists stored in the database and returns the count as an integer.
-/// If no artists are found, 0 is returned.
-#[utoipa::path(
-    get,
-    path = "/api/v1/artists/count",
-    tags = ["Artists"],
-    summary = "Get the total count of artists.",
-    description = "This endpoint retrieves the total number of artists stored in the database.",
-    security(
-        (),
-        ("jwt_token" = ["jwt_token"])
-    ),
-    responses(
-        (status = 200, description = "Artist count retrieved successfully.", body = i32),
-        (status = 500, description = "An error occurred while retrieving the artist count.")
-    )
-)]
-pub async fn count_artists(
-    State(state): State<Arc<AppState>>,
-    access: AccessControl,
-) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to retrieve artist count.");
-
-    match Artist::count(&state, access.user().id).await {
-        Ok(count) => {
-            info!("Successfully retrieved artist count: {count}");
-            Ok(Json(count))
-        }
-        Err(e) => {
-            error!("Failed to retrieve artist count: {e}");
-            Err(e)
-        }
-    }
-}
-
 /// Retrieves a list of all artists.
 ///
-/// This endpoint fetches all artists stored in the database.
+/// This endpoint fetches artists stored in the database according to pagination parameters.
 /// If there are no artists, returns an empty array.
 #[utoipa::path(
     get,
     path = "/api/v1/artists",
     tags = ["Artists"],
     summary = "List all artists.",
-    description = "Fetches all artists stored in the database. If there are no artists, returns an empty array.",
+    description = "Fetches a paginated list of artists stored in the database.",
+    params(
+        PaginationQuery
+    ),
     security(
         (),
         ("jwt_token" = [])
     ),
     responses(
-        (status = 200, description = "Artists retrieved successfully.", body = Vec<ArtistPublic>),
-        (status = 404, description = "No artists found in the database."),
+        (status = 200, description = "Artists retrieved successfully.", body = PaginatedResponse<ArtistPublic>),
         (status = 500, description = "An error occurred while retrieving the artists.")
     )
 )]
 pub async fn find_all_artists(
     State(state): State<Arc<AppState>>,
     access: AccessControl,
+    Query(pagination): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     debug!("Received request to retrieve all artists.");
 
-    match Artist::find_all(&state, access.user().id).await {
-        Ok(artists) => {
-            info!("Artists listed successfully.");
-            Ok(Json(artists))
+    let current_page = pagination.page.unwrap_or(1).max(1);
+    let per_page = pagination.per_page.unwrap_or(20).clamp(1, 100);
+
+    match Artist::find_all(&state, access.user().id, current_page, per_page).await {
+        Ok((artists, total_items)) => {
+            info!("Artists listed successfully. Total: {total_items}");
+
+            let total_pages = (total_items as f64 / per_page as f64).ceil() as i64;
+
+            Ok(Json(PaginatedResponse {
+                data: artists,
+                meta: PaginationMeta {
+                    total_items,
+                    current_page,
+                    per_page,
+                    total_pages,
+                },
+            }))
         }
         Err(e) => {
             error!("Error retrieving all artists: {e}");

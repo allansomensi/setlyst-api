@@ -44,7 +44,6 @@ use utoipa::{
         user::delete_user,
 
         // Artists
-        artist::count_artists,
         artist::find_artist_by_id,
         artist::find_all_artists,
         artist::create_artist,

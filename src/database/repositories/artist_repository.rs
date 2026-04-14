@@ -7,8 +7,12 @@ use uuid::Uuid;
 
 #[async_trait::async_trait]
 pub trait ArtistRepository {
-    async fn count(state: &AppState, user_id: Uuid) -> Result<i64, ApiError>;
-    async fn find_all(state: &AppState, user_id: Uuid) -> Result<Vec<ArtistPublic>, ApiError>;
+    async fn find_all(
+        state: &AppState,
+        user_id: Uuid,
+        page: i64,
+        size: i64,
+    ) -> Result<(Vec<ArtistPublic>, i64), ApiError>;
     async fn find_by_id(
         state: &AppState,
         id: Uuid,
@@ -31,22 +35,29 @@ pub struct ArtistRepositoryImpl;
 
 #[async_trait::async_trait]
 impl ArtistRepository for ArtistRepositoryImpl {
-    async fn count(state: &AppState, user_id: Uuid) -> Result<i64, ApiError> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM artists WHERE user_id = $1;")
-            .bind(user_id)
-            .fetch_one(&state.db)
-            .await?;
-        Ok(count)
-    }
+    async fn find_all(
+        state: &AppState,
+        user_id: Uuid,
+        page: i64,
+        size: i64,
+    ) -> Result<(Vec<ArtistPublic>, i64), ApiError> {
+        let offset = (page - 1) * size;
 
-    async fn find_all(state: &AppState, user_id: Uuid) -> Result<Vec<ArtistPublic>, ApiError> {
+        let count = sqlx::query_scalar("SELECT COUNT(*) FROM artists WHERE user_id = $1;")
+            .bind(user_id)
+            .fetch_one(&state.db);
+
         let artists = sqlx::query_as::<_, ArtistPublic>(
-            "SELECT id, name, user_id, created_at, updated_at FROM artists WHERE user_id = $1 ORDER BY name ASC",
+            "SELECT id, name, user_id, created_at, updated_at FROM artists WHERE user_id = $1 ORDER BY name ASC LIMIT $2 OFFSET $3",
         )
         .bind(user_id)
-        .fetch_all(&state.db)
-        .await?;
-        Ok(artists)
+        .bind(size)
+        .bind(offset)
+        .fetch_all(&state.db);
+
+        let (count, artists) = tokio::try_join!(count, artists)?;
+
+        Ok((artists, count))
     }
 
     async fn find_by_id(
