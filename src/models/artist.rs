@@ -4,7 +4,6 @@ use crate::{
         repositories::artist_repository::{ArtistRepository, ArtistRepositoryImpl},
     },
     errors::api_error::ApiError,
-    models::DeletePayload,
 };
 use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -43,7 +42,6 @@ pub struct CreateArtistPayload {
 
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
 pub struct UpdateArtistPayload {
-    pub id: Uuid,
     #[validate(length(
         min = 1,
         max = 255,
@@ -88,11 +86,15 @@ impl Artist {
         ArtistRepositoryImpl::create(state, payload, user_id).await
     }
 
-    pub async fn update(state: &AppState, payload: &UpdateArtistPayload) -> Result<Uuid, ApiError> {
-        ArtistRepositoryImpl::update(state, payload).await
+    pub async fn update(
+        state: &AppState,
+        id: Uuid,
+        payload: &UpdateArtistPayload,
+    ) -> Result<Uuid, ApiError> {
+        ArtistRepositoryImpl::update(state, id, payload).await
     }
 
-    pub async fn delete(state: &AppState, payload: &DeletePayload) -> Result<(), ApiError> {
-        ArtistRepositoryImpl::delete(state, payload).await
+    pub async fn delete(state: &AppState, id: Uuid) -> Result<(), ApiError> {
+        ArtistRepositoryImpl::delete(state, id).await
     }
 }

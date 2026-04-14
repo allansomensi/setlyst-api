@@ -1,10 +1,7 @@
 use crate::{
     database::AppState,
     errors::api_error::ApiError,
-    models::{
-        DeletePayload,
-        artist::{Artist, ArtistPublic, CreateArtistPayload, UpdateArtistPayload},
-    },
+    models::artist::{Artist, ArtistPublic, CreateArtistPayload, UpdateArtistPayload},
 };
 use uuid::Uuid;
 
@@ -22,8 +19,12 @@ pub trait ArtistRepository {
         payload: &CreateArtistPayload,
         user_id: Uuid,
     ) -> Result<Artist, ApiError>;
-    async fn update(state: &AppState, payload: &UpdateArtistPayload) -> Result<Uuid, ApiError>;
-    async fn delete(state: &AppState, payload: &DeletePayload) -> Result<(), ApiError>;
+    async fn update(
+        state: &AppState,
+        id: Uuid,
+        payload: &UpdateArtistPayload,
+    ) -> Result<Uuid, ApiError>;
+    async fn delete(state: &AppState, id: Uuid) -> Result<(), ApiError>;
 }
 
 pub struct ArtistRepositoryImpl;
@@ -82,19 +83,23 @@ impl ArtistRepository for ArtistRepositoryImpl {
         Ok(new_artist)
     }
 
-    async fn update(state: &AppState, payload: &UpdateArtistPayload) -> Result<Uuid, ApiError> {
+    async fn update(
+        state: &AppState,
+        id: Uuid,
+        payload: &UpdateArtistPayload,
+    ) -> Result<Uuid, ApiError> {
         sqlx::query("UPDATE artists SET name = $1, updated_at = $2 WHERE id = $3")
             .bind(&payload.name)
             .bind(chrono::Utc::now().naive_utc())
-            .bind(payload.id)
+            .bind(id)
             .execute(&state.db)
             .await?;
-        Ok(payload.id)
+        Ok(id)
     }
 
-    async fn delete(state: &AppState, payload: &DeletePayload) -> Result<(), ApiError> {
+    async fn delete(state: &AppState, id: Uuid) -> Result<(), ApiError> {
         sqlx::query("DELETE FROM artists WHERE id = $1")
-            .bind(payload.id)
+            .bind(id)
             .execute(&state.db)
             .await?;
         Ok(())
