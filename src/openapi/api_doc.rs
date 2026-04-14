@@ -36,7 +36,6 @@ use utoipa::{
         auth::verify,
 
         // Users
-        user::count_users,
         user::find_user_by_id,
         user::find_all_users,
         user::create_user,
@@ -76,7 +75,7 @@ use utoipa::{
         (name = "Users", description = "Users endpoints"),
         (name = "Artists", description = "Artists endpoints"),
         (name = "Songs", description = "Songs endpoints"),
-        (name = "Setlist", description = "Setlist endpoints"),
+        (name = "Setlists", description = "Setlist endpoints"),
     )
 )]
 pub struct ApiDoc;

@@ -1,4 +1,3 @@
-use super::DeletePayload;
 use crate::{
     database::{
         AppState,
@@ -148,7 +147,6 @@ pub struct CreateUserPayload {
 
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
 pub struct UpdateUserPayload {
-    pub id: Uuid,
     #[validate(length(
         min = 3,
         max = 20,
@@ -203,12 +201,12 @@ impl User {
         }
     }
 
-    pub async fn count(state: &AppState) -> Result<i64, ApiError> {
-        UserRepositoryImpl::count(state).await
-    }
-
-    pub async fn find_all(state: &AppState) -> Result<Vec<UserPublic>, ApiError> {
-        UserRepositoryImpl::find_all(state).await
+    pub async fn find_all(
+        state: &AppState,
+        page: i64,
+        size: i64,
+    ) -> Result<(Vec<UserPublic>, i64), ApiError> {
+        UserRepositoryImpl::find_all(state, page, size).await
     }
 
     pub async fn find_by_id(state: &AppState, id: Uuid) -> Result<Option<UserPublic>, ApiError> {
@@ -219,11 +217,15 @@ impl User {
         UserRepositoryImpl::create(state, payload).await
     }
 
-    pub async fn update(state: &AppState, payload: &UpdateUserPayload) -> Result<Uuid, ApiError> {
-        UserRepositoryImpl::update(state, payload).await
+    pub async fn update(
+        state: &AppState,
+        id: Uuid,
+        payload: &UpdateUserPayload,
+    ) -> Result<Uuid, ApiError> {
+        UserRepositoryImpl::update(state, id, payload).await
     }
 
-    pub async fn delete(state: &AppState, payload: &DeletePayload) -> Result<(), ApiError> {
-        UserRepositoryImpl::delete(state, payload).await
+    pub async fn delete(state: &AppState, id: Uuid) -> Result<(), ApiError> {
+        UserRepositoryImpl::delete(state, id).await
     }
 }

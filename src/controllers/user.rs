@@ -1,16 +1,17 @@
-use crate::database::AppState;
-use crate::models::auth::access::AccessControl;
-use crate::models::user::{Role, UserPublic};
-use crate::models::{
-    DeletePayload,
-    user::{CreateUserPayload, UpdateUserPayload},
+use crate::{
+    database::AppState,
+    errors::api_error::ApiError,
+    models::{
+        PaginatedResponse, PaginationMeta, PaginationQuery,
+        auth::access::AccessControl,
+        user::{CreateUserPayload, Role, UpdateUserPayload, User, UserPublic},
+    },
+    validations::{existence::user_exists, uniqueness::is_user_unique},
 };
-use crate::validations::{existence::user_exists, uniqueness::is_user_unique};
-use crate::{errors::api_error::ApiError, models::user::User};
 use axum::{
     Json,
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{Path, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header::LOCATION},
     response::IntoResponse,
 };
 use std::sync::Arc;
@@ -18,77 +19,55 @@ use tracing::{debug, error, info};
 use uuid::Uuid;
 use validator::Validate;
 
-/// Retrieves the total count of users.
-///
-/// This endpoint counts all users stored in the database and returns the count as an integer.
-/// If no users are found, 0 is returned.
-#[utoipa::path(
-    get,
-    path = "/api/v1/users/count",
-    tags = ["Users"],
-    summary = "Get the total count of users.",
-    description = "This endpoint retrieves the total number of users stored in the database.",
-    security(
-        (),
-        ("jwt_token" = ["jwt_token"])
-    ),
-    responses(
-        (status = 200, description = "User count retrieved successfully.", body = i32),
-        (status = 500, description = "An error occurred while retrieving the user count.")
-    )
-)]
-pub async fn count_users(
-    State(state): State<Arc<AppState>>,
-    access: AccessControl,
-) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to retrieve user count.");
-
-    access.require_any_role(&[Role::Admin, Role::Moderator])?;
-
-    match User::count(&state).await {
-        Ok(count) => {
-            info!("Successfully retrieved user count: {count}");
-            Ok(Json(count))
-        }
-        Err(e) => {
-            error!("Failed to retrieve user count: {e}");
-            Err(e)
-        }
-    }
-}
-
 /// Retrieves a list of all users.
 ///
-/// This endpoint fetches all users stored in the database.
+/// This endpoint fetches a paginated list of users stored in the database.
 /// If there are no users, returns an empty array.
 #[utoipa::path(
     get,
     path = "/api/v1/users",
     tags = ["Users"],
     summary = "List all users.",
-    description = "Fetches all users stored in the database. If there are no users, returns an empty array.",
+    description = "Fetches a paginated list of users stored in the database.",
+    params(
+        PaginationQuery
+    ),
     security(
         (),
-        ("jwt_token" = ["jwt_token"])
+        ("jwt_token" = [])
     ),
     responses(
-        (status = 200, description = "Users retrieved successfully.", body = Vec<UserPublic>),
-        (status = 404, description = "No users found in the database."),
+        (status = 200, description = "Users retrieved successfully.", body = PaginatedResponse<UserPublic>),
         (status = 500, description = "An error occurred while retrieving the users.")
     )
 )]
 pub async fn find_all_users(
     State(state): State<Arc<AppState>>,
     access: AccessControl,
+    Query(pagination): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     debug!("Received request to retrieve all users.");
 
     access.require_any_role(&[Role::Admin, Role::Moderator])?;
 
-    match User::find_all(&state).await {
-        Ok(users) => {
-            info!("Users listed successfully.");
-            Ok(Json(users))
+    let current_page = pagination.page.unwrap_or(1).max(1);
+    let per_page = pagination.per_page.unwrap_or(20).clamp(1, 100);
+
+    match User::find_all(&state, current_page, per_page).await {
+        Ok((users, total_items)) => {
+            info!("Users listed successfully. Total: {total_items}");
+
+            let total_pages = (total_items as f64 / per_page as f64).ceil() as i64;
+
+            Ok(Json(PaginatedResponse {
+                data: users,
+                meta: PaginationMeta {
+                    total_items,
+                    current_page,
+                    per_page,
+                    total_pages,
+                },
+            }))
         }
         Err(e) => {
             error!("Error retrieving all users: {e}");
@@ -112,7 +91,7 @@ pub async fn find_all_users(
     ),
     security(
         (),
-        ("jwt_token" = ["jwt_token"])
+        ("jwt_token" = [])
     ),
     responses(
         (status = 200, description = "User retrieved successfully.", body = UserPublic),
@@ -124,7 +103,7 @@ pub async fn find_user_by_id(
     Path(id): Path<Uuid>,
     State(state): State<Arc<AppState>>,
     access: AccessControl,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, ApiError> {
     debug!("Received request to retrieve user with id: {id}");
 
     access.require_any_role(&[Role::Admin, Role::Moderator])?;
@@ -159,7 +138,7 @@ pub async fn find_user_by_id(
     request_body = CreateUserPayload,
     security(
         (),
-        ("jwt_token" = ["jwt_token"])
+        ("jwt_token" = [])
     ),
     responses(
         (status = 201, description = "User created successfully.", body = Uuid),
@@ -180,14 +159,20 @@ pub async fn create_user(
 
     access.require_any_role(&[Role::Admin, Role::Moderator])?;
 
-    // Validations
     payload.validate()?;
     is_user_unique(&state, &payload.username).await?;
 
     match User::create(&state, &payload).await {
         Ok(new_user) => {
             info!("User created! ID: {}", &new_user.id);
-            Ok((StatusCode::CREATED, Json(new_user.id)))
+
+            let mut headers = HeaderMap::new();
+            let location = format!("/api/v1/users/{}", new_user.id);
+            if let Ok(header_value) = HeaderValue::from_str(&location) {
+                headers.insert(LOCATION, header_value);
+            }
+
+            Ok((StatusCode::CREATED, headers, Json(new_user.id)))
         }
         Err(e) => {
             error!(
@@ -202,20 +187,20 @@ pub async fn create_user(
 /// Updates an existing user.
 ///
 /// This endpoint updates the details of an existing user.
-/// It accepts the user ID and the new details for the user.
-/// The endpoint validates the new name to ensure it is not empty,
-/// does not conflict with an existing user's name, and meets length requirements.
-/// If the user is successfully updated, it returns the UUID of the updated user.
+/// It accepts the user ID in the path and the new details in the body.
 #[utoipa::path(
-    put,
-    path = "/api/v1/users",
+    patch,
+    path = "/api/v1/users/{id}",
     tags = ["Users"],
     summary = "Update an existing user.",
     description = "This endpoint updates the details of an existing user in the database.",
+    params(
+        ("id" = Uuid, Path, description = "The ID of the user to update")
+    ),
     request_body = UpdateUserPayload,
     security(
         (),
-        ("jwt_token" = ["jwt_token"])
+        ("jwt_token" = [])
     ),
     responses(
         (status = 200, description = "User updated successfully.", body = Uuid),
@@ -228,23 +213,23 @@ pub async fn create_user(
 pub async fn update_user(
     State(state): State<Arc<AppState>>,
     access: AccessControl,
+    Path(id): Path<Uuid>,
     Json(payload): Json<UpdateUserPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to update user with ID: {}", payload.id);
+    debug!("Received request to update user with ID: {id}");
 
     access.require_any_role(&[Role::Admin, Role::Moderator])?;
 
-    // Validations
     payload.validate()?;
-    user_exists(&state, payload.id).await?;
+    user_exists(&state, id).await?;
 
-    match User::update(&state, &payload).await {
+    match User::update(&state, id, &payload).await {
         Ok(user_id) => {
             info!("User updated! ID: {user_id}");
             Ok(Json(user_id))
         }
         Err(e) => {
-            error!("Error updating user with ID {}: {e}", payload.id);
+            error!("Error updating user with ID {id}: {e}");
             Err(e)
         }
     }
@@ -257,40 +242,41 @@ pub async fn update_user(
 /// If the user is successfully deleted, a 204 status code is returned.
 #[utoipa::path(
     delete,
-     path = "/api/v1/users",
-     tags = ["Users"],
-     summary = "Delete an existing user.",
-     description = "This endpoint deletes a specific user from the database using its ID.",
-     request_body = DeletePayload,
-     security(
-        (),
-        ("jwt_token" = ["jwt_token"])
+    path = "/api/v1/users/{id}",
+    tags = ["Users"],
+    summary = "Delete an existing user.",
+    description = "This endpoint deletes a specific user from the database using its ID.",
+    params(
+        ("id" = Uuid, Path, description = "The ID of the user to delete")
     ),
-     responses(
-         (status = 204, description = "User deleted successfully"),
-         (status = 404, description = "User ID not found"),
-         (status = 500, description = "An error occurred while deleting the user")
-     )
- )]
+    security(
+        (),
+        ("jwt_token" = [])
+    ),
+    responses(
+        (status = 204, description = "User deleted successfully"),
+        (status = 404, description = "User ID not found"),
+        (status = 500, description = "An error occurred while deleting the user")
+    )
+)]
 pub async fn delete_user(
     State(state): State<Arc<AppState>>,
     access: AccessControl,
-    Json(payload): Json<DeletePayload>,
+    Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to delete user with ID: {}", payload.id);
+    debug!("Received request to delete user with ID: {id}");
 
     access.require_any_role(&[Role::Admin, Role::Moderator])?;
 
-    // Validations
-    user_exists(&state, payload.id).await?;
+    user_exists(&state, id).await?;
 
-    match User::delete(&state, &payload).await {
+    match User::delete(&state, id).await {
         Ok(_) => {
-            info!("User deleted! ID: {}", &payload.id);
+            info!("User deleted! ID: {id}");
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => {
-            error!("Error deleting user with ID {}: {e}", payload.id);
+            error!("Error deleting user with ID {id}: {e}");
             Err(e)
         }
     }

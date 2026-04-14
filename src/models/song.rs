@@ -58,7 +58,6 @@ pub struct UpdateSongPayload {
 
 impl Song {
     pub fn new(title: &str, artist_id: Uuid, user_id: Uuid) -> Self {
-        // REMOVIDO OPTION
         let now = Utc::now().naive_utc();
         Self {
             id: Uuid::new_v4(),
