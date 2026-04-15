@@ -1,12 +1,16 @@
+use crate::models::user::{Role, Status};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+use uuid::Uuid;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
-    pub iat: usize,
-    pub sub: String,
+    pub sub: Uuid,
+    pub username: String,
+    pub role: Role,
+    pub status: Status,
     pub exp: usize,
-    pub role: String,
+    pub iat: usize,
 }
 
 #[derive(Deserialize, Serialize, ToSchema)]

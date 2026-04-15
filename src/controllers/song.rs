@@ -42,7 +42,7 @@ pub async fn find_all_songs(
 
     match state
         .song_repo
-        .find_all(access.user().id, current_page, per_page)
+        .find_all(access.user_id(), current_page, per_page)
         .await
     {
         Ok((songs, total_items)) => {
@@ -86,7 +86,7 @@ pub async fn find_song_by_id(
 ) -> Result<impl IntoResponse, ApiError> {
     debug!("Received request to retrieve song with id: {id}");
 
-    match state.song_repo.find_by_id(id, access.user().id).await {
+    match state.song_repo.find_by_id(id, access.user_id()).await {
         Ok(Some(song)) => {
             info!("Song found: {id}");
             Ok(Json(song))
@@ -127,7 +127,7 @@ pub async fn create_song(
     );
 
     payload.validate()?;
-    let user_id = access.user().id;
+    let user_id = access.user_id();
 
     state.artist_repo.exists(payload.artist_id, user_id).await?;
     state
@@ -177,7 +177,7 @@ pub async fn update_song(
     debug!("Received request to update song with ID: {id}");
 
     payload.validate()?;
-    let user_id = access.user().id;
+    let user_id = access.user_id();
 
     state.song_repo.exists(id, user_id).await?;
     state.artist_repo.exists(payload.artist_id, user_id).await?;
@@ -211,7 +211,7 @@ pub async fn delete_song(
 ) -> Result<impl IntoResponse, ApiError> {
     debug!("Received request to delete song with ID: {id}");
 
-    let user_id = access.user().id;
+    let user_id = access.user_id();
     state.song_repo.exists(id, user_id).await?;
 
     match state.song_repo.delete(id).await {

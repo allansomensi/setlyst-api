@@ -47,7 +47,7 @@ pub async fn find_all_artists(
 
     match state
         .artist_repo
-        .find_all(access.user().id, current_page, per_page)
+        .find_all(access.user_id(), current_page, per_page)
         .await
     {
         Ok((artists, total_items)) => {
@@ -98,7 +98,7 @@ pub async fn find_artist_by_id(
 ) -> Result<impl IntoResponse, ApiError> {
     debug!("Received request to retrieve artist with id: {id}");
 
-    match state.artist_repo.find_by_id(id, access.user().id).await {
+    match state.artist_repo.find_by_id(id, access.user_id()).await {
         Ok(Some(artist)) => {
             info!("Artist found: {id}");
             Ok(Json(artist))
@@ -144,7 +144,7 @@ pub async fn create_artist(
 
     payload.validate()?;
 
-    let user_id = access.user().id;
+    let user_id = access.user_id();
     state.artist_repo.is_unique(&payload.name, user_id).await?;
 
     match state.artist_repo.create(&payload, user_id).await {
@@ -197,7 +197,7 @@ pub async fn update_artist(
     debug!("Received request to update artist with ID: {id}");
 
     payload.validate()?;
-    let user_id = access.user().id;
+    let user_id = access.user_id();
 
     state.artist_repo.exists(id, user_id).await?;
     state.artist_repo.is_unique(&payload.name, user_id).await?;
@@ -240,7 +240,7 @@ pub async fn delete_artist(
 ) -> Result<impl IntoResponse, ApiError> {
     debug!("Received request to delete artist with ID: {id}");
 
-    let user_id = access.user().id;
+    let user_id = access.user_id();
     state.artist_repo.exists(id, user_id).await?;
 
     match state.artist_repo.delete(id).await {

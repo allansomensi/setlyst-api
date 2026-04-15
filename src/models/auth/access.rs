@@ -1,17 +1,18 @@
 use crate::{
     errors::api_error::ApiError,
-    models::user::{Role, Status, User},
+    models::{auth::token::Claims, user::Role},
 };
 use axum::{extract::FromRequestParts, http::request::Parts};
+use uuid::Uuid;
 
 /// Wrapper struct providing authorization logic for a given authenticated user.
 #[derive(Debug, Clone)]
-pub struct AccessControl(pub User);
+pub struct AccessControl(pub Claims);
 
 impl AccessControl {
-    /// Returns a reference to the inner user.
-    pub fn user(&self) -> &User {
-        &self.0
+    /// Returns the user ID directly.
+    pub fn user_id(&self) -> Uuid {
+        self.0.sub
     }
 
     /// Ensures the user has exactly the specified role.
@@ -39,20 +40,13 @@ where
 {
     type Rejection = ApiError;
 
-    /// Extracts the [`AccessControl`] from the request parts.
-    ///
-    /// It expects a [`User`] to be present in the request extensions (injected by [crate::middlewares::authentication] middleware).
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let user = parts
+        let claims = parts
             .extensions
-            .get::<User>()
+            .get::<Claims>()
             .cloned()
             .ok_or(ApiError::Unauthorized)?;
 
-        if user.status != Status::Active {
-            return Err(ApiError::Unauthorized);
-        }
-
-        Ok(Self(user))
+        Ok(Self(claims))
     }
 }

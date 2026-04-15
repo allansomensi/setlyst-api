@@ -42,7 +42,7 @@ pub async fn find_all_setlists(
 
     match state
         .setlist_repo
-        .find_all(access.user().id, current_page, per_page)
+        .find_all(access.user_id(), current_page, per_page)
         .await
     {
         Ok((setlists, total_items)) => {
@@ -86,7 +86,7 @@ pub async fn find_setlist_by_id(
 ) -> Result<impl IntoResponse, ApiError> {
     debug!("Received request to retrieve setlist with id: {id}");
 
-    match state.setlist_repo.find_by_id(id, access.user().id).await {
+    match state.setlist_repo.find_by_id(id, access.user_id()).await {
         Ok(Some(setlist)) => {
             info!("Setlist found: {id}");
             Ok(Json(setlist))
@@ -127,7 +127,7 @@ pub async fn create_setlist(
     );
 
     payload.validate()?;
-    let user_id = access.user().id;
+    let user_id = access.user_id();
 
     state
         .setlist_repo
@@ -176,7 +176,7 @@ pub async fn update_setlist(
     debug!("Received request to update setlist with ID: {id}");
 
     payload.validate()?;
-    let user_id = access.user().id;
+    let user_id = access.user_id();
 
     state.setlist_repo.exists(id, user_id).await?;
 
@@ -213,7 +213,7 @@ pub async fn delete_setlist(
 ) -> Result<impl IntoResponse, ApiError> {
     debug!("Received request to delete setlist with ID: {id}");
 
-    let user_id = access.user().id;
+    let user_id = access.user_id();
     state.setlist_repo.exists(id, user_id).await?;
 
     match state.setlist_repo.delete(id).await {
