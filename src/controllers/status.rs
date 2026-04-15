@@ -5,7 +5,7 @@ use crate::{
 };
 use axum::{Json, extract::State, response::IntoResponse};
 use chrono::Utc;
-use std::{env, sync::Arc};
+use std::env;
 use tracing::info;
 
 /// Retrieves the current status of the API, including the database connection status.
@@ -21,9 +21,7 @@ use tracing::info;
         (status = 200, description = "Status retrieved successfully", body = Status)
     )
 )]
-pub async fn show_status(
-    State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, ApiError> {
+pub async fn show_status(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     let version: String = sqlx::query_scalar(r#"SHOW server_version;"#)
         .fetch_one(&state.db)
         .await?;

@@ -12,7 +12,6 @@ use crate::{
     validations::uniqueness::is_user_unique,
 };
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
-use std::sync::Arc;
 use tracing::{debug, error, info};
 use validator::Validate;
 
@@ -31,7 +30,7 @@ use validator::Validate;
     )
 )]
 pub async fn login(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Json(payload): Json<LoginPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user_data: Option<(Status, String, Role)> =
@@ -82,7 +81,7 @@ pub async fn login(
     )
 )]
 pub async fn register(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     Json(payload): Json<RegisterPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
     debug!(

@@ -1,8 +1,7 @@
 use crate::{controllers::artist, database::AppState};
 use axum::routing::get;
-use std::sync::Arc;
 
-pub fn create_routes(state: Arc<AppState>) -> axum::Router {
+pub fn create_routes(state: AppState) -> axum::Router {
     axum::Router::new()
         .route(
             "/{id}",

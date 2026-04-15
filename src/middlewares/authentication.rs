@@ -10,10 +10,9 @@ use axum::{
     http::{self, Response},
     middleware::Next,
 };
-use std::sync::Arc;
 
 pub async fn authenticate(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     mut req: Request,
     next: Next,
 ) -> Result<Response<Body>, ApiError> {

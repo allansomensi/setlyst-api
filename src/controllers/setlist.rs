@@ -14,7 +14,6 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header::LOCATION},
     response::IntoResponse,
 };
-use std::sync::Arc;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 use validator::Validate;
@@ -42,7 +41,7 @@ use validator::Validate;
     )
 )]
 pub async fn find_all_setlists(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     access: AccessControl,
     Query(pagination): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -99,7 +98,7 @@ pub async fn find_all_setlists(
 )]
 pub async fn find_setlist_by_id(
     Path(id): Path<Uuid>,
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     access: AccessControl,
 ) -> Result<impl IntoResponse, ApiError> {
     debug!("Received request to retrieve setlist with id: {id}");
@@ -142,7 +141,7 @@ pub async fn find_setlist_by_id(
     )
 )]
 pub async fn create_setlist(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     access: AccessControl,
     Json(payload): Json<CreateSetlistPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -203,7 +202,7 @@ pub async fn create_setlist(
     )
 )]
 pub async fn update_setlist(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     access: AccessControl,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateSetlistPayload>,
@@ -258,7 +257,7 @@ pub async fn update_setlist(
     )
 )]
 pub async fn delete_setlist(
-    State(state): State<Arc<AppState>>,
+    State(state): State<AppState>,
     access: AccessControl,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {

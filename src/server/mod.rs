@@ -3,7 +3,6 @@ use crate::{
     errors::api_error::ApiError,
     routes,
 };
-use std::sync::Arc;
 use tracing::{error, info};
 
 pub async fn run() -> Result<(), ApiError> {
@@ -18,12 +17,12 @@ pub async fn run() -> Result<(), ApiError> {
         }
     };
 
-    let app = routes::create_routes(Arc::new(AppState { db: pool.clone() }));
+    let app = routes::create_routes(AppState { db: pool.clone() });
 
     let addr = std::env::var("HOST")?;
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => {
-            info!("✅ Server started at: {}", &addr);
+            info!("✅ Server started at: {addr}");
             listener
         }
         Err(e) => {
