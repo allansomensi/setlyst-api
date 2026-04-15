@@ -2,7 +2,11 @@ use clap::Parser;
 use setlyst_api::{
     config,
     database::{
-        AppState, connection::create_pool, repositories::user_repository::UserRepositoryImpl,
+        AppState,
+        connection::create_pool,
+        repositories::{
+            artist_repository::ArtistRepositoryImpl, user_repository::UserRepositoryImpl,
+        },
     },
     models::user::{CreateUserPayload, Role, Status},
 };
@@ -37,10 +41,12 @@ async fn main() {
     };
 
     let user_repo = Arc::new(UserRepositoryImpl::new(pool.clone()));
+    let artist_repo = Arc::new(ArtistRepositoryImpl::new(pool.clone()));
 
     let state = AppState {
         db: pool.clone(),
         user_repo,
+        artist_repo,
     };
 
     let user = CreateUserPayload {

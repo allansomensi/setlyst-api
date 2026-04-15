@@ -1,6 +1,10 @@
 use crate::{
     database::{
-        AppState, connection::create_pool, repositories::user_repository::UserRepositoryImpl,
+        AppState,
+        connection::create_pool,
+        repositories::{
+            artist_repository::ArtistRepositoryImpl, user_repository::UserRepositoryImpl,
+        },
     },
     errors::api_error::ApiError,
     routes,
@@ -21,10 +25,12 @@ pub async fn run() -> Result<(), ApiError> {
     };
 
     let user_repo = Arc::new(UserRepositoryImpl::new(pool.clone()));
+    let artist_repo = Arc::new(ArtistRepositoryImpl::new(pool.clone()));
 
     let state = AppState {
         db: pool.clone(),
         user_repo,
+        artist_repo,
     };
 
     let app = routes::create_routes(state);

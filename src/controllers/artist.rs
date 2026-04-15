@@ -3,10 +3,9 @@ use crate::{
     errors::api_error::ApiError,
     models::{
         PaginatedResponse, PaginationMeta, PaginationQuery,
-        artist::{Artist, ArtistPublic, CreateArtistPayload, UpdateArtistPayload},
+        artist::{ArtistPublic, CreateArtistPayload, UpdateArtistPayload},
         auth::access::AccessControl,
     },
-    validations::{existence::artist_exists, uniqueness::is_artist_unique},
 };
 use axum::{
     Json,
@@ -18,10 +17,6 @@ use tracing::{debug, error, info};
 use uuid::Uuid;
 use validator::Validate;
 
-/// Retrieves a list of all artists.
-///
-/// This endpoint fetches artists stored in the database according to pagination parameters.
-/// If there are no artists, returns an empty array.
 #[utoipa::path(
     get,
     path = "/api/v1/artists",
@@ -50,7 +45,11 @@ pub async fn find_all_artists(
     let current_page = pagination.page.unwrap_or(1).max(1);
     let per_page = pagination.per_page.unwrap_or(20).clamp(1, 100);
 
-    match Artist::find_all(&state, access.user().id, current_page, per_page).await {
+    match state
+        .artist_repo
+        .find_all(access.user().id, current_page, per_page)
+        .await
+    {
         Ok((artists, total_items)) => {
             info!("Artists listed successfully. Total: {total_items}");
 
@@ -73,10 +72,6 @@ pub async fn find_all_artists(
     }
 }
 
-/// Retrieves a specific artist by its ID.
-///
-/// This endpoint searches for an artist with the specified ID.
-/// If the artist is found, it returns the artist details.
 #[utoipa::path(
     get,
     path = "/api/v1/artists/{id}",
@@ -103,7 +98,7 @@ pub async fn find_artist_by_id(
 ) -> Result<impl IntoResponse, ApiError> {
     debug!("Received request to retrieve artist with id: {id}");
 
-    match Artist::find_by_id(&state, id, access.user().id).await {
+    match state.artist_repo.find_by_id(id, access.user().id).await {
         Ok(Some(artist)) => {
             info!("Artist found: {id}");
             Ok(Json(artist))
@@ -119,9 +114,6 @@ pub async fn find_artist_by_id(
     }
 }
 
-/// Create a new artist.
-///
-/// This endpoint creates a new artist by providing its details.
 #[utoipa::path(
     post,
     path = "/api/v1/artists",
@@ -151,9 +143,11 @@ pub async fn create_artist(
     );
 
     payload.validate()?;
-    is_artist_unique(&state, &payload.name, access.user().id).await?;
 
-    match Artist::create(&state, &payload, access.user().id).await {
+    let user_id = access.user().id;
+    state.artist_repo.is_unique(&payload.name, user_id).await?;
+
+    match state.artist_repo.create(&payload, user_id).await {
         Ok(new_artist) => {
             info!("Artist created! ID: {}", &new_artist.id);
 
@@ -163,7 +157,7 @@ pub async fn create_artist(
                 headers.insert(LOCATION, header_value);
             }
 
-            Ok((StatusCode::CREATED, headers, Json(new_artist.id)))
+            Ok((StatusCode::CREATED, headers, Json(new_artist)))
         }
         Err(e) => {
             error!("Error creating artist with name {}: {e}", payload.name);
@@ -172,10 +166,6 @@ pub async fn create_artist(
     }
 }
 
-/// Updates an existing artist.
-///
-/// This endpoint updates the details of an existing artist.
-/// It accepts the artist ID in the path and the new details in the body.
 #[utoipa::path(
     patch,
     path = "/api/v1/artists/{id}",
@@ -207,10 +197,12 @@ pub async fn update_artist(
     debug!("Received request to update artist with ID: {id}");
 
     payload.validate()?;
-    artist_exists(&state, id, access.user().id).await?;
-    is_artist_unique(&state, &payload.name, access.user().id).await?;
+    let user_id = access.user().id;
 
-    match Artist::update(&state, id, &payload).await {
+    state.artist_repo.exists(id, user_id).await?;
+    state.artist_repo.is_unique(&payload.name, user_id).await?;
+
+    match state.artist_repo.update(id, &payload).await {
         Ok(artist_id) => {
             info!("Artist updated! ID: {artist_id}");
             Ok(Json(artist_id))
@@ -222,11 +214,6 @@ pub async fn update_artist(
     }
 }
 
-/// Deletes an existing artist.
-///
-/// This endpoint allows artists to delete a specific artist by its ID.
-/// It checks if the artist exists before attempting to delete it.
-/// If the artist is successfully deleted, a 204 status code is returned.
 #[utoipa::path(
     delete,
     path = "/api/v1/artists/{id}",
@@ -253,9 +240,10 @@ pub async fn delete_artist(
 ) -> Result<impl IntoResponse, ApiError> {
     debug!("Received request to delete artist with ID: {id}");
 
-    artist_exists(&state, id, access.user().id).await?;
+    let user_id = access.user().id;
+    state.artist_repo.exists(id, user_id).await?;
 
-    match Artist::delete(&state, id).await {
+    match state.artist_repo.delete(id).await {
         Ok(_) => {
             info!("Artist deleted! ID: {id}");
             Ok(StatusCode::NO_CONTENT)

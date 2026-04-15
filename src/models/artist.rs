@@ -1,10 +1,3 @@
-use crate::{
-    database::{
-        AppState,
-        repositories::artist_repository::{ArtistRepository, ArtistRepositoryImpl},
-    },
-    errors::api_error::ApiError,
-};
 use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::prelude::FromRow;
@@ -60,42 +53,5 @@ impl Artist {
             created_at: now,
             updated_at: now,
         }
-    }
-
-    pub async fn find_all(
-        state: &AppState,
-        user_id: Uuid,
-        page: i64,
-        size: i64,
-    ) -> Result<(Vec<ArtistPublic>, i64), ApiError> {
-        ArtistRepositoryImpl::find_all(state, user_id, page, size).await
-    }
-
-    pub async fn find_by_id(
-        state: &AppState,
-        id: Uuid,
-        user_id: Uuid,
-    ) -> Result<Option<ArtistPublic>, ApiError> {
-        ArtistRepositoryImpl::find_by_id(state, id, user_id).await
-    }
-
-    pub async fn create(
-        state: &AppState,
-        payload: &CreateArtistPayload,
-        user_id: Uuid,
-    ) -> Result<Artist, ApiError> {
-        ArtistRepositoryImpl::create(state, payload, user_id).await
-    }
-
-    pub async fn update(
-        state: &AppState,
-        id: Uuid,
-        payload: &UpdateArtistPayload,
-    ) -> Result<Uuid, ApiError> {
-        ArtistRepositoryImpl::update(state, id, payload).await
-    }
-
-    pub async fn delete(state: &AppState, id: Uuid) -> Result<(), ApiError> {
-        ArtistRepositoryImpl::delete(state, id).await
     }
 }
