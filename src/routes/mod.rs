@@ -19,10 +19,10 @@ pub fn create_routes(state: AppState) -> Router {
                 .nest("/artists", artist::create_routes(state.clone()))
                 .nest("/songs", song::create_routes(state.clone()))
                 .nest("/setlists", setlist::create_routes(state.clone()))
+                .nest("/migrations", migrations::create_routes(state.clone()))
                 .layer(middleware::from_fn(authenticate))
                 .nest("/auth", auth::create_routes(state.clone()))
-                .nest("/status", status::create_routes(state.clone()))
-                .nest("/migrations", migrations::create_routes(state)),
+                .nest("/status", status::create_routes(state)),
         )
         .merge(swagger::swagger_routes())
         .layer(Config::cors())

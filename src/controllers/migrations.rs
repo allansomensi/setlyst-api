@@ -1,10 +1,32 @@
-use crate::{database::AppState, errors::api_error::ApiError};
-use axum::{Json, extract::State, response::IntoResponse};
+use crate::{
+    database::AppState,
+    errors::api_error::ApiError,
+    models::{auth::access::AccessControl, user::Role},
+};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use sqlx::migrate;
 use tracing::{error, info};
 
-pub async fn dry_run() {
-    todo!("Dry run mode is planned but has not been implemented yet.");
+#[utoipa::path(
+    get,
+    path = "/api/v1/migrations",
+    tags = ["Migrations"],
+    summary = "Dry run database migrations.",
+    description = "Simulates database migrations. Currently not implemented.",
+    security(
+        ("jwt_token" = [])
+    ),
+    responses(
+        (status = 501, description = "Not Implemented")
+    )
+)]
+pub async fn dry_run(access: AccessControl) -> Result<impl IntoResponse, ApiError> {
+    access.require_role(Role::Admin)?;
+
+    Ok((
+        StatusCode::NOT_IMPLEMENTED,
+        Json("Dry run mode is planned but has not been implemented yet."),
+    ))
 }
 
 /// Executes pending database migrations.
@@ -18,12 +40,22 @@ pub async fn dry_run() {
     tags = ["Migrations"],
     summary = "Execute pending database migrations.",
     description = "This endpoint executes any pending migrations in the database. It applies migrations that have not yet been run and provides confirmation upon success.",
+    security(
+        ("jwt_token" = [])
+    ),
     responses(
         (status = 200, description = "Migrations applied successfully", body = String),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
         (status = 500, description = "An error occurred while applying migrations")
     )
 )]
-pub async fn live_run(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+pub async fn live_run(
+    State(state): State<AppState>,
+    access: AccessControl,
+) -> Result<impl IntoResponse, ApiError> {
+    access.require_role(Role::Admin)?;
+
     migrate!("./src/database/migrations")
         .run(&state.db)
         .await

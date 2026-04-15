@@ -22,15 +22,15 @@ services-restart:
 
 [group('database')]
 migrate-add MIGRATION_NAME:
-    @cargo sqlx migrate add {{ MIGRATION_NAME }}
+    @cargo sqlx migrate add --source src/database/migrations {{ MIGRATION_NAME }}
 
 [group('database')]
 migrate-run:
-    @cargo sqlx migrate run
+    @cargo sqlx migrate run --source src/database/migrations
 
 [group('database')]
 migrate-down:
-    @cargo sqlx migrate revert
+    @cargo sqlx migrate revert --source src/database/migrations
 
 [group('misc')]
 serve:
