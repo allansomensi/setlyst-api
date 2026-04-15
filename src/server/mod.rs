@@ -12,6 +12,7 @@ use crate::{
     routes,
 };
 use std::sync::Arc;
+use tokio::signal;
 use tracing::{error, info};
 
 pub async fn run() -> Result<(), ApiError> {
@@ -55,7 +56,37 @@ pub async fn run() -> Result<(), ApiError> {
     };
 
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("Error starting the server");
+
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("Shutting down gracefully (Ctrl+C)...");
+        },
+        _ = terminate => {
+            info!("Shutting down gracefully (SIGTERM)...");
+        },
+    }
 }
