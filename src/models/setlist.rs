@@ -1,11 +1,3 @@
-use crate::{
-    database::{
-        AppState,
-        repositories::setlist_repository::{SetlistRepository, SetlistRepositoryImpl},
-    },
-    errors::api_error::ApiError,
-    models::song::SongPublic,
-};
 use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::prelude::FromRow;
@@ -23,13 +15,12 @@ pub struct Setlist {
     pub updated_at: NaiveDateTime,
 }
 
-#[derive(ToSchema, Clone, Serialize, Deserialize)]
+#[derive(ToSchema, Clone, FromRow, Serialize, Deserialize)]
 pub struct SetlistPublic {
     pub id: Uuid,
     pub title: String,
     pub description: Option<String>,
     pub user_id: Uuid,
-    pub songs: Vec<SongPublic>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -39,7 +30,6 @@ pub struct CreateSetlistPayload {
     #[validate(length(min = 1, max = 255, message = "Title must be between 1 and 255 chars."))]
     pub title: String,
     pub description: Option<String>,
-    pub song_ids: Vec<Uuid>,
 }
 
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
@@ -47,7 +37,6 @@ pub struct UpdateSetlistPayload {
     #[validate(length(min = 1, max = 255, message = "Title must be between 1 and 255 chars."))]
     pub title: Option<String>,
     pub description: Option<String>,
-    pub song_ids: Option<Vec<Uuid>>,
 }
 
 impl Setlist {
@@ -61,42 +50,5 @@ impl Setlist {
             created_at: now,
             updated_at: now,
         }
-    }
-
-    pub async fn find_all(
-        state: &AppState,
-        user_id: Uuid,
-        page: i64,
-        size: i64,
-    ) -> Result<(Vec<SetlistPublic>, i64), ApiError> {
-        SetlistRepositoryImpl::find_all(state, user_id, page, size).await
-    }
-
-    pub async fn find_by_id(
-        state: &AppState,
-        id: Uuid,
-        user_id: Uuid,
-    ) -> Result<Option<SetlistPublic>, ApiError> {
-        SetlistRepositoryImpl::find_by_id(state, id, user_id).await
-    }
-
-    pub async fn create(
-        state: &AppState,
-        payload: &CreateSetlistPayload,
-        user_id: Uuid,
-    ) -> Result<Setlist, ApiError> {
-        SetlistRepositoryImpl::create(state, payload, user_id).await
-    }
-
-    pub async fn update(
-        state: &AppState,
-        id: Uuid,
-        payload: &UpdateSetlistPayload,
-    ) -> Result<Uuid, ApiError> {
-        SetlistRepositoryImpl::update(state, id, payload).await
-    }
-
-    pub async fn delete(state: &AppState, id: Uuid) -> Result<(), ApiError> {
-        SetlistRepositoryImpl::delete(state, id).await
     }
 }

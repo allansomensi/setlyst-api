@@ -4,9 +4,8 @@ use crate::{
     models::{
         PaginatedResponse, PaginationMeta, PaginationQuery,
         auth::access::AccessControl,
-        setlist::{CreateSetlistPayload, Setlist, SetlistPublic, UpdateSetlistPayload},
+        setlist::{CreateSetlistPayload, SetlistPublic, UpdateSetlistPayload},
     },
-    validations::existence::{setlist_exists, song_exists},
 };
 use axum::{
     Json,
@@ -18,23 +17,14 @@ use tracing::{debug, error, info};
 use uuid::Uuid;
 use validator::Validate;
 
-/// Retrieves a list of all setlists.
-///
-/// This endpoint fetches setlists stored in the database according to pagination parameters.
-/// If there are no setlists, returns an empty array.
 #[utoipa::path(
     get,
     path = "/api/v1/setlists",
     tags = ["Setlists"],
     summary = "List all setlists.",
     description = "Fetches a paginated list of setlists stored in the database.",
-    params(
-        PaginationQuery
-    ),
-    security(
-        (),
-        ("jwt_token" = [])
-    ),
+    params(PaginationQuery),
+    security((), ("jwt_token" = [])),
     responses(
         (status = 200, description = "Setlists retrieved successfully.", body = PaginatedResponse<SetlistPublic>),
         (status = 500, description = "An error occurred while retrieving the setlists.")
@@ -50,10 +40,13 @@ pub async fn find_all_setlists(
     let current_page = pagination.page.unwrap_or(1).max(1);
     let per_page = pagination.per_page.unwrap_or(20).clamp(1, 100);
 
-    match Setlist::find_all(&state, access.user().id, current_page, per_page).await {
+    match state
+        .setlist_repo
+        .find_all(access.user().id, current_page, per_page)
+        .await
+    {
         Ok((setlists, total_items)) => {
             info!("Setlists listed successfully. Total: {total_items}");
-
             let total_pages = (total_items as f64 / per_page as f64).ceil() as i64;
 
             Ok(Json(PaginatedResponse {
@@ -73,27 +66,17 @@ pub async fn find_all_setlists(
     }
 }
 
-/// Retrieves a specific setlist by its ID.
-///
-/// This endpoint searches for a setlist with the specified ID.
-/// If the setlist is found, it returns the setlist details along with its songs.
 #[utoipa::path(
     get,
     path = "/api/v1/setlists/{id}",
     tags = ["Setlists"],
     summary = "Get a specific setlist by ID.",
     description = "This endpoint retrieves a setlist's details from the database using its ID.",
-    params(
-        ("id", description = "The unique identifier of the setlist to retrieve.", example = Uuid::new_v4)
-    ),
-    security(
-        (),
-        ("jwt_token" = [])
-    ),
+    params(("id", description = "The unique identifier of the setlist to retrieve.", example = Uuid::new_v4)),
+    security((), ("jwt_token" = [])),
     responses(
         (status = 200, description = "Setlist retrieved successfully.", body = SetlistPublic),
-        (status = 404, description = "No setlist found with the specified ID."),
-        (status = 500, description = "An error occurred while retrieving the setlist.")
+        (status = 404, description = "No setlist found with the specified ID.")
     )
 )]
 pub async fn find_setlist_by_id(
@@ -103,7 +86,7 @@ pub async fn find_setlist_by_id(
 ) -> Result<impl IntoResponse, ApiError> {
     debug!("Received request to retrieve setlist with id: {id}");
 
-    match Setlist::find_by_id(&state, id, access.user().id).await {
+    match state.setlist_repo.find_by_id(id, access.user().id).await {
         Ok(Some(setlist)) => {
             info!("Setlist found: {id}");
             Ok(Json(setlist))
@@ -119,9 +102,6 @@ pub async fn find_setlist_by_id(
     }
 }
 
-/// Create a new setlist.
-///
-/// This endpoint creates a new setlist by providing its details and associated songs.
 #[utoipa::path(
     post,
     path = "/api/v1/setlists",
@@ -129,15 +109,11 @@ pub async fn find_setlist_by_id(
     summary = "Create a new setlist.",
     description = "This endpoint creates a new setlist in the database with the provided details.",
     request_body = CreateSetlistPayload,
-    security(
-        (),
-        ("jwt_token" = [])
-    ),
+    security((), ("jwt_token" = [])),
     responses(
-        (status = 201, description = "Setlist created successfully.", body = Uuid),
+        (status = 201, description = "Setlist created successfully.", body = SetlistPublic),
         (status = 400, description = "Invalid input."),
-        (status = 404, description = "Song not found."),
-        (status = 500, description = "An error occurred while creating the setlist.")
+        (status = 409, description = "Conflict: Setlist already exists.")
     )
 )]
 pub async fn create_setlist(
@@ -153,11 +129,12 @@ pub async fn create_setlist(
     payload.validate()?;
     let user_id = access.user().id;
 
-    for song_id in &payload.song_ids {
-        song_exists(&state, *song_id, user_id).await?;
-    }
+    state
+        .setlist_repo
+        .is_unique(&payload.title, user_id)
+        .await?;
 
-    match Setlist::create(&state, &payload, user_id).await {
+    match state.setlist_repo.create(&payload, user_id).await {
         Ok(new_setlist) => {
             info!("Setlist created! ID: {}", &new_setlist.id);
 
@@ -167,7 +144,7 @@ pub async fn create_setlist(
                 headers.insert(LOCATION, header_value);
             }
 
-            Ok((StatusCode::CREATED, headers, Json(new_setlist.id)))
+            Ok((StatusCode::CREATED, headers, Json(new_setlist)))
         }
         Err(e) => {
             error!("Error creating setlist with title {}: {e}", payload.title);
@@ -176,29 +153,18 @@ pub async fn create_setlist(
     }
 }
 
-/// Updates an existing setlist.
-///
-/// This endpoint updates the details of an existing setlist.
-/// It accepts the setlist ID in the path and the new details in the body.
 #[utoipa::path(
     patch,
     path = "/api/v1/setlists/{id}",
     tags = ["Setlists"],
     summary = "Update an existing setlist.",
     description = "This endpoint updates the details of an existing setlist in the database.",
-    params(
-        ("id" = Uuid, Path, description = "The ID of the setlist to update")
-    ),
+    params(("id" = Uuid, Path, description = "The ID of the setlist to update")),
     request_body = UpdateSetlistPayload,
-    security(
-        (),
-        ("jwt_token" = [])
-    ),
+    security((), ("jwt_token" = [])),
     responses(
         (status = 200, description = "Setlist updated successfully.", body = Uuid),
-        (status = 400, description = "Invalid input."),
-        (status = 404, description = "Setlist or Song ID not found."),
-        (status = 500, description = "An error occurred while updating the setlist.")
+        (status = 404, description = "Setlist ID not found.")
     )
 )]
 pub async fn update_setlist(
@@ -212,15 +178,13 @@ pub async fn update_setlist(
     payload.validate()?;
     let user_id = access.user().id;
 
-    setlist_exists(&state, id, user_id).await?;
+    state.setlist_repo.exists(id, user_id).await?;
 
-    if let Some(song_ids) = &payload.song_ids {
-        for song_id in song_ids {
-            song_exists(&state, *song_id, user_id).await?;
-        }
+    if let Some(title) = &payload.title {
+        state.setlist_repo.is_unique(title, user_id).await?;
     }
 
-    match Setlist::update(&state, id, &payload).await {
+    match state.setlist_repo.update(id, &payload).await {
         Ok(setlist_id) => {
             info!("Setlist updated! ID: {setlist_id}");
             Ok(Json(setlist_id))
@@ -232,29 +196,15 @@ pub async fn update_setlist(
     }
 }
 
-/// Deletes an existing setlist.
-///
-/// This endpoint allows users to delete a specific setlist by its ID.
-/// It checks if the setlist exists before attempting to delete it.
-/// If the setlist is successfully deleted, a 204 status code is returned.
 #[utoipa::path(
     delete,
     path = "/api/v1/setlists/{id}",
     tags = ["Setlists"],
     summary = "Delete an existing setlist.",
     description = "This endpoint deletes a specific setlist from the database using its ID.",
-    params(
-        ("id" = Uuid, Path, description = "The ID of the setlist to delete")
-    ),
-    security(
-        (),
-        ("jwt_token" = [])
-    ),
-    responses(
-        (status = 204, description = "Setlist deleted successfully"),
-        (status = 404, description = "Setlist ID not found"),
-        (status = 500, description = "An error occurred while deleting the setlist")
-    )
+    params(("id" = Uuid, Path, description = "The ID of the setlist to delete")),
+    security((), ("jwt_token" = [])),
+    responses((status = 204, description = "Setlist deleted successfully"))
 )]
 pub async fn delete_setlist(
     State(state): State<AppState>,
@@ -263,9 +213,10 @@ pub async fn delete_setlist(
 ) -> Result<impl IntoResponse, ApiError> {
     debug!("Received request to delete setlist with ID: {id}");
 
-    setlist_exists(&state, id, access.user().id).await?;
+    let user_id = access.user().id;
+    state.setlist_repo.exists(id, user_id).await?;
 
-    match Setlist::delete(&state, id).await {
+    match state.setlist_repo.delete(id).await {
         Ok(_) => {
             info!("Setlist deleted! ID: {id}");
             Ok(StatusCode::NO_CONTENT)

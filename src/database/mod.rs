@@ -2,8 +2,8 @@ pub mod connection;
 pub mod repositories;
 
 use repositories::{
-    artist_repository::ArtistRepository, song_repository::SongRepository,
-    user_repository::UserRepository,
+    artist_repository::ArtistRepository, setlist_repository::SetlistRepository,
+    song_repository::SongRepository, user_repository::UserRepository,
 };
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -14,4 +14,5 @@ pub struct AppState {
     pub user_repo: Arc<dyn UserRepository>,
     pub artist_repo: Arc<dyn ArtistRepository>,
     pub song_repo: Arc<dyn SongRepository>,
+    pub setlist_repo: Arc<dyn SetlistRepository>,
 }

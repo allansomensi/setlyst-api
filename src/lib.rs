@@ -8,4 +8,3 @@ mod openapi;
 mod routes;
 pub mod server;
 mod utils;
-pub mod validations;
