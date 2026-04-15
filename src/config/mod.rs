@@ -21,14 +21,18 @@ impl Config {
         environment::load_environment()?;
         Self::logger_init();
 
+        let jwt_secret = std::env::var("JWT_SECRET")?;
+
+        if jwt_secret.len() < 32 {
+            return Err(ConfigError::InsecureJwtSecret);
+        }
+
         let config = Config {
             host: std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0:8000".to_string()),
             database_url: std::env::var("DATABASE_URL")?,
             postgres_db: std::env::var("POSTGRES_DB")?,
-            jwt_secret: std::env::var("JWT_SECRET")?,
-            jwt_expiration_time: std::env::var("JWT_EXPIRATION_TIME")?
-                .parse()
-                .expect("Invalid JWT_EXPIRATION_TIME format"),
+            jwt_secret,
+            jwt_expiration_time: std::env::var("JWT_EXPIRATION_TIME")?.parse()?,
         };
 
         CONFIG.set(config).expect("Config already initialized");

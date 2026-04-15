@@ -8,4 +8,10 @@ pub enum ConfigError {
 
     #[error("Error parsing data: {0}")]
     ParsingError(#[from] std::io::Error),
+
+    #[error("Failed to parse integer: {0}")]
+    ParseInt(#[from] std::num::ParseIntError),
+
+    #[error("JWT_SECRET must be at least 32 characters long for security reasons")]
+    InsecureJwtSecret,
 }
