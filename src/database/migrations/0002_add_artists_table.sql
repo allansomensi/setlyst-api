@@ -6,3 +6,5 @@ CREATE TABLE artists (
     updated_at TIMESTAMP NOT NULL,
     UNIQUE(name, user_id)
 );
+
+CREATE INDEX idx_artists_user_id ON artists(user_id);

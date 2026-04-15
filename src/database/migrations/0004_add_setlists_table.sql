@@ -13,3 +13,5 @@ CREATE TABLE setlist_songs (
     position INTEGER NOT NULL,
     PRIMARY KEY (setlist_id, song_id)
 );
+
+CREATE INDEX idx_setlists_user_id ON setlists(user_id);
