@@ -8,7 +8,6 @@ use tracing::error;
 /// Encrypt a password.
 pub fn encrypt_password(password: &str) -> Result<String, ApiError> {
     let salt = SaltString::generate(&mut OsRng);
-
     let argon2 = Argon2::default();
 
     Ok(argon2
@@ -17,7 +16,7 @@ pub fn encrypt_password(password: &str) -> Result<String, ApiError> {
 }
 
 /// Verifies that a plaintext password matches the stored hash.
-pub fn verify_password(plain_password: &str, hash: &str) -> Result<bool, ApiError> {
+pub fn verify_password(plain_password: &str, hash: &str) -> Result<(), ApiError> {
     let parsed_hash = PasswordHash::new(hash).map_err(|e| {
         error!("Error parsing password hash: {e}");
         ApiError::WrongPassword
@@ -31,5 +30,4 @@ pub fn verify_password(plain_password: &str, hash: &str) -> Result<bool, ApiErro
             error!("Error verifying password: {e}");
             ApiError::WrongPassword
         })
-        .map(|_| true)
 }

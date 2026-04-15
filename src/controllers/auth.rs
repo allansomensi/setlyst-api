@@ -41,12 +41,7 @@ pub async fn login(
         return Err(ApiError::Unauthorized);
     }
 
-    let is_password_correct = verify_password(&payload.password, &user.password_hash)?;
-
-    if !is_password_correct {
-        error!("Incorrect password for user: {}", payload.username);
-        return Err(ApiError::Unauthorized);
-    }
+    verify_password(&payload.password, &user.password_hash)?;
 
     let token = generate_jwt(&user)?;
 
