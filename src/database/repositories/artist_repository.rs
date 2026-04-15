@@ -1,6 +1,6 @@
 use crate::{
     errors::api_error::ApiError,
-    models::artist::{Artist, ArtistPublic, CreateArtistPayload, UpdateArtistPayload},
+    models::artist::{Artist, CreateArtistPayload, UpdateArtistPayload},
 };
 use sqlx::PgPool;
 use tracing::error;
@@ -13,8 +13,8 @@ pub trait ArtistRepository: Send + Sync {
         user_id: Uuid,
         page: i64,
         size: i64,
-    ) -> Result<(Vec<ArtistPublic>, i64), ApiError>;
-    async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<ArtistPublic>, ApiError>;
+    ) -> Result<(Vec<Artist>, i64), ApiError>;
+    async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Artist>, ApiError>;
     async fn create(
         &self,
         payload: &CreateArtistPayload,
@@ -43,14 +43,14 @@ impl ArtistRepository for ArtistRepositoryImpl {
         user_id: Uuid,
         page: i64,
         size: i64,
-    ) -> Result<(Vec<ArtistPublic>, i64), ApiError> {
+    ) -> Result<(Vec<Artist>, i64), ApiError> {
         let offset = (page - 1) * size;
 
         let count = sqlx::query_scalar("SELECT COUNT(*) FROM artists WHERE user_id = $1;")
             .bind(user_id)
             .fetch_one(&self.db);
 
-        let artists = sqlx::query_as::<_, ArtistPublic>(
+        let artists = sqlx::query_as::<_, Artist>(
             "SELECT id, name, user_id, created_at, updated_at FROM artists WHERE user_id = $1 ORDER BY name ASC LIMIT $2 OFFSET $3",
         )
         .bind(user_id)
@@ -63,8 +63,8 @@ impl ArtistRepository for ArtistRepositoryImpl {
         Ok((artists, count))
     }
 
-    async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<ArtistPublic>, ApiError> {
-        let artist = sqlx::query_as::<_, ArtistPublic>(
+    async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Artist>, ApiError> {
+        let artist = sqlx::query_as::<_, Artist>(
             "SELECT id, name, user_id, created_at, updated_at FROM artists WHERE id = $1 AND user_id = $2",
         )
         .bind(id)

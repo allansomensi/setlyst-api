@@ -1,6 +1,6 @@
 use crate::{
     errors::api_error::ApiError,
-    models::setlist::{CreateSetlistPayload, Setlist, SetlistPublic, UpdateSetlistPayload},
+    models::setlist::{CreateSetlistPayload, Setlist, UpdateSetlistPayload},
 };
 use sqlx::PgPool;
 use tracing::error;
@@ -13,8 +13,8 @@ pub trait SetlistRepository: Send + Sync {
         user_id: Uuid,
         page: i64,
         size: i64,
-    ) -> Result<(Vec<SetlistPublic>, i64), ApiError>;
-    async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<SetlistPublic>, ApiError>;
+    ) -> Result<(Vec<Setlist>, i64), ApiError>;
+    async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Setlist>, ApiError>;
     async fn create(
         &self,
         payload: &CreateSetlistPayload,
@@ -43,14 +43,14 @@ impl SetlistRepository for SetlistRepositoryImpl {
         user_id: Uuid,
         page: i64,
         size: i64,
-    ) -> Result<(Vec<SetlistPublic>, i64), ApiError> {
+    ) -> Result<(Vec<Setlist>, i64), ApiError> {
         let offset = (page - 1) * size;
 
         let count = sqlx::query_scalar("SELECT COUNT(*) FROM setlists WHERE user_id = $1;")
             .bind(user_id)
             .fetch_one(&self.db);
 
-        let setlists = sqlx::query_as::<_, SetlistPublic>(
+        let setlists = sqlx::query_as::<_, Setlist>(
             "SELECT id, title, description, user_id, created_at, updated_at FROM setlists WHERE user_id = $1 ORDER BY title ASC LIMIT $2 OFFSET $3",
         )
         .bind(user_id)
@@ -62,8 +62,8 @@ impl SetlistRepository for SetlistRepositoryImpl {
         Ok((setlists, count))
     }
 
-    async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<SetlistPublic>, ApiError> {
-        let setlist = sqlx::query_as::<_, SetlistPublic>(
+    async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Setlist>, ApiError> {
+        let setlist = sqlx::query_as::<_, Setlist>(
             "SELECT id, title, description, user_id, created_at, updated_at FROM setlists WHERE id = $1 AND user_id = $2",
         )
         .bind(id)

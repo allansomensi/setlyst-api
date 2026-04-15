@@ -1,6 +1,6 @@
 use crate::{
     errors::api_error::ApiError,
-    models::song::{CreateSongPayload, Song, SongPublic, UpdateSongPayload},
+    models::song::{CreateSongPayload, Song, UpdateSongPayload},
 };
 use sqlx::PgPool;
 use tracing::error;
@@ -13,8 +13,8 @@ pub trait SongRepository: Send + Sync {
         user_id: Uuid,
         page: i64,
         size: i64,
-    ) -> Result<(Vec<SongPublic>, i64), ApiError>;
-    async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<SongPublic>, ApiError>;
+    ) -> Result<(Vec<Song>, i64), ApiError>;
+    async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Song>, ApiError>;
     async fn create(&self, payload: &CreateSongPayload, user_id: Uuid) -> Result<Song, ApiError>;
     async fn update(&self, id: Uuid, payload: &UpdateSongPayload) -> Result<Uuid, ApiError>;
     async fn delete(&self, id: Uuid) -> Result<(), ApiError>;
@@ -39,14 +39,14 @@ impl SongRepository for SongRepositoryImpl {
         user_id: Uuid,
         page: i64,
         size: i64,
-    ) -> Result<(Vec<SongPublic>, i64), ApiError> {
+    ) -> Result<(Vec<Song>, i64), ApiError> {
         let offset = (page - 1) * size;
 
         let count = sqlx::query_scalar("SELECT COUNT(*) FROM songs WHERE user_id = $1;")
             .bind(user_id)
             .fetch_one(&self.db);
 
-        let songs = sqlx::query_as::<_, SongPublic>(
+        let songs = sqlx::query_as::<_, Song>(
             "SELECT id, title, artist_id, user_id, created_at, updated_at FROM songs WHERE user_id = $1 ORDER BY title ASC LIMIT $2 OFFSET $3",
         )
         .bind(user_id)
@@ -58,8 +58,8 @@ impl SongRepository for SongRepositoryImpl {
         Ok((songs, count))
     }
 
-    async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<SongPublic>, ApiError> {
-        let song = sqlx::query_as::<_, SongPublic>(
+    async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Song>, ApiError> {
+        let song = sqlx::query_as::<_, Song>(
             "SELECT id, title, artist_id, user_id, created_at, updated_at FROM songs WHERE id = $1 AND user_id = $2",
         )
         .bind(id)

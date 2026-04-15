@@ -15,16 +15,6 @@ pub struct Song {
     pub updated_at: NaiveDateTime,
 }
 
-#[derive(ToSchema, Clone, FromRow, Serialize, Deserialize)]
-pub struct SongPublic {
-    pub id: Uuid,
-    pub title: String,
-    pub artist_id: Uuid,
-    pub user_id: Uuid,
-    pub created_at: NaiveDateTime,
-    pub updated_at: NaiveDateTime,
-}
-
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
 pub struct CreateSongPayload {
     #[validate(length(min = 1, max = 255, message = "Title must be between 1 and 255 chars."))]

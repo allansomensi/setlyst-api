@@ -3,7 +3,7 @@ use crate::{
     errors::api_error::ApiError,
     models::{
         PaginatedResponse, PaginationMeta, PaginationQuery,
-        artist::{ArtistPublic, CreateArtistPayload, UpdateArtistPayload},
+        artist::{Artist, CreateArtistPayload, UpdateArtistPayload},
         auth::access::AccessControl,
     },
 };
@@ -31,7 +31,7 @@ use validator::Validate;
         ("jwt_token" = [])
     ),
     responses(
-        (status = 200, description = "Artists retrieved successfully.", body = PaginatedResponse<ArtistPublic>),
+        (status = 200, description = "Artists retrieved successfully.", body = PaginatedResponse<Artist>),
         (status = 500, description = "An error occurred while retrieving the artists.")
     )
 )]
@@ -86,7 +86,7 @@ pub async fn find_all_artists(
         ("jwt_token" = [])
     ),
     responses(
-        (status = 200, description = "Artist retrieved successfully.", body = ArtistPublic),
+        (status = 200, description = "Artist retrieved successfully.", body = Artist),
         (status = 404, description = "No artist found with the specified ID."),
         (status = 500, description = "An error occurred while retrieving the artist.")
     )

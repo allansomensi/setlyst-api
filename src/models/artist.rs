@@ -14,15 +14,6 @@ pub struct Artist {
     pub updated_at: NaiveDateTime,
 }
 
-#[derive(ToSchema, Clone, FromRow, Serialize, Deserialize)]
-pub struct ArtistPublic {
-    pub id: Uuid,
-    pub name: String,
-    pub user_id: Uuid,
-    pub created_at: NaiveDateTime,
-    pub updated_at: NaiveDateTime,
-}
-
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
 pub struct CreateArtistPayload {
     #[validate(length(

@@ -4,7 +4,7 @@ use crate::{
     models::{
         PaginatedResponse, PaginationMeta, PaginationQuery,
         auth::access::AccessControl,
-        setlist::{CreateSetlistPayload, SetlistPublic, UpdateSetlistPayload},
+        setlist::{CreateSetlistPayload, Setlist, UpdateSetlistPayload},
     },
 };
 use axum::{
@@ -26,7 +26,7 @@ use validator::Validate;
     params(PaginationQuery),
     security((), ("jwt_token" = [])),
     responses(
-        (status = 200, description = "Setlists retrieved successfully.", body = PaginatedResponse<SetlistPublic>),
+        (status = 200, description = "Setlists retrieved successfully.", body = PaginatedResponse<Setlist>),
         (status = 500, description = "An error occurred while retrieving the setlists.")
     )
 )]
@@ -75,7 +75,7 @@ pub async fn find_all_setlists(
     params(("id", description = "The unique identifier of the setlist to retrieve.", example = Uuid::new_v4)),
     security((), ("jwt_token" = [])),
     responses(
-        (status = 200, description = "Setlist retrieved successfully.", body = SetlistPublic),
+        (status = 200, description = "Setlist retrieved successfully.", body = Setlist),
         (status = 404, description = "No setlist found with the specified ID.")
     )
 )]
@@ -111,7 +111,7 @@ pub async fn find_setlist_by_id(
     request_body = CreateSetlistPayload,
     security((), ("jwt_token" = [])),
     responses(
-        (status = 201, description = "Setlist created successfully.", body = SetlistPublic),
+        (status = 201, description = "Setlist created successfully.", body = Setlist),
         (status = 400, description = "Invalid input."),
         (status = 409, description = "Conflict: Setlist already exists.")
     )

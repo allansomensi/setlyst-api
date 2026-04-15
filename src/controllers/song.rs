@@ -4,7 +4,7 @@ use crate::{
     models::{
         PaginatedResponse, PaginationMeta, PaginationQuery,
         auth::access::AccessControl,
-        song::{CreateSongPayload, SongPublic, UpdateSongPayload},
+        song::{CreateSongPayload, Song, UpdateSongPayload},
     },
 };
 use axum::{
@@ -26,7 +26,7 @@ use validator::Validate;
     params(PaginationQuery),
     security((), ("jwt_token" = [])),
     responses(
-        (status = 200, description = "Songs retrieved successfully.", body = PaginatedResponse<SongPublic>),
+        (status = 200, description = "Songs retrieved successfully.", body = PaginatedResponse<Song>),
         (status = 500, description = "An error occurred while retrieving the songs.")
     )
 )]
@@ -75,7 +75,7 @@ pub async fn find_all_songs(
     params(("id", description = "The unique identifier of the song to retrieve.", example = Uuid::new_v4)),
     security((), ("jwt_token" = [])),
     responses(
-        (status = 200, description = "Song retrieved successfully.", body = SongPublic),
+        (status = 200, description = "Song retrieved successfully.", body = Song),
         (status = 404, description = "No song found with the specified ID.")
     )
 )]
@@ -111,7 +111,7 @@ pub async fn find_song_by_id(
     request_body = CreateSongPayload,
     security((), ("jwt_token" = [])),
     responses(
-        (status = 201, description = "Song created successfully.", body = SongPublic),
+        (status = 201, description = "Song created successfully.", body = Song),
         (status = 400, description = "Invalid input."),
         (status = 409, description = "Conflict: Song already exists for this artist.")
     )
