@@ -99,13 +99,14 @@ impl SetlistRepository for SetlistRepositoryImpl {
     }
 
     async fn update(&self, id: Uuid, payload: &UpdateSetlistPayload) -> Result<Uuid, ApiError> {
+        let mut tx = self.db.begin().await?;
         let mut updated = false;
 
         if let Some(title) = &payload.title {
             sqlx::query("UPDATE setlists SET title = $1 WHERE id = $2")
                 .bind(title)
                 .bind(id)
-                .execute(&self.db)
+                .execute(&mut *tx)
                 .await?;
             updated = true;
         }
@@ -114,7 +115,7 @@ impl SetlistRepository for SetlistRepositoryImpl {
             sqlx::query("UPDATE setlists SET description = $1 WHERE id = $2")
                 .bind(description)
                 .bind(id)
-                .execute(&self.db)
+                .execute(&mut *tx)
                 .await?;
             updated = true;
         }
@@ -123,8 +124,10 @@ impl SetlistRepository for SetlistRepositoryImpl {
             sqlx::query("UPDATE setlists SET updated_at = $1 WHERE id = $2")
                 .bind(chrono::Utc::now().naive_utc())
                 .bind(id)
-                .execute(&self.db)
+                .execute(&mut *tx)
                 .await?;
+
+            tx.commit().await?;
             Ok(id)
         } else {
             Err(ApiError::NotModified)

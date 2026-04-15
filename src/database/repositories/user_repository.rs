@@ -100,13 +100,14 @@ impl UserRepository for UserRepositoryImpl {
     }
 
     async fn update(&self, id: Uuid, payload: &UpdateUserPayload) -> Result<Uuid, ApiError> {
+        let mut tx = self.db.begin().await?;
         let mut updated = false;
 
         if let Some(username) = &payload.username {
             sqlx::query("UPDATE users SET username = $1 WHERE id = $2;")
                 .bind(username)
                 .bind(id)
-                .execute(&self.db)
+                .execute(&mut *tx)
                 .await?;
             updated = true;
         }
@@ -115,7 +116,7 @@ impl UserRepository for UserRepositoryImpl {
             sqlx::query("UPDATE users SET email = $1 WHERE id = $2;")
                 .bind(email)
                 .bind(id)
-                .execute(&self.db)
+                .execute(&mut *tx)
                 .await?;
             updated = true;
         }
@@ -125,7 +126,7 @@ impl UserRepository for UserRepositoryImpl {
             sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2;")
                 .bind(&encrypted_password)
                 .bind(id)
-                .execute(&self.db)
+                .execute(&mut *tx)
                 .await?;
             updated = true;
         }
@@ -134,7 +135,7 @@ impl UserRepository for UserRepositoryImpl {
             sqlx::query("UPDATE users SET first_name = $1 WHERE id = $2;")
                 .bind(first_name)
                 .bind(id)
-                .execute(&self.db)
+                .execute(&mut *tx)
                 .await?;
             updated = true;
         }
@@ -143,7 +144,7 @@ impl UserRepository for UserRepositoryImpl {
             sqlx::query("UPDATE users SET last_name = $1 WHERE id = $2;")
                 .bind(last_name)
                 .bind(id)
-                .execute(&self.db)
+                .execute(&mut *tx)
                 .await?;
             updated = true;
         }
@@ -152,7 +153,7 @@ impl UserRepository for UserRepositoryImpl {
             sqlx::query("UPDATE users SET role = $1 WHERE id = $2;")
                 .bind(role)
                 .bind(id)
-                .execute(&self.db)
+                .execute(&mut *tx)
                 .await?;
             updated = true;
         }
@@ -161,7 +162,7 @@ impl UserRepository for UserRepositoryImpl {
             sqlx::query("UPDATE users SET status = $1 WHERE id = $2;")
                 .bind(status)
                 .bind(id)
-                .execute(&self.db)
+                .execute(&mut *tx)
                 .await?;
             updated = true;
         }
@@ -170,8 +171,10 @@ impl UserRepository for UserRepositoryImpl {
             sqlx::query("UPDATE users SET updated_at = $1 WHERE id = $2;")
                 .bind(chrono::Utc::now().naive_utc())
                 .bind(id)
-                .execute(&self.db)
+                .execute(&mut *tx)
                 .await?;
+
+            tx.commit().await?;
         } else {
             return Err(ApiError::NotModified);
         }
