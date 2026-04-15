@@ -4,7 +4,6 @@ use crate::{
         repositories::song_repository::{SongRepository, SongRepositoryImpl},
     },
     errors::api_error::ApiError,
-    models::DeletePayload,
 };
 use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -46,7 +45,6 @@ pub struct CreateSongPayload {
 
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
 pub struct UpdateSongPayload {
-    pub id: Uuid,
     #[validate(length(
         min = 1,
         max = 255,
@@ -69,12 +67,13 @@ impl Song {
         }
     }
 
-    pub async fn count(state: &AppState, user_id: Uuid) -> Result<i64, ApiError> {
-        SongRepositoryImpl::count(state, user_id).await
-    }
-
-    pub async fn find_all(state: &AppState, user_id: Uuid) -> Result<Vec<SongPublic>, ApiError> {
-        SongRepositoryImpl::find_all(state, user_id).await
+    pub async fn find_all(
+        state: &AppState,
+        user_id: Uuid,
+        page: i64,
+        size: i64,
+    ) -> Result<(Vec<SongPublic>, i64), ApiError> {
+        SongRepositoryImpl::find_all(state, user_id, page, size).await
     }
 
     pub async fn find_by_id(
@@ -93,11 +92,15 @@ impl Song {
         SongRepositoryImpl::create(state, payload, user_id).await
     }
 
-    pub async fn update(state: &AppState, payload: &UpdateSongPayload) -> Result<Uuid, ApiError> {
-        SongRepositoryImpl::update(state, payload).await
+    pub async fn update(
+        state: &AppState,
+        id: Uuid,
+        payload: &UpdateSongPayload,
+    ) -> Result<Uuid, ApiError> {
+        SongRepositoryImpl::update(state, id, payload).await
     }
 
-    pub async fn delete(state: &AppState, payload: &DeletePayload) -> Result<(), ApiError> {
-        SongRepositoryImpl::delete(state, payload).await
+    pub async fn delete(state: &AppState, id: Uuid) -> Result<(), ApiError> {
+        SongRepositoryImpl::delete(state, id).await
     }
 }

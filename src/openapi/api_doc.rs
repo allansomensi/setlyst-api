@@ -50,7 +50,6 @@ use utoipa::{
         artist::delete_artist,
 
         // Songs
-        song::count_songs,
         song::find_song_by_id,
         song::find_all_songs,
         song::create_song,
