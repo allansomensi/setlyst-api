@@ -57,7 +57,6 @@ use utoipa::{
         song::delete_song,
 
         // Setlists
-        setlist::count_setlists,
         setlist::find_setlist_by_id,
         setlist::find_all_setlists,
         setlist::create_setlist,

@@ -2,7 +2,6 @@ use crate::{
     database::AppState,
     errors::api_error::ApiError,
     models::{
-        DeletePayload,
         setlist::{CreateSetlistPayload, Setlist, SetlistPublic, UpdateSetlistPayload},
         song::SongPublic,
     },
@@ -13,8 +12,12 @@ use uuid::Uuid;
 
 #[async_trait::async_trait]
 pub trait SetlistRepository {
-    async fn count(state: &AppState, user_id: Uuid) -> Result<i64, ApiError>;
-    async fn find_all(state: &AppState, user_id: Uuid) -> Result<Vec<SetlistPublic>, ApiError>;
+    async fn find_all(
+        state: &AppState,
+        user_id: Uuid,
+        page: i64,
+        size: i64,
+    ) -> Result<(Vec<SetlistPublic>, i64), ApiError>;
     async fn find_by_id(
         state: &AppState,
         id: Uuid,
@@ -25,32 +28,42 @@ pub trait SetlistRepository {
         payload: &CreateSetlistPayload,
         user_id: Uuid,
     ) -> Result<Setlist, ApiError>;
-    async fn update(state: &AppState, payload: &UpdateSetlistPayload) -> Result<Uuid, ApiError>;
-    async fn delete(state: &AppState, payload: &DeletePayload) -> Result<(), ApiError>;
+    async fn update(
+        state: &AppState,
+        id: Uuid,
+        payload: &UpdateSetlistPayload,
+    ) -> Result<Uuid, ApiError>;
+    async fn delete(state: &AppState, id: Uuid) -> Result<(), ApiError>;
 }
 
 pub struct SetlistRepositoryImpl;
 
 #[async_trait::async_trait]
 impl SetlistRepository for SetlistRepositoryImpl {
-    async fn count(state: &AppState, user_id: Uuid) -> Result<i64, ApiError> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM setlists WHERE user_id = $1;")
-            .bind(user_id)
-            .fetch_one(&state.db)
-            .await?;
-        Ok(count)
-    }
+    async fn find_all(
+        state: &AppState,
+        user_id: Uuid,
+        page: i64,
+        size: i64,
+    ) -> Result<(Vec<SetlistPublic>, i64), ApiError> {
+        let offset = (page - 1) * size;
 
-    async fn find_all(state: &AppState, user_id: Uuid) -> Result<Vec<SetlistPublic>, ApiError> {
-        let setlists = sqlx::query_as::<_, Setlist>(
-            "SELECT id, title, description, user_id, created_at, updated_at FROM setlists WHERE user_id = $1 ORDER BY created_at DESC"
+        let count_future = sqlx::query_scalar("SELECT COUNT(*) FROM setlists WHERE user_id = $1;")
+            .bind(user_id)
+            .fetch_one(&state.db);
+
+        let setlists_future = sqlx::query_as::<_, Setlist>(
+            "SELECT id, title, description, user_id, created_at, updated_at FROM setlists WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"
         )
         .bind(user_id)
-        .fetch_all(&state.db)
-        .await?;
+        .bind(size)
+        .bind(offset)
+        .fetch_all(&state.db);
+
+        let (total_items, setlists) = tokio::try_join!(count_future, setlists_future)?;
 
         if setlists.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), total_items));
         }
 
         let setlist_ids: Vec<Uuid> = setlists.iter().map(|s| s.id).collect();
@@ -97,7 +110,7 @@ impl SetlistRepository for SetlistRepositoryImpl {
             })
             .collect();
 
-        Ok(result)
+        Ok((result, total_items))
     }
 
     async fn find_by_id(
@@ -170,7 +183,11 @@ impl SetlistRepository for SetlistRepositoryImpl {
         Ok(new_setlist)
     }
 
-    async fn update(state: &AppState, payload: &UpdateSetlistPayload) -> Result<Uuid, ApiError> {
+    async fn update(
+        state: &AppState,
+        id: Uuid,
+        payload: &UpdateSetlistPayload,
+    ) -> Result<Uuid, ApiError> {
         let mut tx = state.db.begin().await?;
         let now = Utc::now().naive_utc();
 
@@ -178,7 +195,7 @@ impl SetlistRepository for SetlistRepositoryImpl {
             sqlx::query("UPDATE setlists SET title = $1, updated_at = $2 WHERE id = $3")
                 .bind(title)
                 .bind(now)
-                .bind(payload.id)
+                .bind(id)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -187,14 +204,14 @@ impl SetlistRepository for SetlistRepositoryImpl {
             sqlx::query("UPDATE setlists SET description = $1, updated_at = $2 WHERE id = $3")
                 .bind(description)
                 .bind(now)
-                .bind(payload.id)
+                .bind(id)
                 .execute(&mut *tx)
                 .await?;
         }
 
         if let Some(song_ids) = &payload.song_ids {
             sqlx::query("DELETE FROM setlist_songs WHERE setlist_id = $1")
-                .bind(payload.id)
+                .bind(id)
                 .execute(&mut *tx)
                 .await?;
 
@@ -202,7 +219,7 @@ impl SetlistRepository for SetlistRepositoryImpl {
                 sqlx::query(
                     "INSERT INTO setlist_songs (setlist_id, song_id, position) VALUES ($1, $2, $3)",
                 )
-                .bind(payload.id)
+                .bind(id)
                 .bind(song_id)
                 .bind(pos as i32)
                 .execute(&mut *tx)
@@ -211,18 +228,18 @@ impl SetlistRepository for SetlistRepositoryImpl {
 
             sqlx::query("UPDATE setlists SET updated_at = $1 WHERE id = $2")
                 .bind(now)
-                .bind(payload.id)
+                .bind(id)
                 .execute(&mut *tx)
                 .await?;
         }
 
         tx.commit().await?;
-        Ok(payload.id)
+        Ok(id)
     }
 
-    async fn delete(state: &AppState, payload: &DeletePayload) -> Result<(), ApiError> {
+    async fn delete(state: &AppState, id: Uuid) -> Result<(), ApiError> {
         sqlx::query("DELETE FROM setlists WHERE id = $1")
-            .bind(payload.id)
+            .bind(id)
             .execute(&state.db)
             .await?;
         Ok(())

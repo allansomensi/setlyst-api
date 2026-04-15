@@ -4,7 +4,7 @@ use crate::{
         repositories::setlist_repository::{SetlistRepository, SetlistRepositoryImpl},
     },
     errors::api_error::ApiError,
-    models::{DeletePayload, song::SongPublic},
+    models::song::SongPublic,
 };
 use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -44,7 +44,6 @@ pub struct CreateSetlistPayload {
 
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
 pub struct UpdateSetlistPayload {
-    pub id: Uuid,
     #[validate(length(min = 1, max = 255, message = "Title must be between 1 and 255 chars."))]
     pub title: Option<String>,
     pub description: Option<String>,
@@ -64,12 +63,13 @@ impl Setlist {
         }
     }
 
-    pub async fn count(state: &AppState, user_id: Uuid) -> Result<i64, ApiError> {
-        SetlistRepositoryImpl::count(state, user_id).await
-    }
-
-    pub async fn find_all(state: &AppState, user_id: Uuid) -> Result<Vec<SetlistPublic>, ApiError> {
-        SetlistRepositoryImpl::find_all(state, user_id).await
+    pub async fn find_all(
+        state: &AppState,
+        user_id: Uuid,
+        page: i64,
+        size: i64,
+    ) -> Result<(Vec<SetlistPublic>, i64), ApiError> {
+        SetlistRepositoryImpl::find_all(state, user_id, page, size).await
     }
 
     pub async fn find_by_id(
@@ -90,12 +90,13 @@ impl Setlist {
 
     pub async fn update(
         state: &AppState,
+        id: Uuid,
         payload: &UpdateSetlistPayload,
     ) -> Result<Uuid, ApiError> {
-        SetlistRepositoryImpl::update(state, payload).await
+        SetlistRepositoryImpl::update(state, id, payload).await
     }
 
-    pub async fn delete(state: &AppState, payload: &DeletePayload) -> Result<(), ApiError> {
-        SetlistRepositoryImpl::delete(state, payload).await
+    pub async fn delete(state: &AppState, id: Uuid) -> Result<(), ApiError> {
+        SetlistRepositoryImpl::delete(state, id).await
     }
 }
