@@ -68,7 +68,7 @@ async fn main() {
 
     state
         .user_repo
-        .is_unique(&user.username)
+        .is_unique(&user.username, None)
         .await
         .expect("❌ Username already exists!");
 

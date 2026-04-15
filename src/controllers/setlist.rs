@@ -131,7 +131,7 @@ pub async fn create_setlist(
 
     state
         .setlist_repo
-        .is_unique(&payload.title, user_id)
+        .is_unique(&payload.title, user_id, None)
         .await?;
 
     match state.setlist_repo.create(&payload, user_id).await {
@@ -181,7 +181,10 @@ pub async fn update_setlist(
     state.setlist_repo.exists(id, user_id).await?;
 
     if let Some(title) = &payload.title {
-        state.setlist_repo.is_unique(title, user_id).await?;
+        state
+            .setlist_repo
+            .is_unique(title, user_id, Some(id))
+            .await?;
     }
 
     match state.setlist_repo.update(id, &payload).await {

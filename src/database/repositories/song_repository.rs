@@ -18,7 +18,13 @@ pub trait SongRepository: Send + Sync {
     async fn create(&self, payload: &CreateSongPayload, user_id: Uuid) -> Result<Song, ApiError>;
     async fn update(&self, id: Uuid, payload: &UpdateSongPayload) -> Result<Uuid, ApiError>;
     async fn delete(&self, id: Uuid) -> Result<(), ApiError>;
-    async fn is_unique(&self, title: &str, artist_id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
+    async fn is_unique(
+        &self,
+        title: &str,
+        artist_id: Uuid,
+        user_id: Uuid,
+        exclude_id: Option<Uuid>,
+    ) -> Result<(), ApiError>;
     async fn exists(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
 }
 
@@ -104,16 +110,30 @@ impl SongRepository for SongRepositoryImpl {
         Ok(())
     }
 
-    async fn is_unique(&self, title: &str, artist_id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
-        let exists = sqlx::query(
-            "SELECT id FROM songs WHERE title = $1 AND artist_id = $2 AND user_id = $3;",
-        )
-        .bind(title)
-        .bind(artist_id)
-        .bind(user_id)
-        .fetch_optional(&self.db)
-        .await?
-        .is_some();
+    async fn is_unique(
+        &self,
+        title: &str,
+        artist_id: Uuid,
+        user_id: Uuid,
+        exclude_id: Option<Uuid>,
+    ) -> Result<(), ApiError> {
+        let exists = match exclude_id {
+        Some(id) => sqlx::query("SELECT id FROM songs WHERE title = $1 AND artist_id = $2 AND user_id = $3 AND id != $4;")
+            .bind(title)
+            .bind(artist_id)
+            .bind(user_id)
+            .bind(id)
+            .fetch_optional(&self.db)
+            .await?
+            .is_some(),
+        None => sqlx::query("SELECT id FROM songs WHERE title = $1 AND artist_id = $2 AND user_id = $3;")
+            .bind(title)
+            .bind(artist_id)
+            .bind(user_id)
+            .fetch_optional(&self.db)
+            .await?
+            .is_some(),
+    };
 
         if exists {
             error!("Song '{title}' already exists for this artist.");

@@ -132,7 +132,7 @@ pub async fn create_song(
     state.artist_repo.exists(payload.artist_id, user_id).await?;
     state
         .song_repo
-        .is_unique(&payload.title, payload.artist_id, user_id)
+        .is_unique(&payload.title, payload.artist_id, user_id, None)
         .await?;
 
     match state.song_repo.create(&payload, user_id).await {
@@ -181,6 +181,10 @@ pub async fn update_song(
 
     state.song_repo.exists(id, user_id).await?;
     state.artist_repo.exists(payload.artist_id, user_id).await?;
+    state
+        .song_repo
+        .is_unique(&payload.title, payload.artist_id, user_id, Some(id))
+        .await?;
 
     match state.song_repo.update(id, &payload).await {
         Ok(song_id) => {

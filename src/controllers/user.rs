@@ -141,7 +141,7 @@ pub async fn create_user(
     access.require_any_role(&[Role::Admin, Role::Moderator])?;
 
     payload.validate()?;
-    state.user_repo.is_unique(&payload.username).await?;
+    state.user_repo.is_unique(&payload.username, None).await?;
 
     match state.user_repo.create(&payload).await {
         Ok(new_user) => {
@@ -202,6 +202,10 @@ pub async fn update_user(
 
     payload.validate()?;
     state.user_repo.exists(id).await?;
+
+    if let Some(username) = &payload.username {
+        state.user_repo.is_unique(username, Some(id)).await?;
+    }
 
     match state.user_repo.update(id, &payload).await {
         Ok(user_id) => {

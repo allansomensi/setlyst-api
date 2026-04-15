@@ -15,7 +15,7 @@ pub trait UserRepository: Send + Sync {
     async fn create(&self, payload: &CreateUserPayload) -> Result<User, ApiError>;
     async fn update(&self, id: Uuid, payload: &UpdateUserPayload) -> Result<Uuid, ApiError>;
     async fn delete(&self, id: Uuid) -> Result<(), ApiError>;
-    async fn is_unique(&self, username: &str) -> Result<(), ApiError>;
+    async fn is_unique(&self, username: &str, exclude_id: Option<Uuid>) -> Result<(), ApiError>;
     async fn exists(&self, user_id: Uuid) -> Result<(), ApiError>;
 }
 
@@ -187,12 +187,20 @@ impl UserRepository for UserRepositoryImpl {
         Ok(())
     }
 
-    async fn is_unique(&self, username: &str) -> Result<(), ApiError> {
-        let exists = sqlx::query("SELECT id FROM users WHERE username = $1;")
-            .bind(username)
-            .fetch_optional(&self.db)
-            .await?
-            .is_some();
+    async fn is_unique(&self, username: &str, exclude_id: Option<Uuid>) -> Result<(), ApiError> {
+        let exists = match exclude_id {
+            Some(id) => sqlx::query("SELECT id FROM users WHERE username = $1 AND id != $2;")
+                .bind(username)
+                .bind(id)
+                .fetch_optional(&self.db)
+                .await?
+                .is_some(),
+            None => sqlx::query("SELECT id FROM users WHERE username = $1;")
+                .bind(username)
+                .fetch_optional(&self.db)
+                .await?
+                .is_some(),
+        };
 
         if exists {
             error!("Username '{username}' already exists.");

@@ -22,7 +22,12 @@ pub trait SetlistRepository: Send + Sync {
     ) -> Result<Setlist, ApiError>;
     async fn update(&self, id: Uuid, payload: &UpdateSetlistPayload) -> Result<Uuid, ApiError>;
     async fn delete(&self, id: Uuid) -> Result<(), ApiError>;
-    async fn is_unique(&self, title: &str, user_id: Uuid) -> Result<(), ApiError>;
+    async fn is_unique(
+        &self,
+        title: &str,
+        user_id: Uuid,
+        exclude_id: Option<Uuid>,
+    ) -> Result<(), ApiError>;
     async fn exists(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
 }
 
@@ -134,13 +139,29 @@ impl SetlistRepository for SetlistRepositoryImpl {
         Ok(())
     }
 
-    async fn is_unique(&self, title: &str, user_id: Uuid) -> Result<(), ApiError> {
-        let exists = sqlx::query("SELECT id FROM setlists WHERE title = $1 AND user_id = $2;")
+    async fn is_unique(
+        &self,
+        title: &str,
+        user_id: Uuid,
+        exclude_id: Option<Uuid>,
+    ) -> Result<(), ApiError> {
+        let exists = match exclude_id {
+            Some(id) => sqlx::query(
+                "SELECT id FROM setlists WHERE title = $1 AND user_id = $2 AND id != $3;",
+            )
             .bind(title)
             .bind(user_id)
+            .bind(id)
             .fetch_optional(&self.db)
             .await?
-            .is_some();
+            .is_some(),
+            None => sqlx::query("SELECT id FROM setlists WHERE title = $1 AND user_id = $2;")
+                .bind(title)
+                .bind(user_id)
+                .fetch_optional(&self.db)
+                .await?
+                .is_some(),
+        };
 
         if exists {
             error!("Setlist '{title}' already exists for this user.");

@@ -145,7 +145,10 @@ pub async fn create_artist(
     payload.validate()?;
 
     let user_id = access.user_id();
-    state.artist_repo.is_unique(&payload.name, user_id).await?;
+    state
+        .artist_repo
+        .is_unique(&payload.name, user_id, None)
+        .await?;
 
     match state.artist_repo.create(&payload, user_id).await {
         Ok(new_artist) => {
@@ -200,7 +203,10 @@ pub async fn update_artist(
     let user_id = access.user_id();
 
     state.artist_repo.exists(id, user_id).await?;
-    state.artist_repo.is_unique(&payload.name, user_id).await?;
+    state
+        .artist_repo
+        .is_unique(&payload.name, user_id, Some(id))
+        .await?;
 
     match state.artist_repo.update(id, &payload).await {
         Ok(artist_id) => {

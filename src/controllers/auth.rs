@@ -78,7 +78,7 @@ pub async fn register(
     );
 
     payload.validate()?;
-    state.user_repo.is_unique(&payload.username).await?;
+    state.user_repo.is_unique(&payload.username, None).await?;
 
     let user_payload = CreateUserPayload::from(payload);
 

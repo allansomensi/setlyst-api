@@ -22,7 +22,12 @@ pub trait ArtistRepository: Send + Sync {
     ) -> Result<Artist, ApiError>;
     async fn update(&self, id: Uuid, payload: &UpdateArtistPayload) -> Result<Uuid, ApiError>;
     async fn delete(&self, id: Uuid) -> Result<(), ApiError>;
-    async fn is_unique(&self, name: &str, user_id: Uuid) -> Result<(), ApiError>;
+    async fn is_unique(
+        &self,
+        name: &str,
+        user_id: Uuid,
+        exclude_id: Option<Uuid>,
+    ) -> Result<(), ApiError>;
     async fn exists(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
 }
 
@@ -111,13 +116,29 @@ impl ArtistRepository for ArtistRepositoryImpl {
         Ok(())
     }
 
-    async fn is_unique(&self, name: &str, user_id: Uuid) -> Result<(), ApiError> {
-        let exists = sqlx::query("SELECT id FROM artists WHERE name = $1 AND user_id = $2;")
-            .bind(name)
-            .bind(user_id)
-            .fetch_optional(&self.db)
-            .await?
-            .is_some();
+    async fn is_unique(
+        &self,
+        name: &str,
+        user_id: Uuid,
+        exclude_id: Option<Uuid>,
+    ) -> Result<(), ApiError> {
+        let exists = match exclude_id {
+            Some(id) => {
+                sqlx::query("SELECT id FROM artists WHERE name = $1 AND user_id = $2 AND id != $3;")
+                    .bind(name)
+                    .bind(user_id)
+                    .bind(id)
+                    .fetch_optional(&self.db)
+                    .await?
+                    .is_some()
+            }
+            None => sqlx::query("SELECT id FROM artists WHERE name = $1 AND user_id = $2;")
+                .bind(name)
+                .bind(user_id)
+                .fetch_optional(&self.db)
+                .await?
+                .is_some(),
+        };
 
         if exists {
             error!("Artist '{name}' already exists for this user.");
