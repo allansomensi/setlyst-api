@@ -4,7 +4,7 @@ use crate::{
     models::{
         PaginatedResponse, PaginationMeta, PaginationQuery,
         auth::access::AccessControl,
-        user::{CreateUserPayload, Role, UpdateUserPayload},
+        user::{CreateUserPayload, Role, UpdateUserPayload, UserPublic},
     },
 };
 use axum::{
@@ -153,7 +153,11 @@ pub async fn create_user(
                 headers.insert(LOCATION, header_value);
             }
 
-            Ok((StatusCode::CREATED, headers, Json(new_user)))
+            Ok((
+                StatusCode::CREATED,
+                headers,
+                Json(UserPublic::from(new_user)),
+            ))
         }
         Err(e) => {
             error!(

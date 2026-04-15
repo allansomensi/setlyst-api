@@ -62,6 +62,22 @@ pub struct UserPublic {
     pub updated_at: NaiveDateTime,
 }
 
+impl From<User> for UserPublic {
+    fn from(user: User) -> Self {
+        Self {
+            id: user.id,
+            username: user.username,
+            email: user.email,
+            first_name: user.first_name,
+            last_name: user.last_name,
+            role: user.role,
+            status: user.status,
+            created_at: user.created_at,
+            updated_at: user.updated_at,
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
 pub struct RegisterPayload {
     #[validate(length(

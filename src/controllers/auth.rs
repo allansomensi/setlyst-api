@@ -3,7 +3,7 @@ use crate::{
     errors::api_error::ApiError,
     models::{
         auth::{LoginPayload, token::VerifyTokenPayload},
-        user::{CreateUserPayload, RegisterPayload, Status},
+        user::{CreateUserPayload, RegisterPayload, Status, UserPublic},
     },
     utils::{
         hashing::verify_password,
@@ -90,7 +90,7 @@ pub async fn register(
     match state.user_repo.create(&user_payload).await {
         Ok(new_user) => {
             info!("User created! ID: {}", &new_user.id);
-            Ok((StatusCode::CREATED, Json(new_user)))
+            Ok((StatusCode::CREATED, Json(UserPublic::from(new_user))))
         }
         Err(e) => {
             error!(
