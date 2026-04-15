@@ -3,13 +3,12 @@ use crate::{
     errors::api_error::ApiError,
     models::{
         auth::{LoginPayload, token::VerifyTokenPayload},
-        user::{CreateUserPayload, RegisterPayload, Role, Status, User},
+        user::{CreateUserPayload, RegisterPayload, Status},
     },
     utils::{
         hashing::verify_password,
         jwt::{generate_jwt, validate_jwt},
     },
-    validations::uniqueness::is_user_unique,
 };
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use tracing::{debug, error, info};
@@ -33,29 +32,23 @@ pub async fn login(
     State(state): State<AppState>,
     Json(payload): Json<LoginPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_data: Option<(Status, String, Role)> =
-        sqlx::query_as(r#"SELECT status, password_hash, role FROM users WHERE username = $1;"#)
-            .bind(&payload.username)
-            .fetch_optional(&state.db)
-            .await?;
-
-    let (user_status, password_hash, user_role) = match user_data {
-        Some(data) => data,
+    let user = match state.user_repo.find_by_username(&payload.username).await? {
+        Some(u) => u,
         None => return Err(ApiError::NotFound),
     };
 
-    if user_status != Status::Active {
+    if user.status != Status::Active {
         return Err(ApiError::Unauthorized);
     }
 
-    let is_password_correct = verify_password(&payload.password, &password_hash)?;
+    let is_password_correct = verify_password(&payload.password, &user.password_hash)?;
 
     if !is_password_correct {
         error!("Incorrect password for user: {}", payload.username);
         return Err(ApiError::Unauthorized);
     }
 
-    let token = generate_jwt(&payload.username, &user_role.to_string())?;
+    let token = generate_jwt(&payload.username, &user.role.to_string())?;
 
     info!("Login successful for user: {}", payload.username);
 
@@ -74,7 +67,7 @@ pub async fn login(
     description = "This endpoint register a new user in the database with the provided details.",
     request_body = RegisterPayload,
     responses(
-        (status = 201, description = "User registered successfully.", body = Uuid),
+        (status = 201, description = "User registered successfully."),
         (status = 400, description = "Invalid input, including empty name or name too short/long."),
         (status = 409, description = "Conflict: User with the same name already exists."),
         (status = 500, description = "An error occurred while creating the user.")
@@ -89,16 +82,15 @@ pub async fn register(
         payload.username
     );
 
-    // Validations
     payload.validate()?;
-    is_user_unique(&state, &payload.username).await?;
+    state.user_repo.is_unique(&payload.username).await?;
 
     let user_payload = CreateUserPayload::from(payload);
 
-    match User::create(&state, &user_payload).await {
+    match state.user_repo.create(&user_payload).await {
         Ok(new_user) => {
             info!("User created! ID: {}", &new_user.id);
-            Ok((StatusCode::CREATED, Json(new_user.id)))
+            Ok((StatusCode::CREATED, Json(new_user)))
         }
         Err(e) => {
             error!(

@@ -1,10 +1,3 @@
-use crate::{
-    database::{
-        AppState,
-        repositories::user_repository::{UserRepository, UserRepositoryImpl},
-    },
-    errors::api_error::ApiError,
-};
 use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::prelude::{FromRow, Type};
@@ -199,33 +192,5 @@ impl User {
             created_at: Utc::now().naive_utc(),
             updated_at: Utc::now().naive_utc(),
         }
-    }
-
-    pub async fn find_all(
-        state: &AppState,
-        page: i64,
-        size: i64,
-    ) -> Result<(Vec<UserPublic>, i64), ApiError> {
-        UserRepositoryImpl::find_all(state, page, size).await
-    }
-
-    pub async fn find_by_id(state: &AppState, id: Uuid) -> Result<Option<UserPublic>, ApiError> {
-        UserRepositoryImpl::find_by_id(state, id).await
-    }
-
-    pub async fn create(state: &AppState, payload: &CreateUserPayload) -> Result<Self, ApiError> {
-        UserRepositoryImpl::create(state, payload).await
-    }
-
-    pub async fn update(
-        state: &AppState,
-        id: Uuid,
-        payload: &UpdateUserPayload,
-    ) -> Result<Uuid, ApiError> {
-        UserRepositoryImpl::update(state, id, payload).await
-    }
-
-    pub async fn delete(state: &AppState, id: Uuid) -> Result<(), ApiError> {
-        UserRepositoryImpl::delete(state, id).await
     }
 }

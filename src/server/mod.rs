@@ -1,8 +1,11 @@
 use crate::{
-    database::{AppState, connection::create_pool},
+    database::{
+        AppState, connection::create_pool, repositories::user_repository::UserRepositoryImpl,
+    },
     errors::api_error::ApiError,
     routes,
 };
+use std::sync::Arc;
 use tracing::{error, info};
 
 pub async fn run() -> Result<(), ApiError> {
@@ -17,12 +20,19 @@ pub async fn run() -> Result<(), ApiError> {
         }
     };
 
-    let app = routes::create_routes(AppState { db: pool.clone() });
+    let user_repo = Arc::new(UserRepositoryImpl::new(pool.clone()));
+
+    let state = AppState {
+        db: pool.clone(),
+        user_repo,
+    };
+
+    let app = routes::create_routes(state);
 
     let addr = std::env::var("HOST")?;
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => {
-            info!("✅ Server started at: {addr}");
+            info!("✅ Server started at: {}", &addr);
             listener
         }
         Err(e) => {

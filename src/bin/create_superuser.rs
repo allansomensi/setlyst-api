@@ -1,9 +1,10 @@
 use clap::Parser;
 use setlyst_api::{
     config,
-    database::{AppState, connection::create_pool},
-    models::user::{CreateUserPayload, Role, Status, User},
-    validations::uniqueness::is_user_unique,
+    database::{
+        AppState, connection::create_pool, repositories::user_repository::UserRepositoryImpl,
+    },
+    models::user::{CreateUserPayload, Role, Status},
 };
 use std::sync::Arc;
 use tracing::{error, info};
@@ -35,7 +36,12 @@ async fn main() {
         }
     };
 
-    let state = Arc::new(AppState { db: pool.clone() });
+    let user_repo = Arc::new(UserRepositoryImpl::new(pool.clone()));
+
+    let state = AppState {
+        db: pool.clone(),
+        user_repo,
+    };
 
     let user = CreateUserPayload {
         username: args.username,
@@ -48,11 +54,14 @@ async fn main() {
     };
 
     user.validate().expect("❌ Validation error");
-    is_user_unique(&state, &user.username)
+
+    state
+        .user_repo
+        .is_unique(&user.username)
         .await
         .expect("❌ Username already exists!");
 
-    match User::create(&state, &user).await {
+    match state.user_repo.create(&user).await {
         Ok(new_user) => {
             info!("✅ Superuser created! ID: {}", &new_user.id);
         }
