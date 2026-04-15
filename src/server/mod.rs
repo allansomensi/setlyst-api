@@ -3,7 +3,8 @@ use crate::{
         AppState,
         connection::create_pool,
         repositories::{
-            artist_repository::ArtistRepositoryImpl, user_repository::UserRepositoryImpl,
+            artist_repository::ArtistRepositoryImpl, song_repository::SongRepositoryImpl,
+            user_repository::UserRepositoryImpl,
         },
     },
     errors::api_error::ApiError,
@@ -26,11 +27,13 @@ pub async fn run() -> Result<(), ApiError> {
 
     let user_repo = Arc::new(UserRepositoryImpl::new(pool.clone()));
     let artist_repo = Arc::new(ArtistRepositoryImpl::new(pool.clone()));
+    let song_repo = Arc::new(SongRepositoryImpl::new(pool.clone()));
 
     let state = AppState {
         db: pool.clone(),
         user_repo,
         artist_repo,
+        song_repo,
     };
 
     let app = routes::create_routes(state);

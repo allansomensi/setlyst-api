@@ -1,10 +1,3 @@
-use crate::{
-    database::{
-        AppState,
-        repositories::song_repository::{SongRepository, SongRepositoryImpl},
-    },
-    errors::api_error::ApiError,
-};
 use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::prelude::FromRow;
@@ -34,24 +27,16 @@ pub struct SongPublic {
 
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
 pub struct CreateSongPayload {
-    #[validate(length(
-        min = 1,
-        max = 255,
-        message = "Title must be between 1 and 255 characters."
-    ))]
+    #[validate(length(min = 1, max = 255, message = "Title must be between 1 and 255 chars."))]
     pub title: String,
     pub artist_id: Uuid,
 }
 
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
 pub struct UpdateSongPayload {
-    #[validate(length(
-        min = 1,
-        max = 255,
-        message = "Title must be between 1 and 255 characters."
-    ))]
-    pub title: Option<String>,
-    pub artist_id: Option<Uuid>,
+    #[validate(length(min = 1, max = 255, message = "Title must be between 1 and 255 chars."))]
+    pub title: String,
+    pub artist_id: Uuid,
 }
 
 impl Song {
@@ -65,42 +50,5 @@ impl Song {
             created_at: now,
             updated_at: now,
         }
-    }
-
-    pub async fn find_all(
-        state: &AppState,
-        user_id: Uuid,
-        page: i64,
-        size: i64,
-    ) -> Result<(Vec<SongPublic>, i64), ApiError> {
-        SongRepositoryImpl::find_all(state, user_id, page, size).await
-    }
-
-    pub async fn find_by_id(
-        state: &AppState,
-        id: Uuid,
-        user_id: Uuid,
-    ) -> Result<Option<SongPublic>, ApiError> {
-        SongRepositoryImpl::find_by_id(state, id, user_id).await
-    }
-
-    pub async fn create(
-        state: &AppState,
-        payload: &CreateSongPayload,
-        user_id: Uuid,
-    ) -> Result<Song, ApiError> {
-        SongRepositoryImpl::create(state, payload, user_id).await
-    }
-
-    pub async fn update(
-        state: &AppState,
-        id: Uuid,
-        payload: &UpdateSongPayload,
-    ) -> Result<Uuid, ApiError> {
-        SongRepositoryImpl::update(state, id, payload).await
-    }
-
-    pub async fn delete(state: &AppState, id: Uuid) -> Result<(), ApiError> {
-        SongRepositoryImpl::delete(state, id).await
     }
 }

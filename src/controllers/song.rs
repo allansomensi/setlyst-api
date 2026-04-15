@@ -4,9 +4,8 @@ use crate::{
     models::{
         PaginatedResponse, PaginationMeta, PaginationQuery,
         auth::access::AccessControl,
-        song::{CreateSongPayload, Song, SongPublic, UpdateSongPayload},
+        song::{CreateSongPayload, SongPublic, UpdateSongPayload},
     },
-    validations::existence::{artist_exists, song_exists},
 };
 use axum::{
     Json,
@@ -18,23 +17,14 @@ use tracing::{debug, error, info};
 use uuid::Uuid;
 use validator::Validate;
 
-/// Retrieves a list of all songs.
-///
-/// This endpoint fetches songs stored in the database according to pagination parameters.
-/// If there are no songs, returns an empty array.
 #[utoipa::path(
     get,
     path = "/api/v1/songs",
     tags = ["Songs"],
     summary = "List all songs.",
     description = "Fetches a paginated list of songs stored in the database.",
-    params(
-        PaginationQuery
-    ),
-    security(
-        (),
-        ("jwt_token" = [])
-    ),
+    params(PaginationQuery),
+    security((), ("jwt_token" = [])),
     responses(
         (status = 200, description = "Songs retrieved successfully.", body = PaginatedResponse<SongPublic>),
         (status = 500, description = "An error occurred while retrieving the songs.")
@@ -50,10 +40,13 @@ pub async fn find_all_songs(
     let current_page = pagination.page.unwrap_or(1).max(1);
     let per_page = pagination.per_page.unwrap_or(20).clamp(1, 100);
 
-    match Song::find_all(&state, access.user().id, current_page, per_page).await {
+    match state
+        .song_repo
+        .find_all(access.user().id, current_page, per_page)
+        .await
+    {
         Ok((songs, total_items)) => {
             info!("Songs listed successfully. Total: {total_items}");
-
             let total_pages = (total_items as f64 / per_page as f64).ceil() as i64;
 
             Ok(Json(PaginatedResponse {
@@ -73,27 +66,17 @@ pub async fn find_all_songs(
     }
 }
 
-/// Retrieves a specific song by its ID.
-///
-/// This endpoint searches for a song with the specified ID.
-/// If the song is found, it returns the song details.
 #[utoipa::path(
     get,
     path = "/api/v1/songs/{id}",
     tags = ["Songs"],
     summary = "Get a specific song by ID.",
     description = "This endpoint retrieves a song's details from the database using its ID.",
-    params(
-        ("id", description = "The unique identifier of the song to retrieve.", example = Uuid::new_v4)
-    ),
-    security(
-        (),
-        ("jwt_token" = [])
-    ),
+    params(("id", description = "The unique identifier of the song to retrieve.", example = Uuid::new_v4)),
+    security((), ("jwt_token" = [])),
     responses(
         (status = 200, description = "Song retrieved successfully.", body = SongPublic),
-        (status = 404, description = "No song found with the specified ID."),
-        (status = 500, description = "An error occurred while retrieving the song.")
+        (status = 404, description = "No song found with the specified ID.")
     )
 )]
 pub async fn find_song_by_id(
@@ -103,7 +86,7 @@ pub async fn find_song_by_id(
 ) -> Result<impl IntoResponse, ApiError> {
     debug!("Received request to retrieve song with id: {id}");
 
-    match Song::find_by_id(&state, id, access.user().id).await {
+    match state.song_repo.find_by_id(id, access.user().id).await {
         Ok(Some(song)) => {
             info!("Song found: {id}");
             Ok(Json(song))
@@ -119,9 +102,6 @@ pub async fn find_song_by_id(
     }
 }
 
-/// Create a new song.
-///
-/// This endpoint creates a new song by providing its details.
 #[utoipa::path(
     post,
     path = "/api/v1/songs",
@@ -129,15 +109,11 @@ pub async fn find_song_by_id(
     summary = "Create a new song.",
     description = "This endpoint creates a new song in the database with the provided details.",
     request_body = CreateSongPayload,
-    security(
-        (),
-        ("jwt_token" = [])
-    ),
+    security((), ("jwt_token" = [])),
     responses(
-        (status = 201, description = "Song created successfully.", body = Uuid),
+        (status = 201, description = "Song created successfully.", body = SongPublic),
         (status = 400, description = "Invalid input."),
-        (status = 404, description = "Artist not found."),
-        (status = 500, description = "An error occurred while creating the song.")
+        (status = 409, description = "Conflict: Song already exists for this artist.")
     )
 )]
 pub async fn create_song(
@@ -151,9 +127,15 @@ pub async fn create_song(
     );
 
     payload.validate()?;
-    artist_exists(&state, payload.artist_id, access.user().id).await?;
+    let user_id = access.user().id;
 
-    match Song::create(&state, &payload, access.user().id).await {
+    state.artist_repo.exists(payload.artist_id, user_id).await?;
+    state
+        .song_repo
+        .is_unique(&payload.title, payload.artist_id, user_id)
+        .await?;
+
+    match state.song_repo.create(&payload, user_id).await {
         Ok(new_song) => {
             info!("Song created! ID: {}", &new_song.id);
 
@@ -163,7 +145,7 @@ pub async fn create_song(
                 headers.insert(LOCATION, header_value);
             }
 
-            Ok((StatusCode::CREATED, headers, Json(new_song.id)))
+            Ok((StatusCode::CREATED, headers, Json(new_song)))
         }
         Err(e) => {
             error!("Error creating song with title {}: {e}", payload.title);
@@ -172,29 +154,18 @@ pub async fn create_song(
     }
 }
 
-/// Updates an existing song.
-///
-/// This endpoint updates the details of an existing song.
-/// It accepts the song ID in the path and the new details in the body.
 #[utoipa::path(
     patch,
     path = "/api/v1/songs/{id}",
     tags = ["Songs"],
     summary = "Update an existing song.",
     description = "This endpoint updates the details of an existing song in the database.",
-    params(
-        ("id" = Uuid, Path, description = "The ID of the song to update")
-    ),
+    params(("id" = Uuid, Path, description = "The ID of the song to update")),
     request_body = UpdateSongPayload,
-    security(
-        (),
-        ("jwt_token" = [])
-    ),
+    security((), ("jwt_token" = [])),
     responses(
         (status = 200, description = "Song updated successfully.", body = Uuid),
-        (status = 400, description = "Invalid input."),
-        (status = 404, description = "Song or Artist ID not found."),
-        (status = 500, description = "An error occurred while updating the song.")
+        (status = 404, description = "Song ID not found.")
     )
 )]
 pub async fn update_song(
@@ -206,13 +177,12 @@ pub async fn update_song(
     debug!("Received request to update song with ID: {id}");
 
     payload.validate()?;
-    song_exists(&state, id, access.user().id).await?;
+    let user_id = access.user().id;
 
-    if let Some(new_artist_id) = payload.artist_id {
-        artist_exists(&state, new_artist_id, access.user().id).await?;
-    }
+    state.song_repo.exists(id, user_id).await?;
+    state.artist_repo.exists(payload.artist_id, user_id).await?;
 
-    match Song::update(&state, id, &payload).await {
+    match state.song_repo.update(id, &payload).await {
         Ok(song_id) => {
             info!("Song updated! ID: {song_id}");
             Ok(Json(song_id))
@@ -224,29 +194,15 @@ pub async fn update_song(
     }
 }
 
-/// Deletes an existing song.
-///
-/// This endpoint allows users to delete a specific song by its ID.
-/// It checks if the song exists before attempting to delete it.
-/// If the song is successfully deleted, a 204 status code is returned.
 #[utoipa::path(
     delete,
     path = "/api/v1/songs/{id}",
     tags = ["Songs"],
     summary = "Delete an existing song.",
     description = "This endpoint deletes a specific song from the database using its ID.",
-    params(
-        ("id" = Uuid, Path, description = "The ID of the song to delete")
-    ),
-    security(
-        (),
-        ("jwt_token" = [])
-    ),
-    responses(
-        (status = 204, description = "Song deleted successfully"),
-        (status = 404, description = "Song ID not found"),
-        (status = 500, description = "An error occurred while deleting the song")
-    )
+    params(("id" = Uuid, Path, description = "The ID of the song to delete")),
+    security((), ("jwt_token" = [])),
+    responses((status = 204, description = "Song deleted successfully"))
 )]
 pub async fn delete_song(
     State(state): State<AppState>,
@@ -255,9 +211,10 @@ pub async fn delete_song(
 ) -> Result<impl IntoResponse, ApiError> {
     debug!("Received request to delete song with ID: {id}");
 
-    song_exists(&state, id, access.user().id).await?;
+    let user_id = access.user().id;
+    state.song_repo.exists(id, user_id).await?;
 
-    match Song::delete(&state, id).await {
+    match state.song_repo.delete(id).await {
         Ok(_) => {
             info!("Song deleted! ID: {id}");
             Ok(StatusCode::NO_CONTENT)
