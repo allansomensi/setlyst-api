@@ -1,11 +1,11 @@
 use crate::{
+    config::Config,
     database::AppState,
     errors::api_error::ApiError,
     models::status::{Database, Dependencies, Status},
 };
 use axum::{Json, extract::State, response::IntoResponse};
 use chrono::Utc;
-use std::env;
 use tracing::info;
 
 /// Retrieves the current status of the API, including the database connection status.
@@ -32,9 +32,11 @@ pub async fn show_status(State(state): State<AppState>) -> Result<impl IntoRespo
         .parse()
         .expect("Error parsing max_connections as i64");
 
+    let config = Config::get();
+
     let opened_connections: i64 =
         sqlx::query_scalar(r#"SELECT count(*) FROM pg_stat_activity WHERE datname = $1;"#)
-            .bind(env::var("POSTGRES_DB")?)
+            .bind(&config.postgres_db)
             .fetch_one(&state.db)
             .await?;
 

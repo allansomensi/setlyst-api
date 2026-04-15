@@ -1,4 +1,5 @@
 use crate::{
+    config::Config,
     database::{
         AppState,
         connection::create_pool,
@@ -40,10 +41,11 @@ pub async fn run() -> Result<(), ApiError> {
 
     let app = routes::create_routes(state);
 
-    let addr = std::env::var("HOST")?;
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
+    let config = Config::get();
+
+    let listener = match tokio::net::TcpListener::bind(&config.host).await {
         Ok(listener) => {
-            info!("✅ Server started at: {}", &addr);
+            info!("✅ Server started at: {}", &config.host);
             listener
         }
         Err(e) => {
