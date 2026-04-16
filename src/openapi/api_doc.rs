@@ -65,6 +65,7 @@ use utoipa::{
         setlist::add_song_to_setlist,
         setlist::remove_song_from_setlist,
         setlist::get_setlist_songs,
+        setlist::reorder_setlist_songs
     ),
     components(
         schemas(Status, User, Artist, Song, Setlist)

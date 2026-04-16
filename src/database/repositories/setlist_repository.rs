@@ -42,6 +42,7 @@ pub trait SetlistRepository: Send + Sync {
         page: i64,
         size: i64,
     ) -> Result<(Vec<crate::models::song::Song>, i64), ApiError>;
+    async fn reorder_songs(&self, setlist_id: Uuid, song_ids: &[Uuid]) -> Result<(), ApiError>;
 }
 
 pub struct SetlistRepositoryImpl {
@@ -267,5 +268,29 @@ impl SetlistRepository for SetlistRepositoryImpl {
 
         let (count, songs) = tokio::try_join!(count, songs)?;
         Ok((songs, count))
+    }
+
+    async fn reorder_songs(&self, setlist_id: Uuid, song_ids: &[Uuid]) -> Result<(), ApiError> {
+        sqlx::query(
+            r#"
+            UPDATE setlist_songs AS ss
+            SET position = u.new_position
+            FROM (
+                SELECT unnest($1::uuid[]) AS id, 
+                       generate_series(1, array_length($1::uuid[], 1)) AS new_position
+            ) AS u
+            WHERE ss.setlist_id = $2 AND ss.song_id = u.id
+            "#,
+        )
+        .bind(song_ids)
+        .bind(setlist_id)
+        .execute(&self.db)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to reorder setlist songs: {e}");
+            ApiError::DatabaseError(e)
+        })?;
+
+        Ok(())
     }
 }

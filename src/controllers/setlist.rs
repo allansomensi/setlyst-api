@@ -4,7 +4,10 @@ use crate::{
     models::{
         PaginatedResponse, PaginationMeta, PaginationQuery,
         auth::access::AccessControl,
-        setlist::{AddSongToSetlistPayload, CreateSetlistPayload, Setlist, UpdateSetlistPayload},
+        setlist::{
+            AddSongToSetlistPayload, CreateSetlistPayload, ReorderSetlistSongsPayload, Setlist,
+            UpdateSetlistPayload,
+        },
     },
 };
 use axum::{
@@ -357,4 +360,43 @@ pub async fn get_setlist_songs(
             Err(e)
         }
     }
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/setlists/{id}/songs/reorder",
+    tags = ["Setlists"],
+    summary = "Reorder songs in a setlist.",
+    description = "Updates the positions of all songs in a setlist based on the provided ordered list of IDs.",
+    params(
+        ("id" = Uuid, Path, description = "The ID of the setlist")
+    ),
+    request_body = ReorderSetlistSongsPayload,
+    security(
+        (),
+        ("jwt_token" = [])
+    ),
+    responses(
+        (status = 200, description = "Setlist reordered successfully"),
+        (status = 400, description = "Invalid input."),
+        (status = 404, description = "Setlist not found.")
+    )
+)]
+pub async fn reorder_setlist_songs(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(setlist_id): Path<Uuid>,
+    Json(payload): Json<ReorderSetlistSongsPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    payload.validate()?;
+
+    let user_id = access.user_id();
+    state.setlist_repo.exists(setlist_id, user_id).await?;
+
+    state
+        .setlist_repo
+        .reorder_songs(setlist_id, &payload.song_ids)
+        .await?;
+
+    Ok((StatusCode::OK, Json("Setlist reordered successfully")))
 }

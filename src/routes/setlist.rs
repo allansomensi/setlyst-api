@@ -1,12 +1,13 @@
 use crate::{
     controllers::setlist::{
         self, add_song_to_setlist, get_setlist_songs, remove_song_from_setlist,
+        reorder_setlist_songs,
     },
     database::AppState,
 };
 use axum::{
     Router,
-    routing::{delete, get},
+    routing::{delete, get, patch},
 };
 
 pub fn create_routes(state: AppState) -> Router {
@@ -25,6 +26,7 @@ pub fn create_routes(state: AppState) -> Router {
             "/{id}/songs",
             get(get_setlist_songs).post(add_song_to_setlist),
         )
+        .route("/{id}/songs/reorder", patch(reorder_setlist_songs))
         .route("/{id}/songs/{song_id}", delete(remove_song_from_setlist))
         .with_state(state)
 }

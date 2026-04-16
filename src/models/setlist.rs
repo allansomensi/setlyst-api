@@ -48,3 +48,9 @@ impl Setlist {
         }
     }
 }
+
+#[derive(Debug, Deserialize, Serialize, ToSchema, Validate)]
+pub struct ReorderSetlistSongsPayload {
+    #[validate(length(min = 1, message = "The list of song IDs cannot be empty."))]
+    pub song_ids: Vec<Uuid>,
+}
