@@ -133,7 +133,7 @@ impl IntoResponse for ApiError {
                 },
             ),
             ApiError::WrongPassword => (
-                StatusCode::BAD_REQUEST,
+                StatusCode::UNAUTHORIZED,
                 ErrorResponse {
                     code: String::from("WRONG_PASSWORD"),
                     message: String::from("Incorrect password! Try again."),
