@@ -20,7 +20,7 @@ impl AccessControl {
         if self.0.role == role {
             Ok(())
         } else {
-            Err(ApiError::Unauthorized)
+            Err(ApiError::Forbidden)
         }
     }
 
@@ -29,7 +29,7 @@ impl AccessControl {
         if roles.contains(&self.0.role) {
             Ok(())
         } else {
-            Err(ApiError::Unauthorized)
+            Err(ApiError::Forbidden)
         }
     }
 }

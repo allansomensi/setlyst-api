@@ -93,6 +93,7 @@ pub struct RegisterPayload {
         max = 100,
         message = "Password must be between 8 and 100 chars."
     ))]
+    #[serde(skip_serializing)]
     pub password: String,
     #[validate(length(
         min = 3,
@@ -137,6 +138,7 @@ pub struct CreateUserPayload {
         max = 100,
         message = "Password must be between 8 and 100 chars."
     ))]
+    #[serde(skip_serializing)]
     pub password: String,
     #[validate(length(
         min = 3,
@@ -169,6 +171,7 @@ pub struct UpdateUserPayload {
         max = 100,
         message = "Password must be between 8 and 100 chars."
     ))]
+    #[serde(skip_serializing)]
     pub password: Option<String>,
     #[validate(length(
         min = 3,

@@ -1,35 +1,21 @@
 use super::Config;
-use chrono::{DateTime, FixedOffset, Utc};
 use tracing_appender::{non_blocking::WorkerGuard, rolling};
 use tracing_subscriber::{
     EnvFilter, Layer, Registry,
-    fmt::{self, format::Writer, time::FormatTime},
+    fmt::{self},
     layer::SubscriberExt,
 };
 
 impl Config {
     pub fn logger_init() -> WorkerGuard {
-        struct UtcFormattedTime;
-
-        impl FormatTime for UtcFormattedTime {
-            fn format_time(&self, writer: &mut Writer<'_>) -> std::fmt::Result {
-                let brasilia_offset = FixedOffset::west_opt(3 * 3600).unwrap();
-                let now: DateTime<FixedOffset> = Utc::now().with_timezone(&brasilia_offset);
-                let formatted_time = now.format("%d/%m/%Y %H:%M:%S").to_string();
-                write!(writer, "{}", formatted_time)
-            }
-        }
-
         let rust_log_file = EnvFilter::from_env("RUST_LOG_FILE");
         let rust_log_console = EnvFilter::from_env("RUST_LOG_CONSOLE");
 
         let file_appender = rolling::daily("logs", "api.log");
-        // Envolver em non_blocking para melhor performance e obter o guard
         let (non_blocking_appender, guard) = tracing_appender::non_blocking(file_appender);
 
         let file_layer = fmt::Layer::new()
-            .with_timer(UtcFormattedTime)
-            .with_writer(non_blocking_appender) // <- Usar o non_blocking aqui
+            .with_writer(non_blocking_appender)
             .with_file(true)
             .with_ansi(false)
             .with_line_number(true)
@@ -38,7 +24,6 @@ impl Config {
 
         let console_layer = fmt::Layer::new()
             .pretty()
-            .with_timer(UtcFormattedTime)
             .with_file(false)
             .with_ansi(true)
             .with_line_number(false)

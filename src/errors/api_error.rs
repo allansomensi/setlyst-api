@@ -44,6 +44,9 @@ pub enum ApiError {
     #[error("You are not allowed to continue.")]
     Unauthorized,
 
+    #[error("You do not have permission to perform this action.")]
+    Forbidden,
+
     #[error("Incorrect password! Try again.")]
     WrongPassword,
 }
@@ -132,6 +135,16 @@ impl IntoResponse for ApiError {
                     details: Some(String::from("Please try again later.")),
                 },
             ),
+            ApiError::Forbidden => (
+                StatusCode::FORBIDDEN,
+                ErrorResponse {
+                    code: String::from("FORBIDDEN"),
+                    message: String::from("You do not have permission to perform this action"),
+                    details: Some(String::from(
+                        "Your current role does not grant access to this resource.",
+                    )),
+                },
+            ),
             ApiError::WrongPassword => (
                 StatusCode::UNAUTHORIZED,
                 ErrorResponse {
@@ -141,9 +154,9 @@ impl IntoResponse for ApiError {
                 },
             ),
             ApiError::NotModified => (
-                StatusCode::NOT_MODIFIED,
+                StatusCode::UNPROCESSABLE_ENTITY,
                 ErrorResponse {
-                    code: String::from("NOT_MODIFIED"),
+                    code: String::from("UNPROCESSABLE_ENTITY"),
                     message: String::from("No updates were made for the provided ID."),
                     details: Some(String::from(
                         "The provided ID may not exist, or no fields were changed. Please verify the ID and the update values.",

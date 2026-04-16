@@ -1,5 +1,9 @@
 use super::Config;
-use tower_http::cors::{Any, CorsLayer};
+use axum::http::{
+    header::{AUTHORIZATION, CONTENT_TYPE},
+    method::Method,
+};
+use tower_http::cors::CorsLayer;
 
 impl Config {
     pub fn cors() -> CorsLayer {
@@ -9,7 +13,7 @@ impl Config {
 
         CorsLayer::new()
             .allow_origin(origins)
-            .allow_methods(Any)
-            .allow_headers(Any)
+            .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE])
+            .allow_headers([CONTENT_TYPE, AUTHORIZATION])
     }
 }

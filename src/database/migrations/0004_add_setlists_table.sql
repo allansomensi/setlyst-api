@@ -15,3 +15,4 @@ CREATE TABLE setlist_songs (
 );
 
 CREATE INDEX idx_setlists_user_id ON setlists(user_id);
+CREATE INDEX idx_setlist_songs_song_id ON setlist_songs(song_id);

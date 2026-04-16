@@ -8,7 +8,7 @@ pub mod swagger;
 pub mod user;
 
 use crate::{config::Config, database::AppState, middlewares::authentication::authenticate};
-use axum::{Router, middleware};
+use axum::{Router, extract::DefaultBodyLimit, middleware};
 
 pub fn create_routes(state: AppState) -> Router {
     Router::new()
@@ -26,4 +26,5 @@ pub fn create_routes(state: AppState) -> Router {
         )
         .merge(swagger::swagger_routes())
         .layer(Config::cors())
+        .layer(DefaultBodyLimit::max(1_048_576))
 }
