@@ -30,7 +30,17 @@ pub struct Args {
 
 #[tokio::main]
 async fn main() {
-    config::Config::init().expect("Config error");
+    let _guard = match config::Config::init() {
+        Ok(guard) => {
+            tracing::info!("✅ Configurations loaded!");
+            guard
+        }
+        Err(e) => {
+            tracing::error!("❌ Error loading configurations: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let args = Args::parse();
 
     let pool = match create_pool().await {

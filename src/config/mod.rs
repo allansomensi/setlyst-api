@@ -1,6 +1,7 @@
 use crate::errors::config_error::ConfigError;
 use axum::http::HeaderValue;
 use std::sync::OnceLock;
+use tracing_appender::non_blocking::WorkerGuard;
 
 pub mod cors;
 pub mod environment;
@@ -19,9 +20,9 @@ pub struct Config {
 static CONFIG: OnceLock<Config> = OnceLock::new();
 
 impl Config {
-    pub fn init() -> Result<(), ConfigError> {
+    pub fn init() -> Result<WorkerGuard, ConfigError> {
         environment::load_environment()?;
-        Self::logger_init();
+        let guard = Self::logger_init();
 
         let jwt_secret = std::env::var("JWT_SECRET")?;
         if jwt_secret.len() < 32 {
@@ -50,7 +51,7 @@ impl Config {
 
         CONFIG.set(config).expect("Config already initialized");
 
-        Ok(())
+        Ok(guard)
     }
 
     pub fn get() -> &'static Config {

@@ -1,6 +1,6 @@
 use super::Config;
 use chrono::{DateTime, FixedOffset, Utc};
-use tracing_appender::rolling;
+use tracing_appender::{non_blocking::WorkerGuard, rolling};
 use tracing_subscriber::{
     EnvFilter, Layer, Registry,
     fmt::{self, format::Writer, time::FormatTime},
@@ -8,7 +8,7 @@ use tracing_subscriber::{
 };
 
 impl Config {
-    pub fn logger_init() {
+    pub fn logger_init() -> WorkerGuard {
         struct UtcFormattedTime;
 
         impl FormatTime for UtcFormattedTime {
@@ -24,10 +24,12 @@ impl Config {
         let rust_log_console = EnvFilter::from_env("RUST_LOG_CONSOLE");
 
         let file_appender = rolling::daily("logs", "api.log");
+        // Envolver em non_blocking para melhor performance e obter o guard
+        let (non_blocking_appender, guard) = tracing_appender::non_blocking(file_appender);
 
         let file_layer = fmt::Layer::new()
             .with_timer(UtcFormattedTime)
-            .with_writer(file_appender)
+            .with_writer(non_blocking_appender) // <- Usar o non_blocking aqui
             .with_file(true)
             .with_ansi(false)
             .with_line_number(true)
@@ -46,5 +48,7 @@ impl Config {
         let subscriber = Registry::default().with(console_layer).with(file_layer);
 
         tracing::subscriber::set_global_default(subscriber).expect("Failed to set subscriber");
+
+        guard
     }
 }
