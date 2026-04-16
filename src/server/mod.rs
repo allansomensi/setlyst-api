@@ -11,7 +11,7 @@ use crate::{
     errors::api_error::ApiError,
     routes,
 };
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 use tokio::signal;
 use tracing::{error, info};
 
@@ -55,10 +55,13 @@ pub async fn run() -> Result<(), ApiError> {
         }
     };
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .expect("Error starting the server");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .expect("Error starting the server");
 
     Ok(())
 }

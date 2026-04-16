@@ -9,8 +9,15 @@ pub mod user;
 
 use crate::{config::Config, database::AppState, middlewares::authentication::authenticate};
 use axum::{Router, extract::DefaultBodyLimit, middleware};
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
 pub fn create_routes(state: AppState) -> Router {
+    let global_governor_conf = GovernorConfigBuilder::default()
+        .per_second(10)
+        .burst_size(60)
+        .finish()
+        .unwrap();
+
     Router::new()
         .nest(
             "/api/v1",
@@ -27,4 +34,5 @@ pub fn create_routes(state: AppState) -> Router {
         .merge(swagger::swagger_routes())
         .layer(Config::cors())
         .layer(DefaultBodyLimit::max(1_048_576))
+        .layer(GovernorLayer::new(global_governor_conf))
 }

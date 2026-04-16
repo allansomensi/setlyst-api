@@ -31,10 +31,7 @@ pub struct Args {
 #[tokio::main]
 async fn main() {
     let _guard = match config::Config::init() {
-        Ok(guard) => {
-            tracing::info!("✅ Configurations loaded!");
-            guard
-        }
+        Ok(guard) => guard,
         Err(e) => {
             tracing::error!("❌ Error loading configurations: {e}");
             std::process::exit(1);

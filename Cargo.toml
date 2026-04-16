@@ -40,6 +40,7 @@ utoipa = { version = "5.3", features = ["chrono", "uuid"] }
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 uuid = { version = "1.17", features = ["serde", "v4", "v7"] }
 validator = { version = "0.20", features = ["derive"] }
+tower_governor = "0.8"
 
 [dev-dependencies.cargo-husky]
 version = "1.5"
