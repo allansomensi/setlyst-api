@@ -14,4 +14,7 @@ pub enum ConfigError {
 
     #[error("JWT_SECRET must be at least 32 characters long for security reasons")]
     InsecureJwtSecret,
+
+    #[error("Invalid header value: {0}")]
+    InvalidHeaderValue(#[from] axum::http::header::InvalidHeaderValue),
 }

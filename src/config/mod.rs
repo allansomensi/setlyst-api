@@ -1,4 +1,5 @@
 use crate::errors::config_error::ConfigError;
+use axum::http::HeaderValue;
 use std::sync::OnceLock;
 
 pub mod cors;
@@ -12,6 +13,7 @@ pub struct Config {
     pub postgres_db: String,
     pub jwt_secret: String,
     pub jwt_expiration_time: i64,
+    pub cors_allowed_origins: Vec<HeaderValue>,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -22,9 +24,19 @@ impl Config {
         Self::logger_init();
 
         let jwt_secret = std::env::var("JWT_SECRET")?;
-
         if jwt_secret.len() < 32 {
             return Err(ConfigError::InsecureJwtSecret);
+        }
+
+        let cors_raw = std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_default();
+        let mut cors_allowed_origins = Vec::new();
+
+        for origin in cors_raw
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            cors_allowed_origins.push(origin.parse::<HeaderValue>()?);
         }
 
         let config = Config {
@@ -33,6 +45,7 @@ impl Config {
             postgres_db: std::env::var("POSTGRES_DB")?,
             jwt_secret,
             jwt_expiration_time: std::env::var("JWT_EXPIRATION_TIME")?.parse()?,
+            cors_allowed_origins,
         };
 
         CONFIG.set(config).expect("Config already initialized");

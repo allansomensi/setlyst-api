@@ -3,14 +3,9 @@ use tower_http::cors::{Any, CorsLayer};
 
 impl Config {
     pub fn cors() -> CorsLayer {
-        let origins = [
-            "http://127.0.0.1:3000"
-                .parse()
-                .expect("Error parsing cors host"),
-            "http://localhost:3000"
-                .parse()
-                .expect("Error parsing cors host"),
-        ];
+        let config = Self::get();
+
+        let origins = config.cors_allowed_origins.clone();
 
         CorsLayer::new()
             .allow_origin(origins)
