@@ -25,8 +25,8 @@ pub struct CreateSongPayload {
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
 pub struct UpdateSongPayload {
     #[validate(length(min = 1, max = 255, message = "Title must be between 1 and 255 chars."))]
-    pub title: String,
-    pub artist_id: Uuid,
+    pub title: Option<String>,
+    pub artist_id: Option<Uuid>,
 }
 
 impl Song {

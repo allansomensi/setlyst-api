@@ -92,14 +92,38 @@ impl SongRepository for SongRepositoryImpl {
     }
 
     async fn update(&self, id: Uuid, payload: &UpdateSongPayload) -> Result<Uuid, ApiError> {
-        sqlx::query("UPDATE songs SET title = $1, artist_id = $2, updated_at = $3 WHERE id = $4")
-            .bind(&payload.title)
-            .bind(payload.artist_id)
-            .bind(chrono::Utc::now().naive_utc())
-            .bind(id)
-            .execute(&self.db)
-            .await?;
-        Ok(id)
+        let mut tx = self.db.begin().await?;
+        let mut updated = false;
+
+        if let Some(title) = &payload.title {
+            sqlx::query("UPDATE songs SET title = $1 WHERE id = $2")
+                .bind(title)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            updated = true;
+        }
+
+        if let Some(artist_id) = payload.artist_id {
+            sqlx::query("UPDATE songs SET artist_id = $1 WHERE id = $2")
+                .bind(artist_id)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            updated = true;
+        }
+
+        if updated {
+            sqlx::query("UPDATE songs SET updated_at = $1 WHERE id = $2")
+                .bind(chrono::Utc::now().naive_utc())
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(id)
+        } else {
+            Err(ApiError::NotModified)
+        }
     }
 
     async fn delete(&self, id: Uuid) -> Result<(), ApiError> {

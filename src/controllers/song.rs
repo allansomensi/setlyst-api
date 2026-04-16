@@ -179,12 +179,25 @@ pub async fn update_song(
     payload.validate()?;
     let user_id = access.user_id();
 
-    state.song_repo.exists(id, user_id).await?;
-    state.artist_repo.exists(payload.artist_id, user_id).await?;
-    state
+    let existing_song = state
         .song_repo
-        .is_unique(&payload.title, payload.artist_id, user_id, Some(id))
-        .await?;
+        .find_by_id(id, user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    if let Some(artist_id) = payload.artist_id {
+        state.artist_repo.exists(artist_id, user_id).await?;
+    }
+
+    if payload.title.is_some() || payload.artist_id.is_some() {
+        let title_to_check = payload.title.as_deref().unwrap_or(&existing_song.title);
+        let artist_to_check = payload.artist_id.unwrap_or(existing_song.artist_id);
+
+        state
+            .song_repo
+            .is_unique(title_to_check, artist_to_check, user_id, Some(id))
+            .await?;
+    }
 
     match state.song_repo.update(id, &payload).await {
         Ok(song_id) => {

@@ -31,7 +31,7 @@ pub struct UpdateArtistPayload {
         max = 255,
         message = "Artist name must be between 1 and 255 chars."
     ))]
-    pub name: String,
+    pub name: Option<String>,
 }
 
 impl Artist {

@@ -99,13 +99,29 @@ impl ArtistRepository for ArtistRepositoryImpl {
     }
 
     async fn update(&self, id: Uuid, payload: &UpdateArtistPayload) -> Result<Uuid, ApiError> {
-        sqlx::query("UPDATE artists SET name = $1, updated_at = $2 WHERE id = $3")
-            .bind(&payload.name)
-            .bind(chrono::Utc::now().naive_utc())
-            .bind(id)
-            .execute(&self.db)
-            .await?;
-        Ok(id)
+        let mut tx = self.db.begin().await?;
+        let mut updated = false;
+
+        if let Some(name) = &payload.name {
+            sqlx::query("UPDATE artists SET name = $1 WHERE id = $2")
+                .bind(name)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            updated = true;
+        }
+
+        if updated {
+            sqlx::query("UPDATE artists SET updated_at = $1 WHERE id = $2")
+                .bind(chrono::Utc::now().naive_utc())
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(id)
+        } else {
+            Err(ApiError::NotModified)
+        }
     }
 
     async fn delete(&self, id: Uuid) -> Result<(), ApiError> {
