@@ -29,6 +29,19 @@ pub trait SetlistRepository: Send + Sync {
         exclude_id: Option<Uuid>,
     ) -> Result<(), ApiError>;
     async fn exists(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
+    async fn add_song(
+        &self,
+        setlist_id: Uuid,
+        song_id: Uuid,
+        position: i32,
+    ) -> Result<(), ApiError>;
+    async fn remove_song(&self, setlist_id: Uuid, song_id: Uuid) -> Result<(), ApiError>;
+    async fn get_songs(
+        &self,
+        setlist_id: Uuid,
+        page: i64,
+        size: i64,
+    ) -> Result<(Vec<crate::models::song::Song>, i64), ApiError>;
 }
 
 pub struct SetlistRepositoryImpl {
@@ -188,5 +201,71 @@ impl SetlistRepository for SetlistRepositoryImpl {
         } else {
             Ok(())
         }
+    }
+
+    async fn add_song(
+        &self,
+        setlist_id: Uuid,
+        song_id: Uuid,
+        position: i32,
+    ) -> Result<(), ApiError> {
+        sqlx::query(
+            "INSERT INTO setlist_songs (setlist_id, song_id, position) VALUES ($1, $2, $3)
+             ON CONFLICT (setlist_id, song_id) DO UPDATE SET position = $3;",
+        )
+        .bind(setlist_id)
+        .bind(song_id)
+        .bind(position)
+        .execute(&self.db)
+        .await
+        .map_err(|e| {
+            tracing::error!("Error adding song to setlist: {e}");
+            ApiError::DatabaseError(e)
+        })?;
+
+        Ok(())
+    }
+
+    async fn remove_song(&self, setlist_id: Uuid, song_id: Uuid) -> Result<(), ApiError> {
+        let result =
+            sqlx::query("DELETE FROM setlist_songs WHERE setlist_id = $1 AND song_id = $2;")
+                .bind(setlist_id)
+                .bind(song_id)
+                .execute(&self.db)
+                .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(ApiError::NotFound);
+        }
+
+        Ok(())
+    }
+
+    async fn get_songs(
+        &self,
+        setlist_id: Uuid,
+        page: i64,
+        size: i64,
+    ) -> Result<(Vec<crate::models::song::Song>, i64), ApiError> {
+        let offset = (page - 1) * size;
+
+        let count = sqlx::query_scalar("SELECT COUNT(*) FROM setlist_songs WHERE setlist_id = $1;")
+            .bind(setlist_id)
+            .fetch_one(&self.db);
+
+        let songs = sqlx::query_as::<_, crate::models::song::Song>(
+            "SELECT s.* FROM songs s
+             INNER JOIN setlist_songs ss ON s.id = ss.song_id
+             WHERE ss.setlist_id = $1
+             ORDER BY ss.position ASC
+             LIMIT $2 OFFSET $3;",
+        )
+        .bind(setlist_id)
+        .bind(size)
+        .bind(offset)
+        .fetch_all(&self.db);
+
+        let (count, songs) = tokio::try_join!(count, songs)?;
+        Ok((songs, count))
     }
 }

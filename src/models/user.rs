@@ -196,6 +196,7 @@ impl User {
         role: Option<Role>,
         status: Option<Status>,
     ) -> Self {
+        let now = Utc::now().naive_utc();
         Self {
             id: Uuid::new_v4(),
             username: username.to_string(),
@@ -205,8 +206,8 @@ impl User {
             last_name,
             role: role.unwrap_or_default(),
             status: status.unwrap_or_default(),
-            created_at: Utc::now().naive_utc(),
-            updated_at: Utc::now().naive_utc(),
+            created_at: now,
+            updated_at: now,
         }
     }
 }

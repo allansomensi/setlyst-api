@@ -62,6 +62,9 @@ use utoipa::{
         setlist::create_setlist,
         setlist::update_setlist,
         setlist::delete_setlist,
+        setlist::add_song_to_setlist,
+        setlist::remove_song_from_setlist,
+        setlist::get_setlist_songs,
     ),
     components(
         schemas(Status, User, Artist, Song, Setlist)

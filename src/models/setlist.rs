@@ -29,6 +29,12 @@ pub struct UpdateSetlistPayload {
     pub description: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct AddSongToSetlistPayload {
+    pub song_id: Uuid,
+    pub position: i32,
+}
+
 impl Setlist {
     pub fn new(title: &str, description: Option<String>, user_id: Uuid) -> Self {
         let now = Utc::now().naive_utc();

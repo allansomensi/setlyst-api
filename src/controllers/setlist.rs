@@ -4,7 +4,7 @@ use crate::{
     models::{
         PaginatedResponse, PaginationMeta, PaginationQuery,
         auth::access::AccessControl,
-        setlist::{CreateSetlistPayload, Setlist, UpdateSetlistPayload},
+        setlist::{AddSongToSetlistPayload, CreateSetlistPayload, Setlist, UpdateSetlistPayload},
     },
 };
 use axum::{
@@ -226,6 +226,134 @@ pub async fn delete_setlist(
         }
         Err(e) => {
             error!("Error deleting setlist with ID {id}: {e}");
+            Err(e)
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/setlists/{id}/songs",
+    tags = ["Setlists"],
+    summary = "Add a song to a setlist.",
+    description = "Adds a specific song to a setlist at a given position.",
+    params(("id" = Uuid, Path, description = "The ID of the setlist")),
+    request_body = AddSongToSetlistPayload,
+    security(
+        (),
+        ("jwt_token" = [])
+    ),
+    responses(
+        (status = 201, description = "Song added to setlist successfully", body = String),
+        (status = 404, description = "Setlist or song not found.")
+    )
+)]
+pub async fn add_song_to_setlist(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(setlist_id): Path<Uuid>,
+    Json(payload): Json<AddSongToSetlistPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
+    state.setlist_repo.exists(setlist_id, user_id).await?;
+    state.song_repo.exists(payload.song_id, user_id).await?;
+
+    state
+        .setlist_repo
+        .add_song(setlist_id, payload.song_id, payload.position)
+        .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json("Song added to setlist successfully"),
+    ))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/setlists/{id}/songs/{song_id}",
+    tags = ["Setlists"],
+    summary = "Remove a song from a setlist.",
+    description = "Removes a specific song from a setlist.",
+    params(
+        ("id" = Uuid, Path, description = "The ID of the setlist"),
+        ("song_id" = Uuid, Path, description = "The ID of the song to remove")
+    ),
+    security(
+        (),
+        ("jwt_token" = [])
+    ),
+    responses(
+        (status = 204, description = "Song removed successfully"),
+        (status = 404, description = "Setlist or song not found.")
+    )
+)]
+pub async fn remove_song_from_setlist(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path((setlist_id, song_id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
+    state.setlist_repo.exists(setlist_id, user_id).await?;
+    state.setlist_repo.remove_song(setlist_id, song_id).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/setlists/{id}/songs",
+    tags = ["Setlists"],
+    summary = "Get all songs in a setlist.",
+    description = "Retrieves a paginated list of all songs associated with a specific setlist, ordered by their position.",
+    params(
+        ("id" = Uuid, Path, description = "The ID of the setlist"),
+        PaginationQuery
+    ),
+    security(
+        (),
+        ("jwt_token" = [])
+    ),
+    responses(
+        (status = 200, description = "Songs retrieved successfully", body = PaginatedResponse<crate::models::song::Song>),
+        (status = 404, description = "Setlist not found.")
+    )
+)]
+pub async fn get_setlist_songs(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(id): Path<Uuid>,
+    Query(pagination): Query<PaginationQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
+    state.setlist_repo.exists(id, user_id).await?;
+
+    let current_page = pagination.page.unwrap_or(1).max(1);
+    let per_page = pagination.per_page.unwrap_or(20).clamp(1, 100);
+
+    match state
+        .setlist_repo
+        .get_songs(id, current_page, per_page)
+        .await
+    {
+        Ok((songs, total_items)) => {
+            let total_pages = (total_items as f64 / per_page as f64).ceil() as i64;
+
+            Ok(Json(PaginatedResponse {
+                data: songs,
+                meta: PaginationMeta {
+                    total_items,
+                    current_page,
+                    per_page,
+                    total_pages,
+                },
+            }))
+        }
+        Err(e) => {
+            error!("Error retrieving songs for setlist {id}: {e}");
             Err(e)
         }
     }

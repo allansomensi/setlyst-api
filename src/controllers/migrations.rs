@@ -14,6 +14,7 @@ use tracing::{error, info};
     summary = "Dry run database migrations.",
     description = "Simulates database migrations. Currently not implemented.",
     security(
+        (),
         ("jwt_token" = [])
     ),
     responses(
@@ -41,6 +42,7 @@ pub async fn dry_run(access: AccessControl) -> Result<impl IntoResponse, ApiErro
     summary = "Execute pending database migrations.",
     description = "This endpoint executes any pending migrations in the database. It applies migrations that have not yet been run and provides confirmation upon success.",
     security(
+        (),
         ("jwt_token" = [])
     ),
     responses(

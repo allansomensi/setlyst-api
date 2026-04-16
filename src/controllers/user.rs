@@ -24,6 +24,7 @@ use validator::Validate;
     summary = "List all users",
     description = "Returns a paginated list of all users. Requires Admin or Moderator role.",
     security(
+        (),
         ("jwt_token" = [])
     ),
     params(
@@ -75,6 +76,7 @@ pub async fn find_all_users(
     summary = "Get user by ID",
     description = "Returns a single user by their UUID. Requires Admin or Moderator role.",
     security(
+        (),
         ("jwt_token" = [])
     ),
     params(
@@ -118,6 +120,7 @@ pub async fn find_user_by_id(
     summary = "Create a new user",
     description = "Creates a new user. Requires Admin or Moderator role.",
     security(
+        (),
         ("jwt_token" = [])
     ),
     request_body = CreateUserPayload,
@@ -176,6 +179,7 @@ pub async fn create_user(
     summary = "Update a user",
     description = "Updates an existing user. Requires Admin or Moderator role.",
     security(
+        (),
         ("jwt_token" = [])
     ),
     params(
@@ -226,6 +230,7 @@ pub async fn update_user(
     summary = "Delete a user",
     description = "Deletes an existing user. Requires Admin or Moderator role.",
     security(
+        (),
         ("jwt_token" = [])
     ),
     params(

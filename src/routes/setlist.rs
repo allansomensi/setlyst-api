@@ -1,5 +1,13 @@
-use crate::{controllers::setlist, database::AppState};
-use axum::{Router, routing::get};
+use crate::{
+    controllers::setlist::{
+        self, add_song_to_setlist, get_setlist_songs, remove_song_from_setlist,
+    },
+    database::AppState,
+};
+use axum::{
+    Router,
+    routing::{delete, get},
+};
 
 pub fn create_routes(state: AppState) -> Router {
     axum::Router::new()
@@ -13,5 +21,10 @@ pub fn create_routes(state: AppState) -> Router {
             "/",
             get(setlist::find_all_setlists).post(setlist::create_setlist),
         )
+        .route(
+            "/{id}/songs",
+            get(get_setlist_songs).post(add_song_to_setlist),
+        )
+        .route("/{id}/songs/{song_id}", delete(remove_song_from_setlist))
         .with_state(state)
 }
