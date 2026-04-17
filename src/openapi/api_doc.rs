@@ -1,6 +1,12 @@
 use crate::{
     controllers::{artist, auth, migrations, setlist, song, status, user},
-    models::{artist::Artist, setlist::Setlist, song::Song, status::Status, user::User},
+    models::{
+        artist::Artist,
+        setlist::Setlist,
+        song::{Genre, Song, Tonality},
+        status::Status,
+        user::User,
+    },
 };
 use serde::Serialize;
 use utoipa::{
@@ -70,7 +76,7 @@ use utoipa::{
         setlist::reorder_setlist_songs
     ),
     components(
-        schemas(Status, User, Artist, Song, Setlist)
+        schemas(Status, User, Artist, Song, Setlist, Tonality, Genre)
     ),
     tags(
         (name = "Status", description = "Status endpoints"),

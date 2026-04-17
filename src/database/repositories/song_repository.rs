@@ -53,7 +53,7 @@ impl SongRepository for SongRepositoryImpl {
             .fetch_one(&self.db);
 
         let songs = sqlx::query_as::<_, Song>(
-            "SELECT id, title, artist_id, user_id, created_at, updated_at FROM songs WHERE user_id = $1 ORDER BY title ASC LIMIT $2 OFFSET $3",
+            "SELECT id, title, artist_id, user_id, tempo, lyrics, tonality, genre, duration, created_at, updated_at FROM songs WHERE user_id = $1 ORDER BY title ASC LIMIT $2 OFFSET $3",
         )
         .bind(user_id)
         .bind(size)
@@ -66,7 +66,7 @@ impl SongRepository for SongRepositoryImpl {
 
     async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Song>, ApiError> {
         let song = sqlx::query_as::<_, Song>(
-            "SELECT id, title, artist_id, user_id, created_at, updated_at FROM songs WHERE id = $1 AND user_id = $2",
+            "SELECT id, title, artist_id, user_id, tempo, lyrics, tonality, genre, duration, created_at, updated_at FROM songs WHERE id = $1 AND user_id = $2",
         )
         .bind(id)
         .bind(user_id)
@@ -76,14 +76,20 @@ impl SongRepository for SongRepositoryImpl {
     }
 
     async fn create(&self, payload: &CreateSongPayload, user_id: Uuid) -> Result<Song, ApiError> {
-        let new_song = Song::new(&payload.title, payload.artist_id, user_id);
+        let new_song = Song::new(payload, user_id);
+
         sqlx::query(
-            "INSERT INTO songs (id, title, artist_id, user_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO songs (id, title, artist_id, user_id, tempo, lyrics, tonality, genre, duration, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(new_song.id)
         .bind(&new_song.title)
         .bind(new_song.artist_id)
         .bind(new_song.user_id)
+        .bind(new_song.tempo)
+        .bind(&new_song.lyrics)
+        .bind(new_song.tonality)
+        .bind(new_song.genre)
+        .bind(new_song.duration)
         .bind(new_song.created_at)
         .bind(new_song.updated_at)
         .execute(&self.db)
@@ -107,6 +113,51 @@ impl SongRepository for SongRepositoryImpl {
         if let Some(artist_id) = payload.artist_id {
             sqlx::query("UPDATE songs SET artist_id = $1 WHERE id = $2")
                 .bind(artist_id)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            updated = true;
+        }
+
+        if let Some(tempo) = payload.tempo {
+            sqlx::query("UPDATE songs SET tempo = $1 WHERE id = $2")
+                .bind(tempo)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            updated = true;
+        }
+
+        if let Some(lyrics) = &payload.lyrics {
+            sqlx::query("UPDATE songs SET lyrics = $1 WHERE id = $2")
+                .bind(lyrics)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            updated = true;
+        }
+
+        if let Some(tonality) = payload.tonality {
+            sqlx::query("UPDATE songs SET tonality = $1 WHERE id = $2")
+                .bind(tonality)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            updated = true;
+        }
+
+        if let Some(genre) = payload.genre {
+            sqlx::query("UPDATE songs SET genre = $1 WHERE id = $2")
+                .bind(genre)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            updated = true;
+        }
+
+        if let Some(duration) = payload.duration {
+            sqlx::query("UPDATE songs SET duration = $1 WHERE id = $2")
+                .bind(duration)
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
