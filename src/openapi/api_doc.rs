@@ -41,6 +41,8 @@ use utoipa::{
         user::create_user,
         user::update_user,
         user::delete_user,
+        user::get_current_user,
+        user::update_current_user,
 
         // Artists
         artist::find_artist_by_id,

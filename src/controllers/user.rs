@@ -4,7 +4,7 @@ use crate::{
     models::{
         PaginatedResponse, PaginationMeta, PaginationQuery,
         auth::access::AccessControl,
-        user::{CreateUserPayload, Role, UpdateUserPayload, UserPublic},
+        user::{CreateUserPayload, Role, UpdateUserPayload, User, UserPublic},
     },
 };
 use axum::{
@@ -263,4 +263,65 @@ pub async fn delete_user(
             Err(e)
         }
     }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/users/me",
+    tags = ["Users"],
+    summary = "Get current user profile",
+    description = "Retrieves the profile information of the currently authenticated user based on the JWT token.",
+    security(
+        (),
+        ("jwt_token" = [])
+    ),
+    responses(
+        (status = 200, description = "User profile retrieved successfully", body = User),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "User not found")
+    )
+)]
+pub async fn get_current_user(
+    State(state): State<AppState>,
+    access: AccessControl,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
+    let user = state
+        .user_repo
+        .find_by_id(user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    Ok((StatusCode::OK, Json(user)))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/users/me",
+    tags = ["Users"],
+    summary = "Update current user profile",
+    description = "Updates the profile details of the currently authenticated user.",
+    request_body = UpdateUserPayload,
+    security(
+        (),
+        ("jwt_token" = [])
+    ),
+    responses(
+        (status = 200, description = "Profile updated successfully"),
+        (status = 400, description = "Invalid input"),
+        (status = 401, description = "Unauthorized")
+    )
+)]
+pub async fn update_current_user(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Json(payload): Json<UpdateUserPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    payload.validate()?;
+    let user_id = access.user_id();
+
+    state.user_repo.update(user_id, &payload).await?;
+
+    Ok((StatusCode::OK, Json("Profile updated successfully")))
 }
