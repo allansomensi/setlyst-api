@@ -4,7 +4,9 @@ use crate::{
     models::{
         PaginatedResponse, PaginationMeta, PaginationQuery,
         auth::access::AccessControl,
-        user::{CreateUserPayload, Role, UpdateUserPayload, User, UserPublic},
+        user::{
+            CreateUserPayload, Role, UpdateCurrentUserPayload, UpdateUserPayload, User, UserPublic,
+        },
     },
 };
 use axum::{
@@ -392,7 +394,7 @@ pub async fn get_current_user(
     tags = ["Users"],
     summary = "Update current user profile",
     description = "Updates the profile details of the currently authenticated user.",
-    request_body = UpdateUserPayload,
+    request_body = UpdateCurrentUserPayload,
     security(
         (),
         ("jwt_token" = [])
@@ -406,7 +408,7 @@ pub async fn get_current_user(
 pub async fn update_current_user(
     State(state): State<AppState>,
     access: AccessControl,
-    Json(payload): Json<UpdateUserPayload>,
+    Json(payload): Json<UpdateCurrentUserPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = access.user_id();
 
@@ -416,6 +418,8 @@ pub async fn update_current_user(
     );
 
     payload.validate()?;
+
+    let payload = UpdateUserPayload::from(payload);
 
     state.user_repo.update(user_id, &payload).await?;
 

@@ -189,6 +189,55 @@ pub struct UpdateUserPayload {
     pub status: Option<Status>,
 }
 
+#[derive(Deserialize, Serialize, ToSchema, Validate)]
+pub struct UpdateCurrentUserPayload {
+    #[validate(length(
+        min = 3,
+        max = 20,
+        message = "Username must be between 3 and 20 chars."
+    ))]
+    pub username: Option<String>,
+
+    #[validate(email(message = "Invalid email"))]
+    pub email: Option<String>,
+
+    #[validate(length(
+        min = 8,
+        max = 100,
+        message = "Password must be between 8 and 100 chars."
+    ))]
+    #[serde(skip_serializing)]
+    pub password: Option<String>,
+
+    #[validate(length(
+        min = 3,
+        max = 20,
+        message = "First name must be between 3 and 20 chars."
+    ))]
+    pub first_name: Option<String>,
+
+    #[validate(length(
+        min = 3,
+        max = 20,
+        message = "Last name must be between 3 and 20 chars."
+    ))]
+    pub last_name: Option<String>,
+}
+
+impl From<UpdateCurrentUserPayload> for UpdateUserPayload {
+    fn from(payload: UpdateCurrentUserPayload) -> Self {
+        Self {
+            username: payload.username,
+            email: payload.email,
+            password: payload.password,
+            first_name: payload.first_name,
+            last_name: payload.last_name,
+            role: None,
+            status: None,
+        }
+    }
+}
+
 impl User {
     pub fn new(
         username: &str,
