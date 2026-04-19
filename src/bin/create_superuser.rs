@@ -11,21 +11,77 @@ use setlyst_api::{
     },
     models::user::{CreateUserPayload, Role, Status},
 };
+use std::io::{self, Write};
 use std::sync::Arc;
 use tracing::{error, info};
 use validator::Validate;
 
-const DEFAULT_USERNAME: &str = "admin";
-const DEFAULT_PASSWORD: &str = "root@toor";
-
 #[derive(clap::Parser, Debug)]
 #[command(version, about)]
 pub struct Args {
-    #[arg(short, long, default_value = DEFAULT_USERNAME)]
-    username: String,
+    /// Optional username. If not provided, the program will prompt for it.
+    #[arg(short, long)]
+    username: Option<String>,
+}
 
-    #[arg(short, long, default_value = DEFAULT_PASSWORD)]
-    password: String,
+fn validate_password_strength(password: &str) -> Result<(), &'static str> {
+    if password.len() < 8 {
+        return Err("Password must be at least 8 characters long.");
+    }
+    if !password.chars().any(|c| c.is_lowercase()) {
+        return Err("Password must contain at least one lowercase letter.");
+    }
+    if !password.chars().any(|c| c.is_uppercase()) {
+        return Err("Password must contain at least one uppercase letter.");
+    }
+    if !password.chars().any(|c| c.is_numeric()) {
+        return Err("Password must contain at least one number.");
+    }
+    if !password.chars().any(|c| !c.is_alphanumeric()) {
+        return Err("Password must contain at least one special character.");
+    }
+    Ok(())
+}
+
+fn prompt_for_username() -> String {
+    let mut username = String::new();
+    loop {
+        username.clear();
+        print!("Enter the username for the new admin: ");
+        io::stdout().flush().expect("❌ Error displaying prompt");
+
+        io::stdin()
+            .read_line(&mut username)
+            .expect("❌ Error reading username");
+
+        let trimmed_username = username.trim();
+
+        if !trimmed_username.is_empty() {
+            return trimmed_username.to_string();
+        } else {
+            println!("❌ Username cannot be empty.\n");
+        }
+    }
+}
+
+fn prompt_for_password(username: &str) -> String {
+    let mut password = String::new();
+    loop {
+        password.clear();
+        print!("Enter a strong password for user '{username}': ");
+        io::stdout().flush().expect("❌ Error displaying prompt");
+
+        io::stdin()
+            .read_line(&mut password)
+            .expect("❌ Error reading password");
+
+        let trimmed_password = password.trim();
+
+        match validate_password_strength(trimmed_password) {
+            Ok(_) => return trimmed_password.to_string(),
+            Err(e) => println!("❌ Weak password: {}\n", e),
+        }
+    }
 }
 
 #[tokio::main]
@@ -61,9 +117,17 @@ async fn main() {
         setlist_repo,
     };
 
+    // Use the argument if provided, otherwise prompt the user
+    let username = match args.username {
+        Some(name) => name,
+        None => prompt_for_username(),
+    };
+
+    let password = prompt_for_password(&username);
+
     let user = CreateUserPayload {
-        username: args.username,
-        password: args.password,
+        username: username.clone(),
+        password,
         role: Some(Role::Admin),
         status: Some(Status::default()),
         email: None,
