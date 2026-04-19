@@ -40,12 +40,17 @@ impl Config {
             cors_allowed_origins.push(origin.parse::<HeaderValue>()?);
         }
 
+        let port = std::env::var("PORT").unwrap_or_else(|_| "8000".to_string());
+        let host = format!("0.0.0.0:{port}");
+
         let config = Config {
-            host: std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0:8000".to_string()),
+            host,
             database_url: std::env::var("DATABASE_URL")?,
             postgres_db: std::env::var("POSTGRES_DB")?,
             jwt_secret,
-            jwt_expiration_time: std::env::var("JWT_EXPIRATION_TIME")?.parse()?,
+            jwt_expiration_time: std::env::var("JWT_EXPIRATION_TIME")
+                .unwrap_or_else(|_| "86400".to_string())
+                .parse()?,
             cors_allowed_origins,
         };
 

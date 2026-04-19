@@ -26,7 +26,7 @@ use utoipa::{
         license(name = "MIT", identifier = "MIT")
     ),
     servers(
-        (url = "http://localhost:8000", description = "Local server"),
+        (url = "/", description = "Default Server")
     ),
     modifiers(&AuthToken),
     paths(
