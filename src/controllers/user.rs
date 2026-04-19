@@ -41,16 +41,30 @@ pub async fn find_all_users(
     access: AccessControl,
     Query(pagination): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to retrieve all users.");
-    access.require_any_role(&[Role::Admin, Role::Moderator])?;
+    let requester_id = access.user_id();
 
     let current_page = pagination.page.unwrap_or(1).max(1);
     let per_page = pagination.per_page.unwrap_or(20).clamp(1, 100);
 
+    debug!(
+        %requester_id,
+        current_page,
+        per_page,
+        "Processing request to retrieve paginated users"
+    );
+
+    access.require_any_role(&[Role::Admin, Role::Moderator])?;
+
     match state.user_repo.find_all(current_page, per_page).await {
         Ok((users, total_items)) => {
-            info!("Users listed successfully. Total: {total_items}");
             let total_pages = (total_items as f64 / per_page as f64).ceil() as i64;
+
+            info!(
+                %requester_id,
+                total_items,
+                total_pages,
+                "Users retrieved successfully"
+            );
 
             Ok(Json(PaginatedResponse {
                 data: users,
@@ -63,7 +77,11 @@ pub async fn find_all_users(
             }))
         }
         Err(e) => {
-            error!("Error retrieving all users: {e}");
+            error!(
+                %requester_id,
+                error = %e,
+                "Failed to retrieve users"
+            );
             Err(e)
         }
     }
@@ -94,20 +112,40 @@ pub async fn find_user_by_id(
     State(state): State<AppState>,
     access: AccessControl,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to retrieve user with id: {id}");
+    let requester_id = access.user_id();
+
+    debug!(
+        %requester_id,
+        target_user_id = %id,
+        "Processing request to retrieve user by ID"
+    );
+
     access.require_any_role(&[Role::Admin, Role::Moderator])?;
 
     match state.user_repo.find_by_id(id).await {
         Ok(Some(user)) => {
-            info!("User found: {id}");
+            info!(
+                %requester_id,
+                target_user_id = %id,
+                "User retrieved successfully"
+            );
             Ok(Json(user))
         }
         Ok(None) => {
-            error!("No user found with id: {id}");
+            info!(
+                %requester_id,
+                target_user_id = %id,
+                "User not found"
+            );
             Err(ApiError::NotFound)
         }
         Err(e) => {
-            error!("Error retrieving user with id {id}: {e}");
+            error!(
+                %requester_id,
+                target_user_id = %id,
+                error = %e,
+                "Failed to retrieve user by ID"
+            );
             Err(e)
         }
     }
@@ -137,10 +175,14 @@ pub async fn create_user(
     access: AccessControl,
     Json(payload): Json<CreateUserPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let requester_id = access.user_id();
+
     debug!(
-        "Received request to create user with username: {}",
-        payload.username
+        %requester_id,
+        new_username = %payload.username,
+        "Processing request to create a new user"
     );
+
     access.require_any_role(&[Role::Admin, Role::Moderator])?;
 
     payload.validate()?;
@@ -148,7 +190,11 @@ pub async fn create_user(
 
     match state.user_repo.create(&payload).await {
         Ok(new_user) => {
-            info!("User created! ID: {}", &new_user.id);
+            info!(
+                %requester_id,
+                new_user_id = %new_user.id,
+                "User created successfully"
+            );
 
             let mut headers = HeaderMap::new();
             let location = format!("/api/v1/users/{}", new_user.id);
@@ -164,8 +210,10 @@ pub async fn create_user(
         }
         Err(e) => {
             error!(
-                "Error creating user with username {}: {e}",
-                payload.username
+                %requester_id,
+                new_username = %payload.username,
+                error = %e,
+                "Failed to create user"
             );
             Err(e)
         }
@@ -201,7 +249,14 @@ pub async fn update_user(
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateUserPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to update user with ID: {id}");
+    let requester_id = access.user_id();
+
+    debug!(
+        %requester_id,
+        target_user_id = %id,
+        "Processing request to update user"
+    );
+
     access.require_any_role(&[Role::Admin, Role::Moderator])?;
 
     payload.validate()?;
@@ -213,11 +268,20 @@ pub async fn update_user(
 
     match state.user_repo.update(id, &payload).await {
         Ok(user_id) => {
-            info!("User updated! ID: {user_id}");
+            info!(
+                %requester_id,
+                target_user_id = %user_id,
+                "User updated successfully"
+            );
             Ok(Json(user_id))
         }
         Err(e) => {
-            error!("Error updating user with ID {id}: {e}");
+            error!(
+                %requester_id,
+                target_user_id = %id,
+                error = %e,
+                "Failed to update user"
+            );
             Err(e)
         }
     }
@@ -248,18 +312,34 @@ pub async fn delete_user(
     access: AccessControl,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to delete user with ID: {id}");
+    let requester_id = access.user_id();
+
+    debug!(
+        %requester_id,
+        target_user_id = %id,
+        "Processing request to delete user"
+    );
+
     access.require_any_role(&[Role::Admin, Role::Moderator])?;
 
     state.user_repo.exists(id).await?;
 
     match state.user_repo.delete(id).await {
         Ok(_) => {
-            info!("User deleted! ID: {id}");
+            info!(
+                %requester_id,
+                target_user_id = %id,
+                "User deleted successfully"
+            );
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => {
-            error!("Error deleting user with ID {id}: {e}");
+            error!(
+                %requester_id,
+                target_user_id = %id,
+                error = %e,
+                "Failed to delete user"
+            );
             Err(e)
         }
     }
@@ -287,11 +367,21 @@ pub async fn get_current_user(
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = access.user_id();
 
+    debug!(
+        %user_id,
+        "Processing request to retrieve current user profile"
+    );
+
     let user = state
         .user_repo
         .find_by_id(user_id)
         .await?
         .ok_or(ApiError::NotFound)?;
+
+    info!(
+        %user_id,
+        "Current user profile retrieved successfully"
+    );
 
     Ok((StatusCode::OK, Json(user)))
 }
@@ -318,10 +408,21 @@ pub async fn update_current_user(
     access: AccessControl,
     Json(payload): Json<UpdateUserPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    payload.validate()?;
     let user_id = access.user_id();
 
+    debug!(
+        %user_id,
+        "Processing request to update current user profile"
+    );
+
+    payload.validate()?;
+
     state.user_repo.update(user_id, &payload).await?;
+
+    info!(
+        %user_id,
+        "Current user profile updated successfully"
+    );
 
     Ok((StatusCode::OK, Json("Profile updated successfully")))
 }

@@ -38,19 +38,31 @@ pub async fn find_all_setlists(
     access: AccessControl,
     Query(pagination): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to retrieve all setlists.");
-
+    let user_id = access.user_id();
     let current_page = pagination.page.unwrap_or(1).max(1);
     let per_page = pagination.per_page.unwrap_or(20).clamp(1, 100);
 
+    debug!(
+        %user_id,
+        current_page,
+        per_page,
+        "Processing request to retrieve paginated setlists"
+    );
+
     match state
         .setlist_repo
-        .find_all(access.user_id(), current_page, per_page)
+        .find_all(user_id, current_page, per_page)
         .await
     {
         Ok((setlists, total_items)) => {
-            info!("Setlists listed successfully. Total: {total_items}");
             let total_pages = (total_items as f64 / per_page as f64).ceil() as i64;
+
+            info!(
+                %user_id,
+                total_items,
+                total_pages,
+                "Setlists retrieved successfully"
+            );
 
             Ok(Json(PaginatedResponse {
                 data: setlists,
@@ -63,7 +75,11 @@ pub async fn find_all_setlists(
             }))
         }
         Err(e) => {
-            error!("Error retrieving all setlists: {e}");
+            error!(
+                %user_id,
+                error = %e,
+                "Failed to retrieve setlists"
+            );
             Err(e)
         }
     }
@@ -87,19 +103,38 @@ pub async fn find_setlist_by_id(
     State(state): State<AppState>,
     access: AccessControl,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to retrieve setlist with id: {id}");
+    let user_id = access.user_id();
+
+    debug!(
+        %user_id,
+        setlist_id = %id,
+        "Processing request to retrieve setlist by ID"
+    );
 
     match state.setlist_repo.find_by_id(id, access.user_id()).await {
         Ok(Some(setlist)) => {
-            info!("Setlist found: {id}");
+            info!(
+                %user_id,
+                setlist_id = %id,
+                "Setlist retrieved successfully"
+            );
             Ok(Json(setlist))
         }
         Ok(None) => {
-            error!("No setlist found with id: {id}");
+            info!(
+                %user_id,
+                setlist_id = %id,
+                "Setlist not found"
+            );
             Err(ApiError::NotFound)
         }
         Err(e) => {
-            error!("Error retrieving setlist with id {id}: {e}");
+            error!(
+                %user_id,
+                setlist_id = %id,
+                error = %e,
+                "Failed to retrieve setlist by ID"
+            );
             Err(e)
         }
     }
@@ -124,13 +159,15 @@ pub async fn create_setlist(
     access: AccessControl,
     Json(payload): Json<CreateSetlistPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
     debug!(
-        "Received request to create setlist with title: {}",
-        payload.title
+        %user_id,
+        setlist_title = %payload.title,
+        "Processing request to create a new setlist"
     );
 
     payload.validate()?;
-    let user_id = access.user_id();
 
     state
         .setlist_repo
@@ -139,7 +176,11 @@ pub async fn create_setlist(
 
     match state.setlist_repo.create(&payload, user_id).await {
         Ok(new_setlist) => {
-            info!("Setlist created! ID: {}", &new_setlist.id);
+            info!(
+                %user_id,
+                setlist_id = %new_setlist.id,
+                "Setlist created successfully"
+            );
 
             let mut headers = HeaderMap::new();
             let location = format!("/api/v1/setlists/{}", new_setlist.id);
@@ -150,7 +191,12 @@ pub async fn create_setlist(
             Ok((StatusCode::CREATED, headers, Json(new_setlist)))
         }
         Err(e) => {
-            error!("Error creating setlist with title {}: {e}", payload.title);
+            error!(
+                %user_id,
+                setlist_title = %payload.title,
+                error = %e,
+                "Failed to create setlist"
+            );
             Err(e)
         }
     }
@@ -176,10 +222,15 @@ pub async fn update_setlist(
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateSetlistPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to update setlist with ID: {id}");
+    let user_id = access.user_id();
+
+    debug!(
+        %user_id,
+        setlist_id = %id,
+        "Processing request to update setlist"
+    );
 
     payload.validate()?;
-    let user_id = access.user_id();
 
     state.setlist_repo.exists(id, user_id).await?;
 
@@ -192,11 +243,20 @@ pub async fn update_setlist(
 
     match state.setlist_repo.update(id, &payload).await {
         Ok(setlist_id) => {
-            info!("Setlist updated! ID: {setlist_id}");
+            info!(
+                %user_id,
+                setlist_id = %setlist_id,
+                "Setlist updated successfully"
+            );
             Ok(Json(setlist_id))
         }
         Err(e) => {
-            error!("Error updating setlist with ID {id}: {e}");
+            error!(
+                %user_id,
+                setlist_id = %id,
+                error = %e,
+                "Failed to update setlist"
+            );
             Err(e)
         }
     }
@@ -217,18 +277,31 @@ pub async fn delete_setlist(
     access: AccessControl,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to delete setlist with ID: {id}");
-
     let user_id = access.user_id();
+    debug!(
+        %user_id,
+        setlist_id = %id,
+        "Processing request to delete setlist"
+    );
+
     state.setlist_repo.exists(id, user_id).await?;
 
     match state.setlist_repo.delete(id).await {
         Ok(_) => {
-            info!("Setlist deleted! ID: {id}");
+            info!(
+                %user_id,
+                setlist_id = %id,
+                "Setlist deleted successfully"
+            );
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => {
-            error!("Error deleting setlist with ID {id}: {e}");
+            error!(
+                %user_id,
+                setlist_id = %id,
+                error = %e,
+                "Failed to delete setlist"
+            );
             Err(e)
         }
     }
@@ -259,6 +332,13 @@ pub async fn add_song_to_setlist(
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = access.user_id();
 
+    debug!(
+        %user_id,
+        %setlist_id,
+        song_id = %payload.song_id,
+        "Processing request to add song to setlist"
+    );
+
     state.setlist_repo.exists(setlist_id, user_id).await?;
     state.song_repo.exists(payload.song_id, user_id).await?;
 
@@ -266,6 +346,13 @@ pub async fn add_song_to_setlist(
         .setlist_repo
         .add_song(setlist_id, payload.song_id, payload.position)
         .await?;
+
+    info!(
+        %user_id,
+        %setlist_id,
+        song_id = %payload.song_id,
+        "Song added to setlist successfully"
+    );
 
     Ok((
         StatusCode::CREATED,
@@ -299,8 +386,22 @@ pub async fn remove_song_from_setlist(
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = access.user_id();
 
+    debug!(
+        %user_id,
+        %setlist_id,
+        %song_id,
+        "Processing request to remove song from setlist"
+    );
+
     state.setlist_repo.exists(setlist_id, user_id).await?;
     state.setlist_repo.remove_song(setlist_id, song_id).await?;
+
+    info!(
+        %user_id,
+        %setlist_id,
+        %song_id,
+        "Song removed from setlist successfully"
+    );
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -332,10 +433,18 @@ pub async fn get_setlist_songs(
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = access.user_id();
 
-    state.setlist_repo.exists(id, user_id).await?;
-
     let current_page = pagination.page.unwrap_or(1).max(1);
     let per_page = pagination.per_page.unwrap_or(20).clamp(1, 100);
+
+    info!(
+        %user_id,
+        setlist_id = %id,
+        current_page,
+        per_page,
+        "Processing request to retrieve songs for setlist"
+    );
+
+    state.setlist_repo.exists(id, user_id).await?;
 
     match state
         .setlist_repo
@@ -344,6 +453,13 @@ pub async fn get_setlist_songs(
     {
         Ok((songs, total_items)) => {
             let total_pages = (total_items as f64 / per_page as f64).ceil() as i64;
+
+            info!(
+                %user_id,
+                setlist_id = %id,
+                total_items,
+                "Songs for setlist retrieved successfully"
+            );
 
             Ok(Json(PaginatedResponse {
                 data: songs,
@@ -356,7 +472,12 @@ pub async fn get_setlist_songs(
             }))
         }
         Err(e) => {
-            error!("Error retrieving songs for setlist {id}: {e}");
+            error!(
+                %user_id,
+                setlist_id = %id,
+                error = %e,
+                "Failed to retrieve songs for setlist"
+            );
             Err(e)
         }
     }
@@ -388,15 +509,28 @@ pub async fn reorder_setlist_songs(
     Path(setlist_id): Path<Uuid>,
     Json(payload): Json<ReorderSetlistSongsPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
+    debug!(
+        %user_id,
+        %setlist_id,
+        "Processing request to reorder songs in setlist"
+    );
+
     payload.validate()?;
 
-    let user_id = access.user_id();
     state.setlist_repo.exists(setlist_id, user_id).await?;
 
     state
         .setlist_repo
         .reorder_songs(setlist_id, &payload.song_ids)
         .await?;
+
+    info!(
+        %user_id,
+        %setlist_id,
+        "Songs in setlist reordered successfully"
+    );
 
     Ok((StatusCode::OK, Json("Setlist reordered successfully")))
 }

@@ -22,6 +22,12 @@ use tracing::{error, info};
     )
 )]
 pub async fn dry_run(access: AccessControl) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+    info!(
+        %user_id,
+        "Processing request to dry run migrations"
+    );
+
     access.require_role(Role::Admin)?;
 
     Ok((
@@ -56,16 +62,29 @@ pub async fn live_run(
     State(state): State<AppState>,
     access: AccessControl,
 ) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+    info!(
+        %user_id,
+        "Processing request to execute live database migrations"
+    );
+
     access.require_role(Role::Admin)?;
 
     migrate!("./src/database/migrations")
         .run(&state.db)
         .await
         .map_err(|e| {
-            error!("Error applying migrations: {e}");
+            error!(
+                %user_id,
+                error = %e,
+                "Failed to apply database migrations"
+            );
             ApiError::DatabaseError(e.into())
         })?;
 
-    info!("Migrations applied successfully!");
+    info!(
+        %user_id,
+        "Database migrations applied successfully"
+    );
     Ok(Json("Migrations applied successfully!"))
 }

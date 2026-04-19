@@ -32,6 +32,11 @@ pub async fn login(
     State(state): State<AppState>,
     Json(payload): Json<LoginPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
+    debug!(
+        "Received request to login for username: {}",
+        payload.username
+    );
+
     let user = match state.user_repo.find_by_username(&payload.username).await? {
         Some(u) => u,
         None => return Err(ApiError::NotFound),

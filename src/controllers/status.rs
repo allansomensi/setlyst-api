@@ -6,7 +6,7 @@ use crate::{
 };
 use axum::{Json, extract::State, response::IntoResponse};
 use chrono::Utc;
-use tracing::info;
+use tracing::{debug, info};
 
 /// Retrieves the current status of the API, including the database connection status.
 /// Provides information on the database version, maximum connections, and currently open connections.
@@ -22,6 +22,8 @@ use tracing::info;
     )
 )]
 pub async fn show_status(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    debug!("Processing request to retrieve API and database status");
+
     let version: String = sqlx::query_scalar(r#"SHOW server_version;"#)
         .fetch_one(&state.db)
         .await?;
@@ -46,7 +48,12 @@ pub async fn show_status(State(state): State<AppState>) -> Result<impl IntoRespo
         opened_connections,
     };
 
-    info!("Status queried");
+    info!(
+        database_name = %config.postgres_db,
+        max_connections,
+        opened_connections,
+        "API and database status retrieved successfully"
+    );
     Ok(Json(Status {
         updated_at: Utc::now().naive_utc(),
         dependencies: Dependencies { database },

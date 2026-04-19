@@ -35,19 +35,32 @@ pub async fn find_all_songs(
     access: AccessControl,
     Query(pagination): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to retrieve all songs.");
+    let user_id = access.user_id();
 
     let current_page = pagination.page.unwrap_or(1).max(1);
     let per_page = pagination.per_page.unwrap_or(20).clamp(1, 100);
 
+    debug!(
+        %user_id,
+        current_page,
+        per_page,
+        "Processing request to retrieve paginated songs"
+    );
+
     match state
         .song_repo
-        .find_all(access.user_id(), current_page, per_page)
+        .find_all(user_id, current_page, per_page)
         .await
     {
         Ok((songs, total_items)) => {
-            info!("Songs listed successfully. Total: {total_items}");
             let total_pages = (total_items as f64 / per_page as f64).ceil() as i64;
+
+            info!(
+                %user_id,
+                total_items,
+                total_pages,
+                "Songs retrieved successfully"
+            );
 
             Ok(Json(PaginatedResponse {
                 data: songs,
@@ -60,7 +73,11 @@ pub async fn find_all_songs(
             }))
         }
         Err(e) => {
-            error!("Error retrieving all songs: {e}");
+            error!(
+                %user_id,
+                error = %e,
+                "Failed to retrieve songs"
+            );
             Err(e)
         }
     }
@@ -84,19 +101,38 @@ pub async fn find_song_by_id(
     State(state): State<AppState>,
     access: AccessControl,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to retrieve song with id: {id}");
+    let user_id = access.user_id();
 
-    match state.song_repo.find_by_id(id, access.user_id()).await {
+    debug!(
+        %user_id,
+        song_id = %id,
+        "Processing request to retrieve song by ID"
+    );
+
+    match state.song_repo.find_by_id(id, user_id).await {
         Ok(Some(song)) => {
-            info!("Song found: {id}");
+            info!(
+                %user_id,
+                song_id = %id,
+                "Song retrieved successfully"
+            );
             Ok(Json(song))
         }
         Ok(None) => {
-            error!("No song found with id: {id}");
+            info!(
+                %user_id,
+                song_id = %id,
+                "Song not found"
+            );
             Err(ApiError::NotFound)
         }
         Err(e) => {
-            error!("Error retrieving song with id {id}: {e}");
+            error!(
+                %user_id,
+                song_id = %id,
+                error = %e,
+                "Failed to retrieve song by ID"
+            );
             Err(e)
         }
     }
@@ -121,13 +157,16 @@ pub async fn create_song(
     access: AccessControl,
     Json(payload): Json<CreateSongPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
     debug!(
-        "Received request to create song with title: {}",
-        payload.title
+        %user_id,
+        song_title = %payload.title,
+        artist_id = %payload.artist_id,
+        "Processing request to create a new song"
     );
 
     payload.validate()?;
-    let user_id = access.user_id();
 
     state.artist_repo.exists(payload.artist_id, user_id).await?;
     state
@@ -137,7 +176,11 @@ pub async fn create_song(
 
     match state.song_repo.create(&payload, user_id).await {
         Ok(new_song) => {
-            info!("Song created! ID: {}", &new_song.id);
+            info!(
+                %user_id,
+                song_id = %new_song.id,
+                "Song created successfully"
+            );
 
             let mut headers = HeaderMap::new();
             let location = format!("/api/v1/songs/{}", new_song.id);
@@ -148,7 +191,12 @@ pub async fn create_song(
             Ok((StatusCode::CREATED, headers, Json(new_song)))
         }
         Err(e) => {
-            error!("Error creating song with title {}: {e}", payload.title);
+            error!(
+                %user_id,
+                song_title = %payload.title,
+                error = %e,
+                "Failed to create song"
+            );
             Err(e)
         }
     }
@@ -174,10 +222,15 @@ pub async fn update_song(
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateSongPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to update song with ID: {id}");
+    let user_id = access.user_id();
+
+    debug!(
+        %user_id,
+        song_id = %id,
+        "Processing request to update song"
+    );
 
     payload.validate()?;
-    let user_id = access.user_id();
 
     let existing_song = state
         .song_repo
@@ -201,11 +254,20 @@ pub async fn update_song(
 
     match state.song_repo.update(id, &payload).await {
         Ok(song_id) => {
-            info!("Song updated! ID: {song_id}");
+            info!(
+                %user_id,
+                song_id = %song_id,
+                "Song updated successfully"
+            );
             Ok(Json(song_id))
         }
         Err(e) => {
-            error!("Error updating song with ID {id}: {e}");
+            error!(
+                %user_id,
+                song_id = %id,
+                error = %e,
+                "Failed to update song"
+            );
             Err(e)
         }
     }
@@ -226,18 +288,32 @@ pub async fn delete_song(
     access: AccessControl,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to delete song with ID: {id}");
-
     let user_id = access.user_id();
+
+    debug!(
+        %user_id,
+        song_id = %id,
+        "Processing request to delete song"
+    );
+
     state.song_repo.exists(id, user_id).await?;
 
     match state.song_repo.delete(id).await {
         Ok(_) => {
-            info!("Song deleted! ID: {id}");
+            info!(
+                %user_id,
+                song_id = %id,
+                "Song deleted successfully"
+            );
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => {
-            error!("Error deleting song with ID {id}: {e}");
+            error!(
+                %user_id,
+                song_id = %id,
+                error = %e,
+                "Failed to delete song"
+            );
             Err(e)
         }
     }

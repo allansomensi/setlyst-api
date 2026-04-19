@@ -40,20 +40,32 @@ pub async fn find_all_artists(
     access: AccessControl,
     Query(pagination): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to retrieve all artists.");
+    let user_id = access.user_id();
 
     let current_page = pagination.page.unwrap_or(1).max(1);
     let per_page = pagination.per_page.unwrap_or(20).clamp(1, 100);
 
+    debug!(
+        %user_id,
+        current_page,
+        per_page,
+        "Processing request to retrieve paginated artists"
+    );
+
     match state
         .artist_repo
-        .find_all(access.user_id(), current_page, per_page)
+        .find_all(user_id, current_page, per_page)
         .await
     {
         Ok((artists, total_items)) => {
-            info!("Artists listed successfully. Total: {total_items}");
-
             let total_pages = (total_items as f64 / per_page as f64).ceil() as i64;
+
+            info!(
+                %user_id,
+                total_items,
+                total_pages,
+                "Artists retrieved successfully"
+            );
 
             Ok(Json(PaginatedResponse {
                 data: artists,
@@ -66,7 +78,11 @@ pub async fn find_all_artists(
             }))
         }
         Err(e) => {
-            error!("Error retrieving all artists: {e}");
+            error!(
+                %user_id,
+                error = %e,
+                "Failed to retrieve artists"
+            );
             Err(e)
         }
     }
@@ -96,19 +112,38 @@ pub async fn find_artist_by_id(
     State(state): State<AppState>,
     access: AccessControl,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to retrieve artist with id: {id}");
+    let user_id = access.user_id();
 
-    match state.artist_repo.find_by_id(id, access.user_id()).await {
+    debug!(
+        %user_id,
+        artist_id = %id,
+        "Processing request to retrieve artist by ID"
+    );
+
+    match state.artist_repo.find_by_id(id, user_id).await {
         Ok(Some(artist)) => {
-            info!("Artist found: {id}");
+            info!(
+                %user_id,
+                artist_id = %id,
+                "Artist retrieved successfully"
+            );
             Ok(Json(artist))
         }
         Ok(None) => {
-            error!("No artist found with id: {id}");
+            info!(
+                %user_id,
+                artist_id = %id,
+                "Artist not found"
+            );
             Err(ApiError::NotFound)
         }
         Err(e) => {
-            error!("Error retrieving artist with id {id}: {e}");
+            error!(
+                %user_id,
+                artist_id = %id,
+                error = %e,
+                "Failed to retrieve artist by ID"
+            );
             Err(e)
         }
     }
@@ -137,14 +172,16 @@ pub async fn create_artist(
     access: AccessControl,
     Json(payload): Json<CreateArtistPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
     debug!(
-        "Received request to create artist with name: {}",
-        payload.name
+        %user_id,
+        artist_name = %payload.name,
+        "Processing request to create a new artist"
     );
 
     payload.validate()?;
 
-    let user_id = access.user_id();
     state
         .artist_repo
         .is_unique(&payload.name, user_id, None)
@@ -152,7 +189,11 @@ pub async fn create_artist(
 
     match state.artist_repo.create(&payload, user_id).await {
         Ok(new_artist) => {
-            info!("Artist created! ID: {}", &new_artist.id);
+            info!(
+                %user_id,
+                artist_id = %new_artist.id,
+                "Artist created successfully"
+            );
 
             let mut headers = HeaderMap::new();
             let location = format!("/api/v1/artists/{}", new_artist.id);
@@ -163,7 +204,12 @@ pub async fn create_artist(
             Ok((StatusCode::CREATED, headers, Json(new_artist)))
         }
         Err(e) => {
-            error!("Error creating artist with name {}: {e}", payload.name);
+            error!(
+                %user_id,
+                artist_name = %payload.name,
+                error = %e,
+                "Failed to create artist"
+            );
             Err(e)
         }
     }
@@ -197,10 +243,15 @@ pub async fn update_artist(
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateArtistPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to update artist with ID: {id}");
+    let user_id = access.user_id();
+
+    debug!(
+        %user_id,
+        artist_id = %id,
+        "Processing request to update artist"
+    );
 
     payload.validate()?;
-    let user_id = access.user_id();
 
     state.artist_repo.exists(id, user_id).await?;
     if let Some(name) = &payload.name {
@@ -209,11 +260,20 @@ pub async fn update_artist(
 
     match state.artist_repo.update(id, &payload).await {
         Ok(artist_id) => {
-            info!("Artist updated! ID: {artist_id}");
+            info!(
+                %user_id,
+                artist_id = %artist_id,
+                "Artist updated successfully"
+            );
             Ok(Json(artist_id))
         }
         Err(e) => {
-            error!("Error updating artist with ID {id}: {e}");
+            error!(
+                %user_id,
+                artist_id = %id,
+                error = %e,
+                "Failed to update artist"
+            );
             Err(e)
         }
     }
@@ -243,18 +303,32 @@ pub async fn delete_artist(
     access: AccessControl,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!("Received request to delete artist with ID: {id}");
-
     let user_id = access.user_id();
+
+    info!(
+        %user_id,
+        artist_id = %id,
+        "Processing request to delete artist"
+    );
+
     state.artist_repo.exists(id, user_id).await?;
 
     match state.artist_repo.delete(id).await {
         Ok(_) => {
-            info!("Artist deleted! ID: {id}");
+            info!(
+                %user_id,
+                artist_id = %id,
+                "Artist deleted successfully"
+            );
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => {
-            error!("Error deleting artist with ID {id}: {e}");
+            error!(
+                %user_id,
+                artist_id = %id,
+                error = %e,
+                "Failed to delete artist"
+            );
             Err(e)
         }
     }
