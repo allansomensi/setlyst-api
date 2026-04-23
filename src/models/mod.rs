@@ -7,6 +7,7 @@ pub mod setlist;
 pub mod song;
 pub mod status;
 pub mod user;
+pub mod user_preferences;
 
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 pub struct DeletePayload {

@@ -6,7 +6,9 @@ use setlyst_api::{
         connection::create_pool,
         repositories::{
             artist_repository::ArtistRepositoryImpl, setlist_repository::SetlistRepositoryImpl,
-            song_repository::SongRepositoryImpl, user_repository::UserRepositoryImpl,
+            song_repository::SongRepositoryImpl,
+            user_preferences_repository::UserPreferencesRepositoryImpl,
+            user_repository::UserRepositoryImpl,
         },
     },
     models::user::{CreateUserPayload, Role, Status},
@@ -105,6 +107,7 @@ async fn main() {
     };
 
     let user_repo = Arc::new(UserRepositoryImpl::new(pool.clone()));
+    let user_prefs_repo = Arc::new(UserPreferencesRepositoryImpl::new(pool.clone()));
     let artist_repo = Arc::new(ArtistRepositoryImpl::new(pool.clone()));
     let song_repo = Arc::new(SongRepositoryImpl::new(pool.clone()));
     let setlist_repo = Arc::new(SetlistRepositoryImpl::new(pool.clone()));
@@ -112,6 +115,7 @@ async fn main() {
     let state = AppState {
         db: pool.clone(),
         user_repo,
+        user_prefs_repo,
         artist_repo,
         song_repo,
         setlist_repo,

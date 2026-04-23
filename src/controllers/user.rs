@@ -7,6 +7,7 @@ use crate::{
         user::{
             CreateUserPayload, Role, UpdateCurrentUserPayload, UpdateUserPayload, User, UserPublic,
         },
+        user_preferences::{UpdatePreferencesPayload, UserPreferences},
     },
 };
 use axum::{
@@ -429,4 +430,155 @@ pub async fn update_current_user(
     );
 
     Ok((StatusCode::OK, Json("Profile updated successfully")))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/users/me/preferences",
+    tags = ["Users"],
+    summary = "Get current user preferences",
+    description = "Retrieves the application preferences of the currently authenticated user.",
+    security(
+        (),
+        ("jwt_token" = [])
+    ),
+    responses(
+        (status = 200, description = "Preferences retrieved successfully", body = UserPreferences),
+        (status = 401, description = "Unauthorized")
+    )
+)]
+pub async fn get_current_user_preferences(
+    State(state): State<AppState>,
+    access: AccessControl,
+) -> Result<impl IntoResponse, ApiError> {
+    let requester_id = access.user_id();
+
+    debug!(
+        %requester_id,
+        "Processing request to retrieve current user preferences"
+    );
+
+    match state.user_prefs_repo.get_by_user_id(requester_id).await {
+        Ok(prefs) => {
+            info!(
+                %requester_id,
+                "Current user preferences retrieved successfully"
+            );
+            Ok((StatusCode::OK, Json(prefs)))
+        }
+        Err(e) => {
+            error!(
+                %requester_id,
+                error = %e,
+                "Failed to retrieve current user preferences"
+            );
+            Err(e)
+        }
+    }
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/users/me/preferences",
+    tags = ["Users"],
+    summary = "Update current user preferences",
+    description = "Updates the application preferences of the currently authenticated user.",
+    request_body = UpdatePreferencesPayload,
+    security(
+        (),
+        ("jwt_token" = [])
+    ),
+    responses(
+        (status = 200, description = "Preferences updated successfully"),
+        (status = 400, description = "Validation error"),
+        (status = 401, description = "Unauthorized")
+    )
+)]
+pub async fn update_current_user_preferences(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Json(payload): Json<UpdatePreferencesPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    let requester_id = access.user_id();
+
+    debug!(
+        %requester_id,
+        "Processing request to update current user preferences"
+    );
+
+    payload.validate()?;
+
+    match state.user_prefs_repo.upsert(requester_id, &payload).await {
+        Ok(_) => {
+            info!(
+                %requester_id,
+                "Current user preferences updated successfully"
+            );
+            Ok((StatusCode::OK, Json("Preferences updated successfully")))
+        }
+        Err(e) => {
+            error!(
+                %requester_id,
+                error = %e,
+                "Failed to update current user preferences"
+            );
+            Err(e)
+        }
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/users/{id}/preferences",
+    tags = ["Users"],
+    summary = "Get user preferences by ID",
+    description = "Returns the preferences for a specific user. Requires Admin or Moderator role.",
+    security(
+        (),
+        ("jwt_token" = [])
+    ),
+    params(
+        ("id" = Uuid, Path, description = "User UUID")
+    ),
+    responses(
+        (status = 200, description = "Preferences found", body = UserPreferences),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - Insufficient permissions"),
+        (status = 404, description = "User preferences not found")
+    )
+)]
+pub async fn get_user_preferences_by_id(
+    Path(id): Path<Uuid>,
+    State(state): State<AppState>,
+    access: AccessControl,
+) -> Result<impl IntoResponse, ApiError> {
+    let requester_id = access.user_id();
+
+    debug!(
+        %requester_id,
+        target_user_id = %id,
+        "Processing request to retrieve user preferences by ID"
+    );
+
+    access.require_any_role(&[Role::Admin, Role::Moderator])?;
+
+    match state.user_prefs_repo.get_by_user_id(id).await {
+        Ok(prefs) => {
+            info!(
+                %requester_id,
+                target_user_id = %id,
+                "User preferences retrieved successfully"
+            );
+            Ok((StatusCode::OK, Json(prefs)))
+        }
+        Err(e) => {
+            error!(
+                %requester_id,
+                target_user_id = %id,
+                error = %e,
+                "Failed to retrieve user preferences by ID"
+            );
+            Err(e)
+        }
+    }
 }

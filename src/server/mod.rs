@@ -5,7 +5,9 @@ use crate::{
         connection::create_pool,
         repositories::{
             artist_repository::ArtistRepositoryImpl, setlist_repository::SetlistRepositoryImpl,
-            song_repository::SongRepositoryImpl, user_repository::UserRepositoryImpl,
+            song_repository::SongRepositoryImpl,
+            user_preferences_repository::UserPreferencesRepositoryImpl,
+            user_repository::UserRepositoryImpl,
         },
     },
     errors::api_error::ApiError,
@@ -29,12 +31,14 @@ pub async fn run() -> Result<(), ApiError> {
 
     let user_repo = Arc::new(UserRepositoryImpl::new(pool.clone()));
     let artist_repo = Arc::new(ArtistRepositoryImpl::new(pool.clone()));
+    let user_prefs_repo = Arc::new(UserPreferencesRepositoryImpl::new(pool.clone()));
     let song_repo = Arc::new(SongRepositoryImpl::new(pool.clone()));
     let setlist_repo = Arc::new(SetlistRepositoryImpl::new(pool.clone()));
 
     let state = AppState {
         db: pool.clone(),
         user_repo,
+        user_prefs_repo,
         artist_repo,
         song_repo,
         setlist_repo,

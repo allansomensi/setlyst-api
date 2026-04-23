@@ -6,6 +6,7 @@ use crate::{
         song::{Genre, Song, Tonality},
         status::Status,
         user::User,
+        user_preferences::UserPreferences,
     },
 };
 use serde::Serialize;
@@ -49,6 +50,9 @@ use utoipa::{
         user::delete_user,
         user::get_current_user,
         user::update_current_user,
+        user::get_current_user_preferences,
+        user::update_current_user_preferences,
+        user::get_user_preferences_by_id,
 
         // Artists
         artist::find_artist_by_id,
@@ -76,7 +80,7 @@ use utoipa::{
         setlist::reorder_setlist_songs
     ),
     components(
-        schemas(Status, User, Artist, Song, Setlist, Tonality, Genre)
+        schemas(Status, User, UserPreferences ,Artist, Song, Setlist, Tonality, Genre)
     ),
     tags(
         (name = "Status", description = "Status endpoints"),
