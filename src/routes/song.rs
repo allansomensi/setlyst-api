@@ -3,6 +3,7 @@ use axum::{Router, routing::get};
 
 pub fn create_routes(state: AppState) -> Router {
     axum::Router::new()
+        .route("/export/chordpro", get(song::export_songs_chordpro))
         .route(
             "/{id}",
             get(song::find_song_by_id)

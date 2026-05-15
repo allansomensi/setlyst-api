@@ -332,3 +332,12 @@ impl Song {
         }
     }
 }
+
+#[derive(Debug, Serialize, ToSchema, FromRow)]
+pub struct SongExport {
+    pub title: String,
+    pub artist_name: Option<String>,
+    pub tonality: Option<String>,
+    pub tempo: Option<i32>,
+    pub lyrics: Option<String>,
+}

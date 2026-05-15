@@ -1,6 +1,6 @@
 use crate::{
     errors::api_error::ApiError,
-    models::song::{CreateSongPayload, Song, UpdateSongPayload},
+    models::song::{CreateSongPayload, Song, SongExport, UpdateSongPayload},
 };
 use sqlx::PgPool;
 use tracing::error;
@@ -26,6 +26,7 @@ pub trait SongRepository: Send + Sync {
         exclude_id: Option<Uuid>,
     ) -> Result<(), ApiError>;
     async fn exists(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
+    async fn export_all_chordpro(&self, user_id: Uuid) -> Result<Vec<SongExport>, ApiError>;
 }
 
 pub struct SongRepositoryImpl {
@@ -232,5 +233,27 @@ impl SongRepository for SongRepositoryImpl {
         } else {
             Ok(())
         }
+    }
+
+    async fn export_all_chordpro(&self, user_id: Uuid) -> Result<Vec<SongExport>, ApiError> {
+        let songs = sqlx::query_as::<_, SongExport>(
+            r#"
+            SELECT 
+                s.title,
+                a.name AS artist_name,
+                s.tonality::text AS tonality,
+                s.tempo,
+                s.lyrics
+            FROM songs s
+            LEFT JOIN artists a ON s.artist_id = a.id
+            WHERE s.user_id = $1
+            ORDER BY a.name ASC, s.title ASC
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(&self.db)
+        .await?;
+
+        Ok(songs)
     }
 }

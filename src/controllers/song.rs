@@ -10,7 +10,10 @@ use crate::{
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header::LOCATION},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{self, LOCATION},
+    },
     response::IntoResponse,
 };
 use tracing::{debug, error, info};
@@ -317,4 +320,87 @@ pub async fn delete_song(
             Err(e)
         }
     }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/songs/export/chordpro",
+    tags = ["Songs"],
+    summary = "Export all songs in ChordPro format.",
+    description = "Exports all user songs compiled into a single ChordPro (.cho) file.",
+    security((), ("jwt_token" = [])),
+    responses(
+        (status = 200, description = "ChordPro file generated successfully.", content_type = "text/plain"),
+        (status = 500, description = "An error occurred while exporting the songs.")
+    )
+)]
+pub async fn export_songs_chordpro(
+    State(state): State<AppState>,
+    access: AccessControl,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
+    debug!(
+        %user_id,
+        "Processing request to export songs in ChordPro format"
+    );
+
+    let songs = state.song_repo.export_all_chordpro(user_id).await?;
+    let songs_count = songs.len();
+
+    let mut chordpro_file = String::new();
+
+    for (index, song) in songs.into_iter().enumerate() {
+        if index > 0 {
+            chordpro_file.push_str("\n{new_song}\n\n");
+        }
+
+        chordpro_file.push_str(&format!("{{title: {}}}\n", song.title));
+
+        if let Some(artist) = song.artist_name {
+            chordpro_file.push_str(&format!("{{artist: {artist}}}\n"));
+        }
+
+        if let Some(key) = song.tonality {
+            chordpro_file.push_str(&format!("{{key: {key}}}\n"));
+        }
+
+        if let Some(tempo) = song.tempo {
+            chordpro_file.push_str(&format!("{{tempo: {tempo}}}\n"));
+        }
+
+        chordpro_file.push('\n');
+
+        if let Some(lyrics) = song.lyrics {
+            chordpro_file.push_str(&lyrics);
+        } else {
+            chordpro_file.push_str("# No lyrics provided.");
+        }
+
+        chordpro_file.push('\n');
+    }
+
+    let filename = format!(
+        "setlyst-songs-{}.cho",
+        chrono::Utc::now().format("%Y%m%d%H%M%S")
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+
+    if let Ok(disposition) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+    {
+        headers.insert(header::CONTENT_DISPOSITION, disposition);
+    }
+
+    info!(
+        %user_id,
+        %songs_count,
+        "Songs exported successfully in ChordPro format"
+    );
+
+    Ok((StatusCode::OK, headers, chordpro_file))
 }

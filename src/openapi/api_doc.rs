@@ -67,6 +67,7 @@ use utoipa::{
         song::create_song,
         song::update_song,
         song::delete_song,
+        song::export_songs_chordpro,
 
         // Setlists
         setlist::find_setlist_by_id,
