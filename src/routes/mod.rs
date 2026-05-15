@@ -9,12 +9,15 @@ pub mod user;
 
 use crate::{config::Config, database::AppState, middlewares::authentication::authenticate};
 use axum::{Router, extract::DefaultBodyLimit, middleware};
-use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
+use tower_governor::{
+    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
+};
 
 pub fn create_routes(state: AppState) -> Router {
     let global_governor_conf = GovernorConfigBuilder::default()
         .per_second(10)
         .burst_size(60)
+        .key_extractor(SmartIpKeyExtractor)
         .finish()
         .unwrap();
 

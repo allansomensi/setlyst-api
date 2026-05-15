@@ -1,11 +1,14 @@
 use crate::{controllers::auth, database::AppState};
 use axum::{Router, routing::post};
-use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
+use tower_governor::{
+    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
+};
 
 pub fn create_routes(state: AppState) -> Router {
     let governor_conf = GovernorConfigBuilder::default()
         .per_second(2)
         .burst_size(5)
+        .key_extractor(SmartIpKeyExtractor)
         .finish()
         .unwrap();
 
