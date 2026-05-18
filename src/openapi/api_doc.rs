@@ -1,7 +1,10 @@
 use crate::{
-    controllers::{artist, auth, migrations, setlist, song, status, user},
+    controllers::{artist, auth, metrics, migrations, setlist, song, status, user},
     models::{
         artist::Artist,
+        metrics::{
+            AdminMetrics, ArtistSongCount, GenreCount, MetricsResponse, RoleCount, UserMetrics,
+        },
         setlist::Setlist,
         song::{Genre, Song, Tonality},
         status::Status,
@@ -78,19 +81,38 @@ use utoipa::{
         setlist::add_song_to_setlist,
         setlist::remove_song_from_setlist,
         setlist::get_setlist_songs,
-        setlist::reorder_setlist_songs
+        setlist::reorder_setlist_songs,
+
+        // Metrics
+        metrics::get_metrics,
     ),
     components(
-        schemas(Status, User, UserPreferences ,Artist, Song, Setlist, Tonality, Genre)
+        schemas(
+            Status,
+            User,
+            UserPreferences,
+            Artist,
+            Song,
+            Setlist,
+            Tonality,
+            Genre,
+            MetricsResponse,
+            UserMetrics,
+            AdminMetrics,
+            GenreCount,
+            ArtistSongCount,
+            RoleCount,
+        )
     ),
     tags(
-        (name = "Status", description = "Status endpoints"),
+        (name = "Status",     description = "Status endpoints"),
         (name = "Migrations", description = "Migrations endpoints"),
-        (name = "Auth", description = "Auth endpoints"),
-        (name = "Users", description = "Users endpoints"),
-        (name = "Artists", description = "Artists endpoints"),
-        (name = "Songs", description = "Songs endpoints"),
-        (name = "Setlists", description = "Setlist endpoints"),
+        (name = "Auth",       description = "Auth endpoints"),
+        (name = "Users",      description = "Users endpoints"),
+        (name = "Artists",    description = "Artists endpoints"),
+        (name = "Songs",      description = "Songs endpoints"),
+        (name = "Setlists",   description = "Setlist endpoints"),
+        (name = "Metrics",    description = "Metrics endpoints"),
     )
 )]
 pub struct ApiDoc;

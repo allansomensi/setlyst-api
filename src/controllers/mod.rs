@@ -1,5 +1,6 @@
 pub mod artist;
 pub mod auth;
+pub mod metrics;
 pub mod migrations;
 pub mod setlist;
 pub mod song;

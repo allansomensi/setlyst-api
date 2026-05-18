@@ -1,5 +1,6 @@
 pub mod artist;
 pub mod auth;
+pub mod metrics;
 pub mod migrations;
 pub mod setlist;
 pub mod song;
@@ -30,6 +31,7 @@ pub fn create_routes(state: AppState) -> Router {
                 .nest("/songs", song::create_routes(state.clone()))
                 .nest("/setlists", setlist::create_routes(state.clone()))
                 .nest("/migrations", migrations::create_routes(state.clone()))
+                .nest("/metrics", metrics::create_routes(state.clone()))
                 .layer(middleware::from_fn(authenticate))
                 .nest("/auth", auth::create_routes(state.clone()))
                 .nest("/status", status::create_routes(state)),
