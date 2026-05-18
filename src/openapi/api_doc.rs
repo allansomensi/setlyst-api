@@ -8,7 +8,7 @@ use crate::{
         setlist::Setlist,
         song::{Genre, Song, Tonality},
         status::Status,
-        user::User,
+        user::{ChangePasswordPayload, User},
         user_preferences::UserPreferences,
     },
 };
@@ -53,6 +53,7 @@ use utoipa::{
         user::delete_user,
         user::get_current_user,
         user::update_current_user,
+        user::change_current_user_password,
         user::get_current_user_preferences,
         user::update_current_user_preferences,
         user::get_user_preferences_by_id,
@@ -90,6 +91,7 @@ use utoipa::{
         schemas(
             Status,
             User,
+            ChangePasswordPayload,
             UserPreferences,
             Artist,
             Song,

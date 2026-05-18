@@ -5,10 +5,12 @@ use crate::{
         PaginatedResponse, PaginationMeta, PaginationQuery,
         auth::access::AccessControl,
         user::{
-            CreateUserPayload, Role, UpdateCurrentUserPayload, UpdateUserPayload, User, UserPublic,
+            ChangePasswordPayload, CreateUserPayload, Role, UpdateCurrentUserPayload,
+            UpdateUserPayload, User, UserPublic,
         },
         user_preferences::{UpdatePreferencesPayload, UserPreferences},
     },
+    utils::hashing,
 };
 use axum::{
     Json,
@@ -430,6 +432,65 @@ pub async fn update_current_user(
     );
 
     Ok((StatusCode::OK, Json("Profile updated successfully")))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/users/me/password",
+    tags = ["Users"],
+    summary = "Change current user password",
+    description = "Updates the password of the currently authenticated user. Requires the current password for security verification.",
+    request_body = ChangePasswordPayload,
+    security(
+        (),
+        ("jwt_token" = [])
+    ),
+    responses(
+        (status = 200, description = "Password updated successfully"),
+        (status = 400, description = "Validation error or invalid input"),
+        (status = 401, description = "Unauthorized or incorrect current password")
+    )
+)]
+pub async fn change_current_user_password(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Json(payload): Json<ChangePasswordPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
+    debug!(
+        %user_id,
+        "Processing request to change current user password"
+    );
+
+    payload.validate()?;
+
+    let user = state
+        .user_repo
+        .find_by_username(&access.0.username)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    hashing::verify_password(&payload.current_password, &user.password_hash)?;
+
+    let update_payload = UpdateUserPayload {
+        username: None,
+        email: None,
+        password: Some(payload.new_password),
+        first_name: None,
+        last_name: None,
+        role: None,
+        status: None,
+    };
+
+    state.user_repo.update(user_id, &update_payload).await?;
+
+    info!(
+        %user_id,
+        "Current user password updated successfully"
+    );
+
+    Ok((StatusCode::OK, Json("Password updated successfully")))
 }
 
 #[utoipa::path(
