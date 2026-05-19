@@ -70,7 +70,18 @@ impl SetlistRepository for SetlistRepositoryImpl {
             .fetch_one(&self.db);
 
         let setlists = sqlx::query_as::<_, Setlist>(
-            "SELECT id, title, description, user_id, created_at, updated_at FROM setlists WHERE user_id = $1 ORDER BY title ASC LIMIT $2 OFFSET $3",
+            r#"
+            SELECT 
+                s.id, s.title, s.description, s.user_id, s.created_at, s.updated_at,
+                COALESCE(SUM(so.duration), 0)::integer AS total_duration
+            FROM setlists s
+            LEFT JOIN setlist_songs ss ON s.id = ss.setlist_id
+            LEFT JOIN songs so ON ss.song_id = so.id
+            WHERE s.user_id = $1
+            GROUP BY s.id
+            ORDER BY s.title ASC 
+            LIMIT $2 OFFSET $3
+            "#,
         )
         .bind(user_id)
         .bind(size)
@@ -83,7 +94,16 @@ impl SetlistRepository for SetlistRepositoryImpl {
 
     async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Setlist>, ApiError> {
         let setlist = sqlx::query_as::<_, Setlist>(
-            "SELECT id, title, description, user_id, created_at, updated_at FROM setlists WHERE id = $1 AND user_id = $2",
+            r#"
+            SELECT 
+                s.id, s.title, s.description, s.user_id, s.created_at, s.updated_at,
+                COALESCE(SUM(so.duration), 0)::integer AS total_duration
+            FROM setlists s
+            LEFT JOIN setlist_songs ss ON s.id = ss.setlist_id
+            LEFT JOIN songs so ON ss.song_id = so.id
+            WHERE s.id = $1 AND s.user_id = $2
+            GROUP BY s.id
+            "#,
         )
         .bind(id)
         .bind(user_id)

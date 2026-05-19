@@ -11,6 +11,7 @@ pub struct Setlist {
     pub title: String,
     pub description: Option<String>,
     pub user_id: Uuid,
+    pub total_duration: i32,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -43,6 +44,7 @@ impl Setlist {
             title: title.to_string(),
             description,
             user_id,
+            total_duration: 0,
             created_at: now,
             updated_at: now,
         }
