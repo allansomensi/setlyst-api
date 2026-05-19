@@ -1,6 +1,7 @@
 use crate::{
     database::AppState,
     errors::api_error::ApiError,
+    export::pdf::{ExportQuery, PdfExportOptions, generate_setlist_pdf},
     models::{
         PaginatedResponse, PaginationMeta, PaginationQuery,
         auth::access::AccessControl,
@@ -533,4 +534,74 @@ pub async fn reorder_setlist_songs(
     );
 
     Ok((StatusCode::OK, Json("Setlist reordered successfully")))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/setlists/{id}/export/pdf",
+    tags = ["Setlists"],
+    summary = "Export a setlist to PDF.",
+    description = "Generates and returns a PDF file containing the setlist's songs. Supports localization via query params.",
+    params(
+        ("id" = Uuid, Path, description = "The ID of the setlist to export"),
+        ExportQuery
+    ),
+    security(
+        (),
+        ("jwt_token" = [])
+    ),
+    responses(
+        (status = 200, description = "PDF exported successfully", content_type = "application/pdf"),
+        (status = 404, description = "Setlist not found"),
+        (status = 500, description = "An error occurred while exporting the setlist")
+    )
+)]
+pub async fn export_setlist_pdf(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(id): Path<Uuid>,
+    Query(query): Query<ExportQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let user_id = access.user_id();
+
+    debug!(%user_id, setlist_id = %id, "Processing request to export setlist to PDF");
+
+    let setlist = state
+        .setlist_repo
+        .find_by_id(id, user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    let (songs, _) = state.setlist_repo.get_songs(id, 1, 100).await?;
+
+    let options = PdfExportOptions::from(query);
+
+    match generate_setlist_pdf(&setlist.title, setlist.total_duration, &songs, &options) {
+        Ok(pdf_bytes) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/pdf"),
+            );
+
+            let filename = format!(
+                "setlist-{}.pdf",
+                setlist.title.replace(" ", "-").to_lowercase()
+            );
+
+            if let Ok(disposition) =
+                HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            {
+                headers.insert(axum::http::header::CONTENT_DISPOSITION, disposition);
+            }
+
+            info!(%user_id, setlist_id = %id, "Setlist PDF exported successfully");
+
+            Ok((StatusCode::OK, headers, pdf_bytes).into_response())
+        }
+        Err(e) => {
+            error!(%user_id, setlist_id = %id, error = ?e, "Failed to generate PDF");
+            Ok((StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate PDF").into_response())
+        }
+    }
 }

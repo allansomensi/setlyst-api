@@ -1,5 +1,6 @@
 use crate::{
     controllers::{artist, auth, backup, metrics, migrations, setlist, song, status, user},
+    export::pdf::PdfLocale,
     models::{
         artist::Artist,
         backup::{BackupFile, ImportSummary},
@@ -84,6 +85,7 @@ use utoipa::{
         setlist::remove_song_from_setlist,
         setlist::get_setlist_songs,
         setlist::reorder_setlist_songs,
+        setlist::export_setlist_pdf,
 
         // Metrics
         metrics::get_metrics,
@@ -111,6 +113,7 @@ use utoipa::{
             RoleCount,
             BackupFile,
             ImportSummary,
+            PdfLocale,
         )
     ),
     tags(

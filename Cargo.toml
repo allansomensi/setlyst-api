@@ -41,6 +41,7 @@ utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 uuid = { version = "1.23", features = ["serde", "v4", "v7"] }
 validator = { version = "0.20", features = ["derive"] }
 tower_governor = { version = "0.8", features = ["tracing"] }
+genpdf = "0.2.0"
 
 [dev-dependencies.cargo-husky]
 version = "1.5"

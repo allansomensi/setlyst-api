@@ -18,6 +18,7 @@ pub fn create_routes(state: AppState) -> Router {
                 .patch(setlist::update_setlist)
                 .delete(setlist::delete_setlist),
         )
+        .route("/{id}/export/pdf", get(setlist::export_setlist_pdf))
         .route(
             "/",
             get(setlist::find_all_setlists).post(setlist::create_setlist),
