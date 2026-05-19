@@ -1,5 +1,6 @@
 pub mod artist;
 pub mod auth;
+pub mod backup;
 pub mod metrics;
 pub mod migrations;
 pub mod setlist;
@@ -32,12 +33,13 @@ pub fn create_routes(state: AppState) -> Router {
                 .nest("/setlists", setlist::create_routes(state.clone()))
                 .nest("/migrations", migrations::create_routes(state.clone()))
                 .nest("/metrics", metrics::create_routes(state.clone()))
+                .nest("/backup", backup::create_routes(state.clone()))
                 .layer(middleware::from_fn(authenticate))
                 .nest("/auth", auth::create_routes(state.clone()))
                 .nest("/status", status::create_routes(state)),
         )
         .merge(swagger::swagger_routes())
         .layer(Config::cors())
-        .layer(DefaultBodyLimit::max(1_048_576))
+        .layer(DefaultBodyLimit::max(10_485_760))
         .layer(GovernorLayer::new(global_governor_conf))
 }

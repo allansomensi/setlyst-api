@@ -1,7 +1,8 @@
 use crate::{
-    controllers::{artist, auth, metrics, migrations, setlist, song, status, user},
+    controllers::{artist, auth, backup, metrics, migrations, setlist, song, status, user},
     models::{
         artist::Artist,
+        backup::{BackupFile, ImportSummary},
         metrics::{
             AdminMetrics, ArtistSongCount, GenreCount, MetricsResponse, RoleCount, UserMetrics,
         },
@@ -86,6 +87,10 @@ use utoipa::{
 
         // Metrics
         metrics::get_metrics,
+
+        // Backup
+        backup::export_backup,
+        backup::import_backup,
     ),
     components(
         schemas(
@@ -104,6 +109,8 @@ use utoipa::{
             GenreCount,
             ArtistSongCount,
             RoleCount,
+            BackupFile,
+            ImportSummary,
         )
     ),
     tags(
@@ -115,6 +122,7 @@ use utoipa::{
         (name = "Songs",      description = "Songs endpoints"),
         (name = "Setlists",   description = "Setlist endpoints"),
         (name = "Metrics",    description = "Metrics endpoints"),
+        (name = "Backup",     description = "Backup and restore endpoints"),
     )
 )]
 pub struct ApiDoc;

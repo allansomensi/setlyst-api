@@ -5,8 +5,9 @@ use setlyst_api::{
         AppState,
         connection::create_pool,
         repositories::{
-            artist_repository::ArtistRepositoryImpl, metrics_repository::MetricsRepositoryImpl,
-            setlist_repository::SetlistRepositoryImpl, song_repository::SongRepositoryImpl,
+            artist_repository::ArtistRepositoryImpl, backup_repository::BackupRepositoryImpl,
+            metrics_repository::MetricsRepositoryImpl, setlist_repository::SetlistRepositoryImpl,
+            song_repository::SongRepositoryImpl,
             user_preferences_repository::UserPreferencesRepositoryImpl,
             user_repository::UserRepositoryImpl,
         },
@@ -112,6 +113,7 @@ async fn main() {
     let song_repo = Arc::new(SongRepositoryImpl::new(pool.clone()));
     let setlist_repo = Arc::new(SetlistRepositoryImpl::new(pool.clone()));
     let metrics_repo = Arc::new(MetricsRepositoryImpl::new(pool.clone()));
+    let backup_repo = Arc::new(BackupRepositoryImpl::new(pool.clone()));
 
     let state = AppState {
         db: pool.clone(),
@@ -121,6 +123,7 @@ async fn main() {
         song_repo,
         setlist_repo,
         metrics_repo,
+        backup_repo,
     };
 
     // Use the argument if provided, otherwise prompt the user

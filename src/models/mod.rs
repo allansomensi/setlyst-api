@@ -3,6 +3,7 @@ use utoipa::{IntoParams, ToSchema};
 
 pub mod artist;
 pub mod auth;
+pub mod backup;
 pub mod metrics;
 pub mod setlist;
 pub mod song;
