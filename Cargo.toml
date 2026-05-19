@@ -1,6 +1,6 @@
 [package]
 name = "setlyst-api"
-version = "0.6.0"
+version = "0.7.0"
 authors = ["Allan Somensi <allansomensidev@proton.me>"]
 description = "A simple REST API for setlist management."
 homepage = "https://github.com/allansomensi/setlyst-api"
