@@ -1,3 +1,4 @@
+use crate::validations::{password::validate_password, username::validate_username};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use validator::Validate;
@@ -7,12 +8,9 @@ pub mod token;
 
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
 pub struct LoginPayload {
-    #[validate(length(min = 3, message = "Password must be between 3 and 20 characters long"))]
+    #[validate(custom(function = "validate_username"))]
     pub username: String,
-    #[validate(length(
-        min = 8,
-        max = 100,
-        message = "Password must be between 8 and 100 chars."
-    ))]
+
+    #[validate(custom(function = "validate_password"))]
     pub password: String,
 }

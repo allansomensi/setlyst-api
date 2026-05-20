@@ -1,3 +1,8 @@
+use crate::validations::{
+    name::{validate_first_name, validate_last_name},
+    password::validate_password,
+    username::validate_username,
+};
 use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::prelude::{FromRow, Type};
@@ -49,6 +54,32 @@ pub struct User {
     pub updated_at: NaiveDateTime,
 }
 
+impl User {
+    pub fn new(
+        username: &str,
+        email: Option<String>,
+        password: &str,
+        first_name: Option<String>,
+        last_name: Option<String>,
+        role: Option<Role>,
+        status: Option<Status>,
+    ) -> Self {
+        let now = Utc::now().naive_utc();
+        Self {
+            id: Uuid::new_v4(),
+            username: username.to_string(),
+            email,
+            password_hash: password.to_string(),
+            first_name,
+            last_name,
+            role: role.unwrap_or_default(),
+            status: status.unwrap_or_default(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
 #[derive(ToSchema, Clone, FromRow, Serialize, Deserialize)]
 pub struct UserPublic {
     pub id: Uuid,
@@ -80,32 +111,20 @@ impl From<User> for UserPublic {
 
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
 pub struct RegisterPayload {
-    #[validate(length(
-        min = 3,
-        max = 20,
-        message = "Username must be between 3 and 20 chars."
-    ))]
+    #[validate(custom(function = "validate_username"))]
     pub username: String,
+
     #[validate(email(message = "Invalid email"))]
     pub email: Option<String>,
-    #[validate(length(
-        min = 8,
-        max = 100,
-        message = "Password must be between 8 and 100 chars."
-    ))]
+
+    #[validate(custom(function = "validate_password"))]
     #[serde(skip_serializing)]
     pub password: String,
-    #[validate(length(
-        min = 3,
-        max = 20,
-        message = "First name must be between 3 and 20 chars."
-    ))]
+
+    #[validate(custom(function = "validate_first_name"))]
     pub first_name: Option<String>,
-    #[validate(length(
-        min = 3,
-        max = 20,
-        message = "Last name must be between 3 and 20 chars."
-    ))]
+
+    #[validate(custom(function = "validate_last_name"))]
     pub last_name: Option<String>,
 }
 
@@ -125,91 +144,62 @@ impl From<RegisterPayload> for CreateUserPayload {
 
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
 pub struct CreateUserPayload {
-    #[validate(length(
-        min = 3,
-        max = 20,
-        message = "Username must be between 3 and 20 chars."
-    ))]
+    #[validate(custom(function = "validate_username"))]
     pub username: String,
+
     #[validate(email(message = "Invalid email"))]
     pub email: Option<String>,
-    #[validate(length(
-        min = 8,
-        max = 100,
-        message = "Password must be between 8 and 100 chars."
-    ))]
+
+    #[validate(custom(function = "validate_password"))]
     #[serde(skip_serializing)]
     pub password: String,
-    #[validate(length(
-        min = 3,
-        max = 20,
-        message = "First name must be between 3 and 20 chars."
-    ))]
+
+    #[validate(custom(function = "validate_first_name"))]
     pub first_name: Option<String>,
-    #[validate(length(
-        min = 3,
-        max = 20,
-        message = "Last name must be between 3 and 20 chars."
-    ))]
+
+    #[validate(custom(function = "validate_last_name"))]
     pub last_name: Option<String>,
+
     pub role: Option<Role>,
+
     pub status: Option<Status>,
 }
 
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
 pub struct UpdateUserPayload {
-    #[validate(length(
-        min = 3,
-        max = 20,
-        message = "Username must be between 3 and 20 chars."
-    ))]
+    #[validate(custom(function = "validate_username"))]
     pub username: Option<String>,
+
     #[validate(email(message = "Invalid email"))]
     pub email: Option<String>,
-    #[validate(length(
-        min = 8,
-        max = 100,
-        message = "Password must be between 8 and 100 chars."
-    ))]
+
+    #[validate(custom(function = "validate_password"))]
     #[serde(skip_serializing)]
     pub password: Option<String>,
-    #[validate(length(
-        min = 3,
-        max = 20,
-        message = "First name must be between 3 and 20 chars."
-    ))]
+
+    #[validate(custom(function = "validate_first_name"))]
     pub first_name: Option<String>,
-    #[validate(length(
-        min = 3,
-        max = 20,
-        message = "Last name must be between 3 and 20 chars."
-    ))]
+
+    #[validate(custom(function = "validate_last_name"))]
     pub last_name: Option<String>,
+
     pub role: Option<Role>,
+
     pub status: Option<Status>,
 }
 
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
 pub struct UpdateCurrentUserPayload {
-    #[validate(length(
-        min = 3,
-        max = 20,
-        message = "Username must be between 3 and 20 chars."
-    ))]
+    #[validate(custom(function = "validate_username"))]
     pub username: Option<String>,
+
     #[validate(email(message = "Invalid email"))]
     pub email: Option<String>,
-    #[validate(length(
-        min = 3,
-        max = 20,
-        message = "First name must be between 3 and 20 chars."
-    ))]
+
+    #[validate(custom(function = "validate_first_name"))]
     pub first_name: Option<String>,
-    #[validate(length(
-        min = 3,
-        max = 20,
-        message = "Last name must be between 3 and 20 chars."
-    ))]
+
+    #[validate(custom(function = "validate_last_name"))]
     pub last_name: Option<String>,
 }
 
@@ -232,36 +222,6 @@ pub struct ChangePasswordPayload {
     #[validate(length(min = 1, message = "Current password is required."))]
     pub current_password: String,
 
-    #[validate(length(
-        min = 8,
-        max = 100,
-        message = "New password must be between 8 and 100 chars."
-    ))]
+    #[validate(custom(function = "validate_password"))]
     pub new_password: String,
-}
-
-impl User {
-    pub fn new(
-        username: &str,
-        email: Option<String>,
-        password: &str,
-        first_name: Option<String>,
-        last_name: Option<String>,
-        role: Option<Role>,
-        status: Option<Status>,
-    ) -> Self {
-        let now = Utc::now().naive_utc();
-        Self {
-            id: Uuid::new_v4(),
-            username: username.to_string(),
-            email,
-            password_hash: password.to_string(),
-            first_name,
-            last_name,
-            role: role.unwrap_or_default(),
-            status: status.unwrap_or_default(),
-            created_at: now,
-            updated_at: now,
-        }
-    }
 }
