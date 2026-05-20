@@ -82,7 +82,7 @@ fn prompt_for_password(username: &str) -> String {
 
         match validate_password_strength(trimmed_password) {
             Ok(_) => return trimmed_password.to_string(),
-            Err(e) => println!("❌ Weak password: {}\n", e),
+            Err(e) => println!("❌ Weak password: {e}\n"),
         }
     }
 }

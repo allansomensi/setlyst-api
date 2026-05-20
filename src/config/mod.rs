@@ -20,7 +20,7 @@ pub struct Config {
 static CONFIG: OnceLock<Config> = OnceLock::new();
 
 impl Config {
-    pub fn init() -> Result<WorkerGuard, ConfigError> {
+    pub fn init() -> Result<Option<WorkerGuard>, ConfigError> {
         environment::load_environment()?;
         let guard = Self::logger_init();
 
