@@ -11,10 +11,12 @@ pub mod swagger;
 pub mod user;
 
 use crate::{config::Config, database::AppState, middlewares::authentication::authenticate};
-use axum::{Router, extract::DefaultBodyLimit, middleware};
+use axum::{Router, extract::DefaultBodyLimit, http::StatusCode, middleware};
+use std::time::Duration;
 use tower_governor::{
     GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
 };
+use tower_http::{compression::CompressionLayer, timeout::TimeoutLayer};
 
 pub fn create_routes(state: AppState) -> Router {
     let global_governor_conf = GovernorConfigBuilder::default()
@@ -42,6 +44,11 @@ pub fn create_routes(state: AppState) -> Router {
         )
         .merge(swagger::swagger_routes())
         .layer(Config::cors())
-        .layer(DefaultBodyLimit::max(10_485_760))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(30),
+        ))
+        .layer(CompressionLayer::new())
         .layer(GovernorLayer::new(global_governor_conf))
+        .layer(DefaultBodyLimit::max(10_485_760))
 }
