@@ -1,8 +1,6 @@
-use crate::{controllers::health, database::AppState};
+use crate::controllers::health;
 use axum::{Router, routing::get};
 
-pub fn create_routes(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(health::health_check))
-        .with_state(state)
+pub fn create_routes() -> Router {
+    Router::new().route("/", get(health::health_check))
 }

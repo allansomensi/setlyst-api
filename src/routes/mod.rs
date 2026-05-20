@@ -39,8 +39,8 @@ pub fn create_routes(state: AppState) -> Router {
                 .nest("/backup", backup::create_routes(state.clone()))
                 .layer(middleware::from_fn(authenticate))
                 .nest("/auth", auth::create_routes(state.clone()))
-                .nest("/status", status::create_routes(state.clone()))
-                .nest("/health", health::create_routes(state)),
+                .nest("/status", status::create_routes(state))
+                .nest("/health", health::create_routes()),
         )
         .merge(swagger::swagger_routes())
         .layer(Config::cors())
