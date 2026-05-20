@@ -17,7 +17,7 @@ use tower_governor::{
 
 pub fn create_routes(state: AppState) -> Router {
     let global_governor_conf = GovernorConfigBuilder::default()
-        .per_second(10)
+        .per_millisecond(200)
         .burst_size(60)
         .key_extractor(SmartIpKeyExtractor)
         .finish()
