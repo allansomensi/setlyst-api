@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Project Documentation
+    url: https://github.com/allansomensi/setlyst-api#readme
+    about: Please read the setup instructions in the README before opening an issue.
+  - name: OpenAPI / Swagger Reference
+    url: https://github.com/allansomensi/setlyst-api/blob/main/src/openapi/api_doc.rs
+    about: Check the endpoint documentation before reporting API behavior issues.

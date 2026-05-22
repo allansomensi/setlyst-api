@@ -1,0 +1,19 @@
+name: Bug Report
+description: Create a report to help us fix an issue
+title: "fix: <brief description>"
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce this? (Optional)
+    validations:
+      required: false
