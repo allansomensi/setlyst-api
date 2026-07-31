@@ -23,16 +23,17 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6", features = ["derive"] }
 dotenvy = "0.15"
 serde = { version = "1", features = ["derive"] }
-sqlx = { version = "0.8", features = [
+sqlx = { version = "0.9", features = [
     "chrono",
     "postgres",
-    "runtime-tokio-native-tls",
+    "runtime-tokio",
+    "tls-native-tls",
     "uuid",
 ] }
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 thiserror = "2"
 tokio = { version = "1.52", features = ["full"] }
-tower-http = { version = "0.6", features = [
+tower-http = { version = "0.7", features = [
     "cors",
     "compression-full",
     "timeout",
@@ -43,7 +44,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 utoipa = { version = "5.3", features = ["chrono", "uuid"] }
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 uuid = { version = "1.23", features = ["serde", "v4", "v7"] }
-validator = { version = "0.20", features = ["derive"] }
+validator = { version = "0.21", features = ["derive"] }
 tower_governor = { version = "0.8", features = ["tracing"] }
 genpdf = "0.2.0"
 
