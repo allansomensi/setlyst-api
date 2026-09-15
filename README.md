@@ -137,6 +137,7 @@ Full interactive documentation is available via Swagger UI at `/swagger-ui` when
 | Users | `/api/v1/users` | User management, profiles, preferences |
 | Artists | `/api/v1/artists` | Artist CRUD |
 | Songs | `/api/v1/songs` | Song CRUD, ChordPro export |
+| Bands | `/api/v1/bands` | Band, membership and invite endpoints |
 | Setlists | `/api/v1/setlists` | Setlist management, song ordering, PDF export |
 | Metrics | `/api/v1/metrics` | User and admin dashboard metrics |
 | Backup | `/api/v1/backup` | Data export and import |
