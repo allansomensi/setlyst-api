@@ -1,4 +1,4 @@
-use crate::models::song::{Song, Tonality};
+use crate::models::song::{SongWithArtist, Tonality};
 use genpdf::{Alignment, Document, Element, SimplePageDecorator, elements, fonts, style};
 use serde::Deserialize;
 use std::io::Cursor;
@@ -124,7 +124,7 @@ fn format_tonality(t: &Tonality) -> &'static str {
 pub fn generate_setlist_pdf(
     setlist_title: &str,
     total_duration_secs: i32,
-    songs: &[Song],
+    songs: &[SongWithArtist],
     options: &PdfExportOptions,
 ) -> Result<Vec<u8>, genpdf::error::Error> {
     let font_family = fonts::from_files("assets/fonts", "Inter", None)?;

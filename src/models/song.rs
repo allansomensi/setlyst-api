@@ -277,6 +277,19 @@ pub struct Song {
     pub title: String,
     pub artist_id: Uuid,
     pub user_id: Uuid,
+    /// The band that owns this song as an independent, shared copy, or
+    /// `None` for a personal song. Set only via [`Song::fork_for_band`],
+    /// when a member contributes one of their own songs to a band setlist —
+    /// this decouples the band's setlist from that member's personal
+    /// catalog, so deleting (or editing) their own copy later never affects
+    /// the band's.
+    pub band_id: Option<Uuid>,
+    /// The personal song this band-owned copy was forked from, or `None`
+    /// for a personal song (or a fork whose source was later deleted — the
+    /// link is cleared, not the copy). Lets re-adding the same source song
+    /// to the same band resolve to the existing fork instead of creating a
+    /// new duplicate. See [`Song::fork_for_band`].
+    pub forked_from: Option<Uuid>,
     pub tempo: Option<i32>,
     pub lyrics: Option<String>,
     pub tonality: Option<Tonality>,
@@ -322,11 +335,40 @@ impl Song {
             title: payload.title.clone(),
             artist_id: payload.artist_id,
             user_id,
+            band_id: None,
+            forked_from: None,
             tempo: payload.tempo,
             lyrics: payload.lyrics.clone(),
             tonality: payload.tonality,
             genre: payload.genre,
             duration: payload.duration,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Creates an independent, band-owned copy of `source`, pointing at
+    /// `artist_id` (a band-owned artist resolved separately). `creator_id`
+    /// is kept for audit purposes only, mirroring [`super::artist::Artist::new_for_band`].
+    pub fn fork_for_band(
+        source: &SongWithArtist,
+        band_id: Uuid,
+        artist_id: Uuid,
+        creator_id: Uuid,
+    ) -> Self {
+        let now = Utc::now().naive_utc();
+        Self {
+            id: Uuid::new_v4(),
+            title: source.title.clone(),
+            artist_id,
+            user_id: creator_id,
+            band_id: Some(band_id),
+            forked_from: Some(source.id),
+            tempo: source.tempo,
+            lyrics: source.lyrics.clone(),
+            tonality: source.tonality,
+            genre: source.genre,
+            duration: source.duration,
             created_at: now,
             updated_at: now,
         }
@@ -340,4 +382,26 @@ pub struct SongExport {
     pub tonality: Option<String>,
     pub tempo: Option<i32>,
     pub lyrics: Option<String>,
+}
+
+/// A [`Song`] with its artist's name resolved via a join, so callers don't
+/// need a separate (and possibly ownership-scoped) artist lookup to display
+/// it — e.g. a band setlist can contain songs owned by different members,
+/// none of whom can see each other's `/artists` list.
+#[derive(ToSchema, Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct SongWithArtist {
+    pub id: Uuid,
+    pub title: String,
+    pub artist_id: Uuid,
+    pub artist_name: String,
+    pub user_id: Uuid,
+    pub band_id: Option<Uuid>,
+    pub forked_from: Option<Uuid>,
+    pub tempo: Option<i32>,
+    pub lyrics: Option<String>,
+    pub tonality: Option<Tonality>,
+    pub genre: Option<Genre>,
+    pub duration: Option<i32>,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
 }

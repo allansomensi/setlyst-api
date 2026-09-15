@@ -78,7 +78,7 @@ impl BackupRepositoryImpl {
 impl BackupRepository for BackupRepositoryImpl {
     async fn export(&self, user_id: Uuid) -> Result<BackupFile, ApiError> {
         let artists_fut = sqlx::query_as::<_, ArtistRow>(
-            "SELECT id, name FROM artists WHERE user_id = $1 ORDER BY name ASC",
+            "SELECT id, name FROM artists WHERE user_id = $1 AND band_id IS NULL ORDER BY name ASC",
         )
         .bind(user_id)
         .fetch_all(&self.db);
@@ -86,14 +86,14 @@ impl BackupRepository for BackupRepositoryImpl {
         let songs_fut = sqlx::query_as::<_, SongRow>(
             "SELECT id, title, artist_id, tempo, lyrics, tonality, genre, duration
              FROM songs
-             WHERE user_id = $1
+             WHERE user_id = $1 AND band_id IS NULL
              ORDER BY title ASC",
         )
         .bind(user_id)
         .fetch_all(&self.db);
 
         let setlists_fut = sqlx::query_as::<_, SetlistRow>(
-            "SELECT id, title, description FROM setlists WHERE user_id = $1 ORDER BY title ASC",
+            "SELECT id, title, description FROM setlists WHERE user_id = $1 AND band_id IS NULL ORDER BY title ASC",
         )
         .bind(user_id)
         .fetch_all(&self.db);
@@ -181,33 +181,34 @@ impl BackupRepository for BackupRepositoryImpl {
         let mut artist_id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(artists_incoming);
 
         for artist in &backup.artists {
-            let resolved_id: Uuid =
-                match sqlx::query_scalar("SELECT id FROM artists WHERE name = $1 AND user_id = $2")
+            let resolved_id: Uuid = match sqlx::query_scalar(
+                "SELECT id FROM artists WHERE name = $1 AND user_id = $2 AND band_id IS NULL",
+            )
+            .bind(&artist.name)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                Some(existing_id) => existing_id,
+                None => {
+                    let new_id = Uuid::new_v4();
+                    sqlx::query(
+                        "INSERT INTO artists (id, name, user_id, created_at, updated_at)
+                         VALUES ($1, $2, $3, $4, $4)",
+                    )
+                    .bind(new_id)
                     .bind(&artist.name)
                     .bind(user_id)
-                    .fetch_optional(&mut *tx)
-                    .await?
-                {
-                    Some(existing_id) => existing_id,
-                    None => {
-                        let new_id = Uuid::new_v4();
-                        sqlx::query(
-                            "INSERT INTO artists (id, name, user_id, created_at, updated_at)
-                         VALUES ($1, $2, $3, $4, $4)",
-                        )
-                        .bind(new_id)
-                        .bind(&artist.name)
-                        .bind(user_id)
-                        .bind(now)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| {
-                            error!("Failed to insert artist '{}': {e}", artist.name);
-                            ApiError::DatabaseError(e)
-                        })?;
-                        new_id
-                    }
-                };
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to insert artist '{}': {e}", artist.name);
+                        ApiError::DatabaseError(e)
+                    })?;
+                    new_id
+                }
+            };
 
             artist_id_map.insert(artist.id, resolved_id);
         }
@@ -228,7 +229,7 @@ impl BackupRepository for BackupRepositoryImpl {
             };
 
             let resolved_id: Uuid = match sqlx::query_scalar(
-                "SELECT id FROM songs WHERE title = $1 AND artist_id = $2 AND user_id = $3",
+                "SELECT id FROM songs WHERE title = $1 AND artist_id = $2 AND user_id = $3 AND band_id IS NULL",
             )
             .bind(&song.title)
             .bind(resolved_artist_id)

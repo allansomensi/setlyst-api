@@ -5,6 +5,8 @@ use crate::{
         connection::create_pool,
         repositories::{
             artist_repository::ArtistRepositoryImpl, backup_repository::BackupRepositoryImpl,
+            band_invite_repository::BandInviteRepositoryImpl,
+            band_member_repository::BandMemberRepositoryImpl, band_repository::BandRepositoryImpl,
             metrics_repository::MetricsRepositoryImpl, setlist_repository::SetlistRepositoryImpl,
             song_repository::SongRepositoryImpl,
             user_preferences_repository::UserPreferencesRepositoryImpl,
@@ -37,6 +39,9 @@ pub async fn run() -> Result<(), ApiError> {
     let setlist_repo = Arc::new(SetlistRepositoryImpl::new(pool.clone()));
     let metrics_repo = Arc::new(MetricsRepositoryImpl::new(pool.clone()));
     let backup_repo = Arc::new(BackupRepositoryImpl::new(pool.clone()));
+    let band_repo = Arc::new(BandRepositoryImpl::new(pool.clone()));
+    let band_member_repo = Arc::new(BandMemberRepositoryImpl::new(pool.clone()));
+    let band_invite_repo = Arc::new(BandInviteRepositoryImpl::new(pool.clone()));
 
     let state = AppState {
         db: pool.clone(),
@@ -47,6 +52,9 @@ pub async fn run() -> Result<(), ApiError> {
         setlist_repo,
         metrics_repo,
         backup_repo,
+        band_repo,
+        band_member_repo,
+        band_invite_repo,
     };
 
     let app = routes::create_routes(state);

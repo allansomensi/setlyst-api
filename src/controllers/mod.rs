@@ -1,6 +1,7 @@
 pub mod artist;
 pub mod auth;
 pub mod backup;
+pub mod band;
 pub mod health;
 pub mod metrics;
 pub mod migrations;

@@ -14,6 +14,11 @@ pub fn create_routes(state: AppState) -> Router {
         )
         .route("/{id}/export/pdf", get(setlist::export_setlist_pdf))
         .route(
+            "/{id}/share",
+            axum::routing::post(setlist::enable_setlist_sharing)
+                .delete(setlist::disable_setlist_sharing),
+        )
+        .route(
             "/",
             get(setlist::find_all_setlists).post(setlist::create_setlist),
         )
@@ -25,6 +30,19 @@ pub fn create_routes(state: AppState) -> Router {
         .route(
             "/{id}/songs/{song_id}",
             delete(setlist::remove_song_from_setlist),
+        )
+        .with_state(state)
+}
+
+/// Unauthenticated routes for viewing/exporting a setlist via its public
+/// share token. Mounted separately (outside the `authenticate` middleware) —
+/// see `routes/mod.rs`.
+pub fn create_public_routes(state: AppState) -> Router {
+    Router::new()
+        .route("/{token}", get(setlist::get_public_setlist))
+        .route(
+            "/{token}/export/pdf",
+            get(setlist::export_public_setlist_pdf),
         )
         .with_state(state)
 }
