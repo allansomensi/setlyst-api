@@ -22,6 +22,22 @@ use tracing::{debug, error, info};
 use uuid::Uuid;
 use validator::Validate;
 
+/// The languages the frontend actually ships (see `i18n/routing.ts`).
+const SUPPORTED_LANGUAGES: [&str; 3] = ["en", "pt-BR", "es"];
+
+/// Reads the locale the frontend is currently rendering with, sent as
+/// `x-app-locale` on every server-side API call (see `fetchServerApi`).
+/// Used only as the *default* shown for a user who hasn't saved
+/// preferences yet — never overrides an already-saved preference.
+fn fallback_language_from_headers(headers: &HeaderMap) -> String {
+    headers
+        .get("x-app-locale")
+        .and_then(|v| v.to_str().ok())
+        .filter(|locale| SUPPORTED_LANGUAGES.contains(locale))
+        .unwrap_or("en")
+        .to_string()
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/users",
@@ -511,6 +527,7 @@ pub async fn change_current_user_password(
 pub async fn get_current_user_preferences(
     State(state): State<AppState>,
     access: AccessControl,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     let requester_id = access.user_id();
 
@@ -519,7 +536,17 @@ pub async fn get_current_user_preferences(
         "Processing request to retrieve current user preferences"
     );
 
-    match state.user_prefs_repo.get_by_user_id(requester_id).await {
+    // The frontend sends the locale it's actually rendering with (see
+    // `fetchServerApi`), so a user who hasn't saved preferences yet still
+    // sees Settings default to the language they're already viewing,
+    // instead of always falling back to English.
+    let fallback_language = fallback_language_from_headers(&headers);
+
+    match state
+        .user_prefs_repo
+        .get_by_user_id(requester_id, &fallback_language)
+        .await
+    {
         Ok(prefs) => {
             info!(
                 %requester_id,
@@ -623,7 +650,10 @@ pub async fn get_user_preferences_by_id(
 
     access.require_any_role(&[Role::Admin, Role::Moderator])?;
 
-    match state.user_prefs_repo.get_by_user_id(id).await {
+    // No meaningful "current locale" to fall back to here — this is an
+    // admin looking up someone else's preferences, not that user's own
+    // Settings page — so just use the neutral default.
+    match state.user_prefs_repo.get_by_user_id(id, "en").await {
         Ok(prefs) => {
             info!(
                 %requester_id,

@@ -45,6 +45,131 @@ pub struct AddSongToSetlistPayload {
     pub position: i32,
 }
 
+/// Optional title override when duplicating a setlist. When omitted, the
+/// backend derives one from the original title (see
+/// `SetlistRepository::duplicate`).
+#[derive(Debug, Default, Deserialize, Serialize, ToSchema, Validate)]
+pub struct DuplicateSetlistPayload {
+    #[validate(length(min = 1, max = 255, message = "Title must be between 1 and 255 chars."))]
+    pub title: Option<String>,
+}
+
+/// A non-song entry in a setlist's running order: either a named
+/// block/section header, or a break/pause slot.
+#[derive(ToSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "setlist_marker_type", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum SetlistMarkerType {
+    Block,
+    Break,
+}
+
+#[derive(ToSchema, Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct SetlistMarker {
+    pub id: Uuid,
+    pub setlist_id: Uuid,
+    pub marker_type: SetlistMarkerType,
+    /// Block name (for `block` markers) or an optional break label (for
+    /// `break` markers — the frontend falls back to a translated
+    /// placeholder such as "Break" when this is `None`).
+    pub label: Option<String>,
+    /// Only meaningful for `break` markers.
+    pub duration_minutes: Option<i32>,
+    pub position: i32,
+    pub created_at: NaiveDateTime,
+}
+
+#[derive(Debug, Deserialize, Serialize, ToSchema, Validate)]
+pub struct CreateSetlistBlockPayload {
+    #[validate(length(
+        min = 1,
+        max = 255,
+        message = "Block name must be between 1 and 255 chars."
+    ))]
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, ToSchema, Validate)]
+pub struct UpdateSetlistBlockPayload {
+    #[validate(length(
+        min = 1,
+        max = 255,
+        message = "Block name must be between 1 and 255 chars."
+    ))]
+    pub name: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, ToSchema, Validate)]
+pub struct CreateSetlistBreakPayload {
+    #[validate(length(max = 255, message = "Label must be at most 255 chars."))]
+    pub label: Option<String>,
+    #[validate(range(
+        min = 0,
+        max = 1440,
+        message = "Duration must be a realistic number of minutes."
+    ))]
+    pub duration_minutes: Option<i32>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, ToSchema, Validate)]
+pub struct UpdateSetlistBreakPayload {
+    #[validate(length(max = 255, message = "Label must be at most 255 chars."))]
+    pub label: Option<String>,
+    #[validate(range(
+        min = 0,
+        max = 1440,
+        message = "Duration must be a realistic number of minutes."
+    ))]
+    pub duration_minutes: Option<i32>,
+}
+
+/// One entry in the combined, position-ordered view of a setlist's
+/// contents — a song, a block header, or a break — used by
+/// `GET /setlists/{id}/items` and the reorder endpoint that follows it.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(tag = "item_type", rename_all = "lowercase")]
+pub enum SetlistItem {
+    Song {
+        position: i32,
+        song: crate::models::song::SongWithArtist,
+    },
+    Block {
+        position: i32,
+        id: Uuid,
+        name: String,
+    },
+    Break {
+        position: i32,
+        id: Uuid,
+        label: Option<String>,
+        duration_minutes: Option<i32>,
+    },
+}
+
+/// A reference to one item in a setlist's timeline, used to describe the
+/// desired order in `ReorderSetlistItemsPayload`. `item_type` says which
+/// table `id` belongs to: `song` -> `songs.id`, `block`/`break` ->
+/// `setlist_markers.id`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SetlistItemType {
+    Song,
+    Block,
+    Break,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct SetlistItemRef {
+    pub item_type: SetlistItemType,
+    pub id: Uuid,
+}
+
+#[derive(Debug, Deserialize, Serialize, ToSchema, Validate)]
+pub struct ReorderSetlistItemsPayload {
+    #[validate(length(min = 1, message = "The list of items cannot be empty."))]
+    pub items: Vec<SetlistItemRef>,
+}
+
 impl Setlist {
     pub fn new(
         title: &str,
@@ -83,4 +208,8 @@ pub struct PublicSetlist {
     pub description: Option<String>,
     pub total_duration: i32,
     pub songs: Vec<crate::models::song::SongWithArtist>,
+    /// Block headers and breaks in the setlist's running order. Merge these
+    /// with `songs` by `position` to reconstruct the full timeline (see
+    /// `SetlistItem`), same as the authenticated `/items` endpoint.
+    pub markers: Vec<SetlistMarker>,
 }

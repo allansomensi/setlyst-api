@@ -425,12 +425,15 @@ pub async fn get_public_gig(
                 .await?;
             match setlist {
                 Some(setlist) => {
-                    let (songs, _) = state.setlist_repo.get_songs(setlist.id, 1, 200).await?;
+                    let songs = state.setlist_repo.get_songs(setlist.id, 1, 200);
+                    let markers = state.setlist_repo.get_markers(setlist.id);
+                    let ((songs, _), markers) = tokio::try_join!(songs, markers)?;
                     Some(PublicSetlist {
                         title: setlist.title,
                         description: setlist.description,
                         total_duration: setlist.total_duration,
                         songs,
+                        markers,
                     })
                 }
                 None => None,

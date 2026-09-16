@@ -8,7 +8,17 @@ use uuid::Uuid;
 
 #[async_trait::async_trait]
 pub trait UserPreferencesRepository: Send + Sync {
-    async fn get_by_user_id(&self, user_id: Uuid) -> Result<UserPreferences, ApiError>;
+    /// Fetches the user's saved preferences, or a transient (not persisted)
+    /// default when they haven't saved any yet. `fallback_language` is used
+    /// only in that transient-default case — pass the locale the caller is
+    /// actually viewing the app in (see `AccessControl`/`x-app-locale`) so a
+    /// brand-new user's Settings page shows the language they're already
+    /// seeing, instead of always defaulting to English.
+    async fn get_by_user_id(
+        &self,
+        user_id: Uuid,
+        fallback_language: &str,
+    ) -> Result<UserPreferences, ApiError>;
     async fn upsert(
         &self,
         user_id: Uuid,
@@ -28,7 +38,11 @@ impl UserPreferencesRepositoryImpl {
 
 #[async_trait::async_trait]
 impl UserPreferencesRepository for UserPreferencesRepositoryImpl {
-    async fn get_by_user_id(&self, user_id: Uuid) -> Result<UserPreferences, ApiError> {
+    async fn get_by_user_id(
+        &self,
+        user_id: Uuid,
+        fallback_language: &str,
+    ) -> Result<UserPreferences, ApiError> {
         let prefs = sqlx::query_as::<_, UserPreferences>(
             "SELECT * FROM user_preferences WHERE user_id = $1",
         )
@@ -43,7 +57,7 @@ impl UserPreferencesRepository for UserPreferencesRepositoryImpl {
             None => Ok(UserPreferences {
                 id: Uuid::new_v4(),
                 user_id,
-                language: "en".to_string(),
+                language: fallback_language.to_string(),
                 theme: UserTheme::System,
                 live_mode_font_size: 100,
                 created_at: now,

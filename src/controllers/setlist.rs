@@ -7,8 +7,11 @@ use crate::{
         auth::access::AccessControl,
         band::BandRole,
         setlist::{
-            AddSongToSetlistPayload, CreateSetlistPayload, PublicSetlist,
-            ReorderSetlistSongsPayload, Setlist, UpdateSetlistPayload,
+            AddSongToSetlistPayload, CreateSetlistBlockPayload, CreateSetlistBreakPayload,
+            CreateSetlistPayload, DuplicateSetlistPayload, PublicSetlist,
+            ReorderSetlistItemsPayload, ReorderSetlistSongsPayload, Setlist, SetlistItem,
+            SetlistMarker, UpdateSetlistBlockPayload, UpdateSetlistBreakPayload,
+            UpdateSetlistPayload,
         },
     },
 };
@@ -215,6 +218,53 @@ pub async fn create_setlist(
                 error = %e,
                 "Failed to create setlist"
             );
+            Err(e)
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/setlists/{id}/duplicate",
+    tags = ["Setlists"],
+    summary = "Duplicate a setlist.",
+    description = "Creates an independent personal copy of a setlist the caller can view, including all of its songs, blocks and breaks. If the title is not provided (or already taken), a suffix such as \" (copy)\" or \" (2)\" is appended automatically.",
+    params(("id" = Uuid, Path, description = "The ID of the setlist to duplicate")),
+    request_body = DuplicateSetlistPayload,
+    security((), ("jwt_token" = [])),
+    responses(
+        (status = 201, description = "Setlist duplicated successfully.", body = Setlist),
+        (status = 404, description = "Setlist not found.")
+    )
+)]
+pub async fn duplicate_setlist(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<DuplicateSetlistPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
+    debug!(%user_id, setlist_id = %id, "Processing request to duplicate setlist");
+
+    payload.validate()?;
+
+    // Viewing the setlist is enough to duplicate it — the copy always
+    // lands in the caller's own personal setlists, so no write access to
+    // the original (e.g. a band setlist) is required.
+    state.setlist_repo.exists(id, user_id).await?;
+
+    match state
+        .setlist_repo
+        .duplicate(id, user_id, payload.title)
+        .await
+    {
+        Ok(new_setlist) => {
+            info!(%user_id, setlist_id = %id, new_setlist_id = %new_setlist.id, "Setlist duplicated successfully");
+            Ok((StatusCode::CREATED, Json(new_setlist)))
+        }
+        Err(e) => {
+            error!(%user_id, setlist_id = %id, error = %e, "Failed to duplicate setlist");
             Err(e)
         }
     }
@@ -618,6 +668,269 @@ pub async fn reorder_setlist_songs(
 
 #[utoipa::path(
     get,
+    path = "/api/v1/setlists/{id}/items",
+    tags = ["Setlists"],
+    summary = "Get the full running order of a setlist.",
+    description = "Retrieves songs, block headers and breaks merged into a single list ordered by position — the shape the setlist builder UI renders directly.",
+    params(("id" = Uuid, Path, description = "The ID of the setlist")),
+    security((), ("jwt_token" = [])),
+    responses(
+        (status = 200, description = "Items retrieved successfully.", body = Vec<SetlistItem>),
+        (status = 404, description = "Setlist not found.")
+    )
+)]
+pub async fn get_setlist_items(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
+    debug!(%user_id, setlist_id = %id, "Processing request to retrieve setlist items");
+
+    state.setlist_repo.exists(id, user_id).await?;
+
+    let items = state.setlist_repo.get_items(id).await?;
+
+    Ok(Json(items))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/setlists/{id}/items/reorder",
+    tags = ["Setlists"],
+    summary = "Reorder songs, blocks and breaks in a setlist.",
+    description = "Updates the shared position of every song and marker (block/break) to match the given order.",
+    params(("id" = Uuid, Path, description = "The ID of the setlist")),
+    request_body = ReorderSetlistItemsPayload,
+    security((), ("jwt_token" = [])),
+    responses(
+        (status = 200, description = "Setlist reordered successfully."),
+        (status = 400, description = "Invalid input."),
+        (status = 404, description = "Setlist not found.")
+    )
+)]
+pub async fn reorder_setlist_items(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(setlist_id): Path<Uuid>,
+    Json(payload): Json<ReorderSetlistItemsPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
+    debug!(%user_id, %setlist_id, "Processing request to reorder setlist items");
+
+    payload.validate()?;
+
+    state.setlist_repo.can_manage(setlist_id, user_id).await?;
+    state
+        .setlist_repo
+        .reorder_items(setlist_id, &payload.items)
+        .await?;
+
+    info!(%user_id, %setlist_id, "Setlist items reordered successfully");
+
+    Ok((StatusCode::OK, Json("Setlist reordered successfully")))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/setlists/{id}/blocks",
+    tags = ["Setlists"],
+    summary = "Add a named block to a setlist.",
+    description = "Creates a block/section header (e.g. \"Bloco Baladas\") appended at the end of the setlist's running order. Reorder it into place afterwards via /items/reorder.",
+    params(("id" = Uuid, Path, description = "The ID of the setlist")),
+    request_body = CreateSetlistBlockPayload,
+    security((), ("jwt_token" = [])),
+    responses(
+        (status = 201, description = "Block created successfully.", body = SetlistMarker),
+        (status = 404, description = "Setlist not found.")
+    )
+)]
+pub async fn create_setlist_block(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(setlist_id): Path<Uuid>,
+    Json(payload): Json<CreateSetlistBlockPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
+    debug!(%user_id, %setlist_id, "Processing request to create setlist block");
+
+    payload.validate()?;
+
+    state.setlist_repo.can_manage(setlist_id, user_id).await?;
+
+    let marker = state
+        .setlist_repo
+        .create_block(setlist_id, &payload.name)
+        .await?;
+
+    info!(%user_id, %setlist_id, marker_id = %marker.id, "Setlist block created successfully");
+
+    Ok((StatusCode::CREATED, Json(marker)))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/setlists/{id}/blocks/{marker_id}",
+    tags = ["Setlists"],
+    summary = "Rename a setlist block.",
+    params(
+        ("id" = Uuid, Path, description = "The ID of the setlist"),
+        ("marker_id" = Uuid, Path, description = "The ID of the block")
+    ),
+    request_body = UpdateSetlistBlockPayload,
+    security((), ("jwt_token" = [])),
+    responses(
+        (status = 200, description = "Block updated successfully.", body = SetlistMarker),
+        (status = 404, description = "Setlist or block not found.")
+    )
+)]
+pub async fn update_setlist_block(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path((setlist_id, marker_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<UpdateSetlistBlockPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
+    debug!(%user_id, %setlist_id, %marker_id, "Processing request to update setlist block");
+
+    payload.validate()?;
+
+    state.setlist_repo.can_manage(setlist_id, user_id).await?;
+
+    let marker = state
+        .setlist_repo
+        .update_block(setlist_id, marker_id, &payload.name)
+        .await?;
+
+    info!(%user_id, %setlist_id, %marker_id, "Setlist block updated successfully");
+
+    Ok(Json(marker))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/setlists/{id}/breaks",
+    tags = ["Setlists"],
+    summary = "Add a break/pause to a setlist.",
+    description = "Creates a visual break (optional label and duration in minutes) appended at the end of the setlist's running order. Reorder it into place afterwards via /items/reorder.",
+    params(("id" = Uuid, Path, description = "The ID of the setlist")),
+    request_body = CreateSetlistBreakPayload,
+    security((), ("jwt_token" = [])),
+    responses(
+        (status = 201, description = "Break created successfully.", body = SetlistMarker),
+        (status = 404, description = "Setlist not found.")
+    )
+)]
+pub async fn create_setlist_break(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(setlist_id): Path<Uuid>,
+    Json(payload): Json<CreateSetlistBreakPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
+    debug!(%user_id, %setlist_id, "Processing request to create setlist break");
+
+    payload.validate()?;
+
+    state.setlist_repo.can_manage(setlist_id, user_id).await?;
+
+    let marker = state
+        .setlist_repo
+        .create_break(setlist_id, payload.label, payload.duration_minutes)
+        .await?;
+
+    info!(%user_id, %setlist_id, marker_id = %marker.id, "Setlist break created successfully");
+
+    Ok((StatusCode::CREATED, Json(marker)))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/setlists/{id}/breaks/{marker_id}",
+    tags = ["Setlists"],
+    summary = "Update a setlist break.",
+    params(
+        ("id" = Uuid, Path, description = "The ID of the setlist"),
+        ("marker_id" = Uuid, Path, description = "The ID of the break")
+    ),
+    request_body = UpdateSetlistBreakPayload,
+    security((), ("jwt_token" = [])),
+    responses(
+        (status = 200, description = "Break updated successfully.", body = SetlistMarker),
+        (status = 404, description = "Setlist or break not found.")
+    )
+)]
+pub async fn update_setlist_break(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path((setlist_id, marker_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<UpdateSetlistBreakPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
+    debug!(%user_id, %setlist_id, %marker_id, "Processing request to update setlist break");
+
+    payload.validate()?;
+
+    state.setlist_repo.can_manage(setlist_id, user_id).await?;
+
+    let marker = state
+        .setlist_repo
+        .update_break(
+            setlist_id,
+            marker_id,
+            payload.label,
+            payload.duration_minutes,
+        )
+        .await?;
+
+    info!(%user_id, %setlist_id, %marker_id, "Setlist break updated successfully");
+
+    Ok(Json(marker))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/setlists/{id}/markers/{marker_id}",
+    tags = ["Setlists"],
+    summary = "Delete a setlist block or break.",
+    params(
+        ("id" = Uuid, Path, description = "The ID of the setlist"),
+        ("marker_id" = Uuid, Path, description = "The ID of the block or break")
+    ),
+    security((), ("jwt_token" = [])),
+    responses(
+        (status = 204, description = "Marker deleted successfully"),
+        (status = 404, description = "Setlist or marker not found.")
+    )
+)]
+pub async fn delete_setlist_marker(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path((setlist_id, marker_id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
+    debug!(%user_id, %setlist_id, %marker_id, "Processing request to delete setlist marker");
+
+    state.setlist_repo.can_manage(setlist_id, user_id).await?;
+    state
+        .setlist_repo
+        .delete_marker(setlist_id, marker_id)
+        .await?;
+
+    info!(%user_id, %setlist_id, %marker_id, "Setlist marker deleted successfully");
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
     path = "/api/v1/setlists/{id}/export/pdf",
     tags = ["Setlists"],
     summary = "Export a setlist to PDF.",
@@ -823,7 +1136,9 @@ pub async fn get_public_setlist(
         .await?
         .ok_or(ApiError::NotFound)?;
 
-    let (songs, _) = state.setlist_repo.get_songs(setlist.id, 1, 200).await?;
+    let songs = state.setlist_repo.get_songs(setlist.id, 1, 200);
+    let markers = state.setlist_repo.get_markers(setlist.id);
+    let ((songs, _), markers) = tokio::try_join!(songs, markers)?;
 
     info!(setlist_id = %setlist.id, "Public setlist retrieved successfully");
 
@@ -832,6 +1147,7 @@ pub async fn get_public_setlist(
         description: setlist.description,
         total_duration: setlist.total_duration,
         songs,
+        markers,
     }))
 }
 

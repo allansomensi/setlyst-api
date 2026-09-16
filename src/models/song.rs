@@ -266,6 +266,168 @@ pub enum Genre {
     #[serde(rename = "ThrashMetal")]
     #[sqlx(rename = "ThrashMetal")]
     ThrashMetal,
+    #[serde(rename = "SoftRock")]
+    #[sqlx(rename = "SoftRock")]
+    SoftRock,
+    #[serde(rename = "ClassicRock")]
+    #[sqlx(rename = "ClassicRock")]
+    ClassicRock,
+    #[serde(rename = "PopRock")]
+    #[sqlx(rename = "PopRock")]
+    PopRock,
+    #[serde(rename = "PowerBallad")]
+    #[sqlx(rename = "PowerBallad")]
+    PowerBallad,
+    #[serde(rename = "FolkRock")]
+    #[sqlx(rename = "FolkRock")]
+    FolkRock,
+    #[serde(rename = "ArenaRock")]
+    #[sqlx(rename = "ArenaRock")]
+    ArenaRock,
+    #[serde(rename = "GarageRock")]
+    #[sqlx(rename = "GarageRock")]
+    GarageRock,
+    #[serde(rename = "IndieRock")]
+    #[sqlx(rename = "IndieRock")]
+    IndieRock,
+    #[serde(rename = "PostRock")]
+    #[sqlx(rename = "PostRock")]
+    PostRock,
+    #[serde(rename = "SurfRock")]
+    #[sqlx(rename = "SurfRock")]
+    SurfRock,
+    #[serde(rename = "GlamRock")]
+    #[sqlx(rename = "GlamRock")]
+    GlamRock,
+    #[serde(rename = "StonerRock")]
+    #[sqlx(rename = "StonerRock")]
+    StonerRock,
+    #[serde(rename = "SouthernRock")]
+    #[sqlx(rename = "SouthernRock")]
+    SouthernRock,
+    #[serde(rename = "BluesRock")]
+    #[sqlx(rename = "BluesRock")]
+    BluesRock,
+    #[serde(rename = "RockAndRoll")]
+    #[sqlx(rename = "RockAndRoll")]
+    RockAndRoll,
+    #[serde(rename = "AlternativeRock")]
+    #[sqlx(rename = "AlternativeRock")]
+    AlternativeRock,
+    #[serde(rename = "IndustrialRock")]
+    #[sqlx(rename = "IndustrialRock")]
+    IndustrialRock,
+    #[serde(rename = "NuMetal")]
+    #[sqlx(rename = "NuMetal")]
+    NuMetal,
+    #[serde(rename = "BlackMetal")]
+    #[sqlx(rename = "BlackMetal")]
+    BlackMetal,
+    #[serde(rename = "DoomMetal")]
+    #[sqlx(rename = "DoomMetal")]
+    DoomMetal,
+    #[serde(rename = "GrooveMetal")]
+    #[sqlx(rename = "GrooveMetal")]
+    GrooveMetal,
+    #[serde(rename = "Metalcore")]
+    #[sqlx(rename = "Metalcore")]
+    Metalcore,
+    #[serde(rename = "Deathcore")]
+    #[sqlx(rename = "Deathcore")]
+    Deathcore,
+    #[serde(rename = "Grindcore")]
+    #[sqlx(rename = "Grindcore")]
+    Grindcore,
+    #[serde(rename = "IndustrialMetal")]
+    #[sqlx(rename = "IndustrialMetal")]
+    IndustrialMetal,
+    #[serde(rename = "GothicMetal")]
+    #[sqlx(rename = "GothicMetal")]
+    GothicMetal,
+    #[serde(rename = "FolkMetal")]
+    #[sqlx(rename = "FolkMetal")]
+    FolkMetal,
+    #[serde(rename = "PostPunk")]
+    #[sqlx(rename = "PostPunk")]
+    PostPunk,
+    #[serde(rename = "PopPunk")]
+    #[sqlx(rename = "PopPunk")]
+    PopPunk,
+    #[serde(rename = "SkaPunk")]
+    #[sqlx(rename = "SkaPunk")]
+    SkaPunk,
+    #[serde(rename = "HardcorePunk")]
+    #[sqlx(rename = "HardcorePunk")]
+    HardcorePunk,
+    #[serde(rename = "NewWave")]
+    #[sqlx(rename = "NewWave")]
+    NewWave,
+    #[serde(rename = "Dance")]
+    #[sqlx(rename = "Dance")]
+    Dance,
+    #[serde(rename = "EDM")]
+    #[sqlx(rename = "EDM")]
+    EDM,
+    #[serde(rename = "DrumAndBass")]
+    #[sqlx(rename = "DrumAndBass")]
+    DrumAndBass,
+    #[serde(rename = "Dubstep")]
+    #[sqlx(rename = "Dubstep")]
+    Dubstep,
+    #[serde(rename = "Trance")]
+    #[sqlx(rename = "Trance")]
+    Trance,
+    #[serde(rename = "Ambient")]
+    #[sqlx(rename = "Ambient")]
+    Ambient,
+    #[serde(rename = "Chillout")]
+    #[sqlx(rename = "Chillout")]
+    Chillout,
+    #[serde(rename = "Synthpop")]
+    #[sqlx(rename = "Synthpop")]
+    Synthpop,
+    #[serde(rename = "Industrial")]
+    #[sqlx(rename = "Industrial")]
+    Industrial,
+    #[serde(rename = "Trap")]
+    #[sqlx(rename = "Trap")]
+    Trap,
+    #[serde(rename = "Drill")]
+    #[sqlx(rename = "Drill")]
+    Drill,
+    #[serde(rename = "Afrobeat")]
+    #[sqlx(rename = "Afrobeat")]
+    Afrobeat,
+    #[serde(rename = "Grime")]
+    #[sqlx(rename = "Grime")]
+    Grime,
+    #[serde(rename = "FunkCarioca")]
+    #[sqlx(rename = "FunkCarioca")]
+    FunkCarioca,
+    #[serde(rename = "Piseiro")]
+    #[sqlx(rename = "Piseiro")]
+    Piseiro,
+    #[serde(rename = "Brega")]
+    #[sqlx(rename = "Brega")]
+    Brega,
+    #[serde(rename = "Frevo")]
+    #[sqlx(rename = "Frevo")]
+    Frevo,
+    #[serde(rename = "Arrocha")]
+    #[sqlx(rename = "Arrocha")]
+    Arrocha,
+    #[serde(rename = "WorldMusic")]
+    #[sqlx(rename = "WorldMusic")]
+    WorldMusic,
+    #[serde(rename = "Flamenco")]
+    #[sqlx(rename = "Flamenco")]
+    Flamenco,
+    #[serde(rename = "Tango")]
+    #[sqlx(rename = "Tango")]
+    Tango,
+    #[serde(rename = "Fado")]
+    #[sqlx(rename = "Fado")]
+    Fado,
     #[serde(rename = "Other")]
     #[sqlx(rename = "Other")]
     Other,
