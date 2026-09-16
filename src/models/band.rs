@@ -113,11 +113,76 @@ pub struct BandMember {
     pub band_id: Uuid,
     pub user_id: Uuid,
     pub role: BandRole,
+    /// Free-text identification label (e.g. "Guitarrista", "Baixista") —
+    /// purely cosmetic, unrelated to `role` and never affects permissions.
+    pub title: Option<String>,
     pub joined_at: NaiveDateTime,
     // Joined from `users` for display purposes.
     pub username: String,
     pub first_name: Option<String>,
     pub last_name: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, ToSchema, Validate)]
+pub struct UpdateBandMemberTitlePayload {
+    #[validate(length(max = 50, message = "Title must be at most 50 chars."))]
+    pub title: Option<String>,
+}
+
+/// A specific action within a band that can be independently permitted or
+/// denied for the `member` and `moderator` roles via
+/// [`BandRolePermissions`]. `admin` and `owner` always have every
+/// permission and are never restricted, so they never appear here.
+#[derive(ToSchema, PartialEq, Eq, Debug, Clone, Copy, Serialize, Deserialize, Type, Hash)]
+#[serde(rename_all(serialize = "snake_case", deserialize = "snake_case"))]
+#[sqlx(type_name = "band_permission", rename_all = "snake_case")]
+pub enum BandPermission {
+    /// Add/remove/reorder songs, blocks and breaks in the band's setlists,
+    /// and edit or delete those setlists.
+    ManageSetlists,
+    /// Edit or delete the band's own copy of a song (title, lyrics, BPM,
+    /// key, etc.) once it has been added to a band setlist.
+    ManageSongs,
+    /// Export a band setlist to PDF.
+    ExportPdf,
+}
+
+/// One row of a band's permission matrix: whether `role` is allowed to
+/// perform `permission`. Only `member`/`moderator` rows are meaningful —
+/// `admin`/`owner` are always allowed everything and are never stored.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize, ToSchema)]
+pub struct BandRolePermission {
+    pub role: BandRole,
+    pub permission: BandPermission,
+    pub allowed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema, Validate)]
+pub struct BandRolePermissionEntry {
+    #[validate(custom(function = "validate_configurable_role"))]
+    pub role: BandRole,
+    pub permission: BandPermission,
+    pub allowed: bool,
+}
+
+fn validate_configurable_role(role: &BandRole) -> Result<(), validator::ValidationError> {
+    match role {
+        BandRole::Member | BandRole::Moderator => Ok(()),
+        BandRole::Admin | BandRole::Owner => {
+            let mut error = validator::ValidationError::new("non_configurable_role");
+            error.message = Some(std::borrow::Cow::from(
+                "admin and owner permissions cannot be customized — they always have every permission.",
+            ));
+            Err(error)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema, Validate)]
+pub struct UpdateBandRolePermissionsPayload {
+    #[validate(length(min = 1, message = "At least one permission entry is required."))]
+    #[validate(nested)]
+    pub permissions: Vec<BandRolePermissionEntry>,
 }
 
 #[derive(Deserialize, Serialize, ToSchema, Validate)]

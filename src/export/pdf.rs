@@ -1,8 +1,13 @@
-use crate::models::song::{SongWithArtist, Tonality};
+use crate::models::setlist::SetlistItem;
+use crate::models::song::Tonality;
 use genpdf::{Alignment, Document, Element, SimplePageDecorator, elements, fonts, style};
 use serde::Deserialize;
 use std::io::Cursor;
 use utoipa::{IntoParams, ToSchema};
+
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -15,6 +20,13 @@ pub struct ExportQuery {
     pub show_key: bool,
     #[serde(default)]
     pub show_bpm: bool,
+    // Blocks and breaks default to shown — they were already part of the
+    // setlist's running order before this option existed, so an absent
+    // query param must not silently hide them.
+    #[serde(default = "default_true")]
+    pub show_blocks: bool,
+    #[serde(default = "default_true")]
+    pub show_breaks: bool,
     #[serde(default)]
     pub lang: PdfLocale,
 }
@@ -26,6 +38,8 @@ impl From<ExportQuery> for PdfExportOptions {
             show_total_duration: query.show_total_duration,
             show_key: query.show_key,
             show_bpm: query.show_bpm,
+            show_blocks: query.show_blocks,
+            show_breaks: query.show_breaks,
             locale: query.lang,
         }
     }
@@ -48,16 +62,19 @@ impl PdfLocale {
                 estimated_duration: "Duração estimada",
                 not_calculated: "Não calculada",
                 key: "Tom",
+                break_label: "Pausa",
             },
             Self::En => PdfLabels {
                 estimated_duration: "Estimated duration",
                 not_calculated: "Not calculated",
                 key: "Key",
+                break_label: "Break",
             },
             Self::Es => PdfLabels {
                 estimated_duration: "Duración estimada",
                 not_calculated: "No calculada",
                 key: "Tono",
+                break_label: "Pausa",
             },
         }
     }
@@ -67,6 +84,7 @@ struct PdfLabels {
     estimated_duration: &'static str,
     not_calculated: &'static str,
     key: &'static str,
+    break_label: &'static str,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -75,6 +93,8 @@ pub struct PdfExportOptions {
     pub show_total_duration: bool,
     pub show_key: bool,
     pub show_bpm: bool,
+    pub show_blocks: bool,
+    pub show_breaks: bool,
     pub locale: PdfLocale,
 }
 
@@ -124,7 +144,7 @@ fn format_tonality(t: &Tonality) -> &'static str {
 pub fn generate_setlist_pdf(
     setlist_title: &str,
     total_duration_secs: i32,
-    songs: &[SongWithArtist],
+    items: &[SetlistItem],
     options: &PdfExportOptions,
 ) -> Result<Vec<u8>, genpdf::error::Error> {
     let font_family = fonts::from_files("assets/fonts", "Inter", None)?;
@@ -177,30 +197,73 @@ pub fn generate_setlist_pdf(
     meta_style.set_font_size(14);
     meta_style.set_color(style::Color::Rgb(80, 80, 80));
 
-    for (index, song) in songs.iter().enumerate() {
-        let text_title = format!("{}. {}", index + 1, song.title);
-        doc.push(elements::Paragraph::new(text_title).styled(title_style));
+    let mut block_style = style::Style::new().bold();
+    block_style.set_font_size(16);
+    block_style.set_color(style::Color::Rgb(30, 30, 30));
 
-        let mut meta_parts = Vec::new();
+    let mut break_style = style::Style::new().italic();
+    break_style.set_font_size(13);
+    break_style.set_color(style::Color::Rgb(120, 120, 120));
 
-        if options.show_key
-            && let Some(key) = &song.tonality
-        {
-            meta_parts.push(format!("{}: {}", labels.key, format_tonality(key)));
+    let mut song_number = 0usize;
+
+    for item in items {
+        match item {
+            SetlistItem::Song { song, .. } => {
+                song_number += 1;
+                let text_title = format!("{song_number}. {}", song.title);
+                doc.push(elements::Paragraph::new(text_title).styled(title_style));
+
+                let mut meta_parts = Vec::new();
+
+                if options.show_key
+                    && let Some(key) = &song.tonality
+                {
+                    meta_parts.push(format!("{}: {}", labels.key, format_tonality(key)));
+                }
+
+                if options.show_bpm
+                    && let Some(bpm) = song.tempo
+                {
+                    meta_parts.push(format!("{bpm} BPM"));
+                }
+
+                if !meta_parts.is_empty() {
+                    let text_meta = meta_parts.join("  •  ");
+                    doc.push(elements::Paragraph::new(text_meta).styled(meta_style));
+                }
+
+                doc.push(elements::Break::new(1));
+            }
+            SetlistItem::Block { name, .. } => {
+                if !options.show_blocks {
+                    continue;
+                }
+
+                doc.push(elements::Break::new(1));
+                doc.push(elements::Paragraph::new(name.clone()).styled(block_style));
+                doc.push(elements::Break::new(1));
+            }
+            SetlistItem::Break {
+                label,
+                duration_minutes,
+                ..
+            } => {
+                if !options.show_breaks {
+                    continue;
+                }
+
+                let text = match (label, duration_minutes) {
+                    (Some(label), Some(minutes)) => format!("{label} ({minutes} min)"),
+                    (Some(label), None) => label.clone(),
+                    (None, Some(minutes)) => format!("{} ({minutes} min)", labels.break_label),
+                    (None, None) => labels.break_label.to_string(),
+                };
+
+                doc.push(elements::Paragraph::new(text).styled(break_style));
+                doc.push(elements::Break::new(1));
+            }
         }
-
-        if options.show_bpm
-            && let Some(bpm) = song.tempo
-        {
-            meta_parts.push(format!("{bpm} BPM"));
-        }
-
-        if !meta_parts.is_empty() {
-            let text_meta = meta_parts.join("  •  ");
-            doc.push(elements::Paragraph::new(text_meta).styled(meta_style));
-        }
-
-        doc.push(elements::Break::new(1));
     }
 
     let mut buffer = Cursor::new(Vec::new());

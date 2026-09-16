@@ -42,7 +42,6 @@ pub struct UpdateSetlistPayload {
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct AddSongToSetlistPayload {
     pub song_id: Uuid,
-    pub position: i32,
 }
 
 /// Optional title override when duplicating a setlist. When omitted, the

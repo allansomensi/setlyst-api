@@ -25,6 +25,9 @@ pub struct Gig {
     /// The setlist to be played, or `None` if it hasn't been chosen yet.
     pub setlist_id: Option<Uuid>,
     pub venue: String,
+    /// Free-text location (address, city, or a maps link) — independent
+    /// of `venue`, which is just the venue's name.
+    pub location: Option<String>,
     pub scheduled_at: NaiveDateTime,
     pub status: GigStatus,
     pub notes: Option<String>,
@@ -37,10 +40,12 @@ pub struct Gig {
     pub updated_at: NaiveDateTime,
 }
 
-#[derive(Deserialize, Serialize, ToSchema, Validate)]
+#[derive(Clone, Deserialize, Serialize, ToSchema, Validate)]
 pub struct CreateGigPayload {
     #[validate(length(min = 1, max = 255, message = "Venue must be between 1 and 255 chars."))]
     pub venue: String,
+    #[validate(length(max = 500, message = "Location must be at most 500 chars."))]
+    pub location: Option<String>,
     pub scheduled_at: NaiveDateTime,
     /// Optionally attach the gig to a band instead of keeping it personal.
     /// The caller must be a member of the band with permission to manage
@@ -58,6 +63,8 @@ pub struct CreateGigPayload {
 pub struct UpdateGigPayload {
     #[validate(length(min = 1, max = 255, message = "Venue must be between 1 and 255 chars."))]
     pub venue: Option<String>,
+    #[validate(length(max = 500, message = "Location must be at most 500 chars."))]
+    pub location: Option<String>,
     pub scheduled_at: Option<NaiveDateTime>,
     pub setlist_id: Option<Uuid>,
     pub status: Option<GigStatus>,
@@ -65,25 +72,22 @@ pub struct UpdateGigPayload {
 }
 
 impl Gig {
-    pub fn new(
-        venue: &str,
-        scheduled_at: NaiveDateTime,
-        user_id: Uuid,
-        band_id: Option<Uuid>,
-        setlist_id: Option<Uuid>,
-        status: GigStatus,
-        notes: Option<String>,
-    ) -> Self {
+    /// Builds a new gig from the caller's `CreateGigPayload` plus the
+    /// `user_id` it doesn't carry itself. Takes the payload by value
+    /// (rather than one argument per field) to keep the constructor's
+    /// arity fixed as fields are added.
+    pub fn new(payload: CreateGigPayload, user_id: Uuid) -> Self {
         let now = Utc::now().naive_utc();
         Self {
             id: Uuid::new_v4(),
             user_id,
-            band_id,
-            setlist_id,
-            venue: venue.to_string(),
-            scheduled_at,
-            status,
-            notes,
+            band_id: payload.band_id,
+            setlist_id: payload.setlist_id,
+            venue: payload.venue,
+            location: payload.location,
+            scheduled_at: payload.scheduled_at,
+            status: payload.status.unwrap_or_default(),
+            notes: payload.notes,
             share_token: None,
             created_at: now,
             updated_at: now,
@@ -97,6 +101,7 @@ impl Gig {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PublicGig {
     pub venue: String,
+    pub location: Option<String>,
     pub scheduled_at: NaiveDateTime,
     pub status: GigStatus,
     pub setlist: Option<crate::models::setlist::PublicSetlist>,

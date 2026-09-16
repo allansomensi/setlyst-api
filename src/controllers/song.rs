@@ -235,6 +235,8 @@ pub async fn update_song(
 
     payload.validate()?;
 
+    state.song_repo.can_manage(id, user_id).await?;
+
     let existing_song = state
         .song_repo
         .find_by_id(id, user_id)
@@ -299,7 +301,7 @@ pub async fn delete_song(
         "Processing request to delete song"
     );
 
-    state.song_repo.exists(id, user_id).await?;
+    state.song_repo.can_manage(id, user_id).await?;
 
     match state.song_repo.delete(id).await {
         Ok(_) => {

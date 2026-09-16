@@ -24,12 +24,21 @@ pub fn create_routes(state: AppState) -> Router {
             axum::routing::patch(band::update_band_member_role).delete(band::remove_band_member),
         )
         .route(
+            "/{id}/members/{user_id}/title",
+            axum::routing::patch(band::update_band_member_title),
+        )
+        .route(
             "/{id}/invites",
             axum::routing::get(band::list_band_invites).post(band::create_band_invite),
         )
         .route(
             "/{id}/invites/{invite_id}",
             axum::routing::delete(band::revoke_band_invite),
+        )
+        .route(
+            "/{id}/permissions",
+            axum::routing::get(band::get_band_role_permissions)
+                .put(band::update_band_role_permissions),
         )
         .route(
             "/{id}/setlists",

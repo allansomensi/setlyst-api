@@ -69,7 +69,7 @@ struct GigAccessRow {
     owner_id: Uuid,
     band_id: Option<Uuid>,
     band_role: Option<BandRole>,
-    members_can_manage_setlists: Option<bool>,
+    role_permission_allowed: Option<bool>,
 }
 
 #[async_trait::async_trait]
@@ -88,7 +88,7 @@ impl GigRepository for GigRepositoryImpl {
                 .fetch_one(&self.db);
 
         let gigs = sqlx::query_as::<_, Gig>(
-            "SELECT id, user_id, band_id, setlist_id, venue, scheduled_at, status, notes, share_token, created_at, updated_at
+            "SELECT id, user_id, band_id, setlist_id, venue, location, scheduled_at, status, notes, share_token, created_at, updated_at
              FROM gigs
              WHERE user_id = $1 AND band_id IS NULL
              ORDER BY scheduled_at ASC
@@ -116,7 +116,7 @@ impl GigRepository for GigRepositoryImpl {
             .fetch_one(&self.db);
 
         let gigs = sqlx::query_as::<_, Gig>(
-            "SELECT id, user_id, band_id, setlist_id, venue, scheduled_at, status, notes, share_token, created_at, updated_at
+            "SELECT id, user_id, band_id, setlist_id, venue, location, scheduled_at, status, notes, share_token, created_at, updated_at
              FROM gigs
              WHERE band_id = $1
              ORDER BY scheduled_at ASC
@@ -133,7 +133,7 @@ impl GigRepository for GigRepositoryImpl {
 
     async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Gig>, ApiError> {
         let gig = sqlx::query_as::<_, Gig>(
-            "SELECT g.id, g.user_id, g.band_id, g.setlist_id, g.venue, g.scheduled_at, g.status, g.notes, g.share_token, g.created_at, g.updated_at
+            "SELECT g.id, g.user_id, g.band_id, g.setlist_id, g.venue, g.location, g.scheduled_at, g.status, g.notes, g.share_token, g.created_at, g.updated_at
              FROM gigs g
              LEFT JOIN band_members bm ON bm.band_id = g.band_id AND bm.user_id = $2
              WHERE g.id = $1 AND (g.user_id = $2 OR bm.user_id IS NOT NULL)"
@@ -146,25 +146,18 @@ impl GigRepository for GigRepositoryImpl {
     }
 
     async fn create(&self, payload: &CreateGigPayload, user_id: Uuid) -> Result<Gig, ApiError> {
-        let new_gig = Gig::new(
-            &payload.venue,
-            payload.scheduled_at,
-            user_id,
-            payload.band_id,
-            payload.setlist_id,
-            payload.status.unwrap_or_default(),
-            payload.notes.clone(),
-        );
+        let new_gig = Gig::new(payload.clone(), user_id);
 
         sqlx::query(
-            "INSERT INTO gigs (id, user_id, band_id, setlist_id, venue, scheduled_at, status, notes, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            "INSERT INTO gigs (id, user_id, band_id, setlist_id, venue, location, scheduled_at, status, notes, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(new_gig.id)
         .bind(new_gig.user_id)
         .bind(new_gig.band_id)
         .bind(new_gig.setlist_id)
         .bind(&new_gig.venue)
+        .bind(&new_gig.location)
         .bind(new_gig.scheduled_at)
         .bind(new_gig.status)
         .bind(&new_gig.notes)
@@ -183,6 +176,15 @@ impl GigRepository for GigRepositoryImpl {
         if let Some(venue) = &payload.venue {
             sqlx::query("UPDATE gigs SET venue = $1 WHERE id = $2")
                 .bind(venue)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            updated = true;
+        }
+
+        if let Some(location) = &payload.location {
+            sqlx::query("UPDATE gigs SET location = $1 WHERE id = $2")
+                .bind(location)
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
@@ -284,10 +286,13 @@ impl GigRepository for GigRepositoryImpl {
                 g.user_id AS owner_id,
                 g.band_id,
                 bm.role AS band_role,
-                b.members_can_manage_setlists
+                brp.allowed AS role_permission_allowed
             FROM gigs g
             LEFT JOIN band_members bm ON bm.band_id = g.band_id AND bm.user_id = $2
-            LEFT JOIN bands b ON b.id = g.band_id
+            LEFT JOIN band_role_permissions brp
+                ON brp.band_id = g.band_id
+                AND brp.role = bm.role
+                AND brp.permission = 'manage_setlists'
             WHERE g.id = $1
             "#,
         )
@@ -300,9 +305,9 @@ impl GigRepository for GigRepositoryImpl {
         let allowed = match row.band_id {
             None => row.owner_id == user_id,
             Some(_) => match row.band_role {
-                Some(role) if role.satisfies(BandRole::Moderator) => true,
-                Some(BandRole::Member) => row.members_can_manage_setlists.unwrap_or(false),
-                _ => false,
+                Some(role) if role.satisfies(BandRole::Admin) => true,
+                Some(_) => row.role_permission_allowed.unwrap_or(false),
+                None => false,
             },
         };
 
@@ -347,7 +352,7 @@ impl GigRepository for GigRepositoryImpl {
 
     async fn find_by_share_token(&self, token: &str) -> Result<Option<Gig>, ApiError> {
         let gig = sqlx::query_as::<_, Gig>(
-            "SELECT id, user_id, band_id, setlist_id, venue, scheduled_at, status, notes, share_token, created_at, updated_at
+            "SELECT id, user_id, band_id, setlist_id, venue, location, scheduled_at, status, notes, share_token, created_at, updated_at
              FROM gigs WHERE share_token = $1"
         )
         .bind(token)

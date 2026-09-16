@@ -14,3 +14,11 @@ pub struct LoginPayload {
     #[validate(custom(function = "validate_password"))]
     pub password: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct LoginResponse {
+    pub token: String,
+    /// `true` when this is the account's very first login ever — lets the
+    /// frontend skip the "welcome back" toast for a brand new account.
+    pub is_first_login: bool,
+}

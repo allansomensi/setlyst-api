@@ -5,7 +5,8 @@ use crate::{
         auth::access::AccessControl,
         band::{
             Band, BandRole, CreateBandInvitePayload, CreateBandPayload, TransferOwnershipPayload,
-            UpdateBandMemberRolePayload, UpdateBandPayload,
+            UpdateBandMemberRolePayload, UpdateBandMemberTitlePayload, UpdateBandPayload,
+            UpdateBandRolePermissionsPayload,
         },
     },
 };
@@ -319,6 +320,57 @@ pub async fn update_band_member_role(
 }
 
 #[utoipa::path(
+    patch,
+    path = "/api/v1/bands/{id}/members/{user_id}/title",
+    tags = ["Bands"],
+    summary = "Set or clear a band member's free-text title/function.",
+    description = "Purely cosmetic (e.g. \"Guitarrista\", \"Baixista\") — never affects permissions. A member may set their own title; an `admin` or higher may set anyone's.",
+    params(
+        ("id" = Uuid, Path, description = "The ID of the band"),
+        ("user_id" = Uuid, Path, description = "The ID of the member to update")
+    ),
+    request_body = UpdateBandMemberTitlePayload,
+    security((), ("jwt_token" = [])),
+    responses(
+        (status = 200, description = "Member title updated successfully."),
+        (status = 403, description = "The caller may only set their own title, or must be an admin."),
+        (status = 404, description = "Member not found.")
+    )
+)]
+pub async fn update_band_member_title(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path((band_id, target_user_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<UpdateBandMemberTitlePayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+    debug!(%user_id, %band_id, %target_user_id, "Processing request to update band member title");
+
+    payload.validate()?;
+
+    if target_user_id != user_id {
+        state
+            .band_repo
+            .require_role(band_id, user_id, BandRole::Admin)
+            .await?;
+    } else {
+        // Still ensure the caller is actually a member of this band.
+        state
+            .band_repo
+            .require_role(band_id, user_id, BandRole::Member)
+            .await?;
+    }
+
+    state
+        .band_member_repo
+        .update_title(band_id, target_user_id, payload.title.as_deref())
+        .await?;
+
+    info!(%user_id, %band_id, %target_user_id, "Band member title updated successfully");
+    Ok(Json("Member title updated successfully"))
+}
+
+#[utoipa::path(
     delete,
     path = "/api/v1/bands/{id}/members/{user_id}",
     tags = ["Bands"],
@@ -491,6 +543,80 @@ pub async fn revoke_band_invite(
     state.band_invite_repo.revoke(invite_id, band_id).await?;
 
     info!(%user_id, %band_id, %invite_id, "Band invite revoked successfully");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/bands/{id}/permissions",
+    tags = ["Bands"],
+    summary = "Get the band's member/moderator permission matrix.",
+    description = "Requires the `admin` band role or higher. `admin` and `owner` are never restricted and are not included in the response.",
+    params(("id" = Uuid, Path, description = "The ID of the band")),
+    security((), ("jwt_token" = [])),
+    responses(
+        (status = 200, description = "Permissions retrieved successfully."),
+        (status = 403, description = "The caller does not have the required band role."),
+        (status = 404, description = "Band not found.")
+    )
+)]
+pub async fn get_band_role_permissions(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+    debug!(%user_id, band_id = %id, "Processing request to fetch band role permissions");
+
+    state
+        .band_repo
+        .require_role(id, user_id, BandRole::Admin)
+        .await?;
+
+    let permissions = state.band_repo.get_role_permissions(id).await?;
+
+    info!(%user_id, band_id = %id, "Band role permissions retrieved successfully");
+    Ok(Json(permissions))
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/v1/bands/{id}/permissions",
+    tags = ["Bands"],
+    summary = "Update the band's member/moderator permission matrix.",
+    description = "Requires the `admin` band role or higher. Only `member` and `moderator` rows may be set — `admin`/`owner` always have every permission.",
+    params(("id" = Uuid, Path, description = "The ID of the band")),
+    request_body = UpdateBandRolePermissionsPayload,
+    security((), ("jwt_token" = [])),
+    responses(
+        (status = 204, description = "Permissions updated successfully."),
+        (status = 400, description = "Invalid payload (e.g. tried to set an admin/owner row)."),
+        (status = 403, description = "The caller does not have the required band role."),
+        (status = 404, description = "Band not found.")
+    )
+)]
+pub async fn update_band_role_permissions(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<UpdateBandRolePermissionsPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+    debug!(%user_id, band_id = %id, "Processing request to update band role permissions");
+
+    payload.validate()?;
+
+    state
+        .band_repo
+        .require_role(id, user_id, BandRole::Admin)
+        .await?;
+
+    state
+        .band_repo
+        .update_role_permissions(id, &payload.permissions)
+        .await?;
+
+    info!(%user_id, band_id = %id, "Band role permissions updated successfully");
     Ok(StatusCode::NO_CONTENT)
 }
 

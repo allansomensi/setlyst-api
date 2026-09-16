@@ -1,6 +1,9 @@
 use crate::{
     errors::api_error::ApiError,
-    models::band::{Band, BandRole, BandWithMembership, CreateBandPayload, UpdateBandPayload},
+    models::band::{
+        Band, BandPermission, BandRole, BandRolePermission, BandRolePermissionEntry,
+        BandWithMembership, CreateBandPayload, UpdateBandPayload,
+    },
     utils::slug::{slugify, uniquify_slug},
 };
 use sqlx::PgPool;
@@ -35,6 +38,32 @@ pub trait BandRepository: Send + Sync {
         user_id: Uuid,
         min_role: BandRole,
     ) -> Result<BandRole, ApiError>;
+
+    /// Returns the full `member`/`moderator` permission matrix for a band
+    /// (six rows: one per role × permission combination).
+    async fn get_role_permissions(
+        &self,
+        band_id: Uuid,
+    ) -> Result<Vec<BandRolePermission>, ApiError>;
+
+    /// Bulk-upserts a set of (role, permission, allowed) entries. Caller
+    /// must already have checked the admin/owner role via `require_role`.
+    async fn update_role_permissions(
+        &self,
+        band_id: Uuid,
+        entries: &[BandRolePermissionEntry],
+    ) -> Result<(), ApiError>;
+
+    /// Returns `true` when `role` is allowed to perform `permission` in
+    /// `band_id`. `admin` and `owner` are always `true`; for `member` and
+    /// `moderator`, this reads the band's permission matrix, defaulting to
+    /// `false` if no row exists (e.g. a race with band creation).
+    async fn role_has_permission(
+        &self,
+        band_id: Uuid,
+        role: BandRole,
+        permission: BandPermission,
+    ) -> Result<bool, ApiError>;
 }
 
 pub struct BandRepositoryImpl {
@@ -155,6 +184,31 @@ impl BandRepository for BandRepositoryImpl {
         .execute(&mut *tx)
         .await?;
 
+        // Seed the default permission matrix for the two configurable
+        // roles, mirroring the same defaults the 0014 migration backfilled
+        // for existing bands: moderators can manage setlists/songs,
+        // members can't (until the admin opts them in), and everyone can
+        // export PDFs.
+        for (role, permission, allowed) in [
+            (BandRole::Moderator, BandPermission::ManageSetlists, true),
+            (BandRole::Moderator, BandPermission::ManageSongs, true),
+            (BandRole::Moderator, BandPermission::ExportPdf, true),
+            (BandRole::Member, BandPermission::ManageSetlists, false),
+            (BandRole::Member, BandPermission::ManageSongs, false),
+            (BandRole::Member, BandPermission::ExportPdf, true),
+        ] {
+            sqlx::query(
+                "INSERT INTO band_role_permissions (band_id, role, permission, allowed)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(new_band.id)
+            .bind(role)
+            .bind(permission)
+            .bind(allowed)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         tx.commit().await?;
 
         Ok(new_band)
@@ -251,5 +305,80 @@ impl BandRepository for BandRepositoryImpl {
                 Err(ApiError::NotFound)
             }
         }
+    }
+
+    async fn get_role_permissions(
+        &self,
+        band_id: Uuid,
+    ) -> Result<Vec<BandRolePermission>, ApiError> {
+        let permissions = sqlx::query_as::<_, BandRolePermission>(
+            "SELECT role, permission, allowed FROM band_role_permissions
+             WHERE band_id = $1
+             ORDER BY role, permission;",
+        )
+        .bind(band_id)
+        .fetch_all(&self.db)
+        .await?;
+
+        Ok(permissions)
+    }
+
+    async fn update_role_permissions(
+        &self,
+        band_id: Uuid,
+        entries: &[BandRolePermissionEntry],
+    ) -> Result<(), ApiError> {
+        let mut tx = self.db.begin().await?;
+
+        for entry in entries {
+            sqlx::query(
+                "INSERT INTO band_role_permissions (band_id, role, permission, allowed)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (band_id, role, permission) DO UPDATE SET allowed = $4",
+            )
+            .bind(band_id)
+            .bind(entry.role)
+            .bind(entry.permission)
+            .bind(entry.allowed)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                error!("Failed to update band role permission: {e}");
+                ApiError::DatabaseError(e)
+            })?;
+        }
+
+        sqlx::query("UPDATE bands SET updated_at = $1 WHERE id = $2")
+            .bind(chrono::Utc::now().naive_utc())
+            .bind(band_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        Ok(())
+    }
+
+    async fn role_has_permission(
+        &self,
+        band_id: Uuid,
+        role: BandRole,
+        permission: BandPermission,
+    ) -> Result<bool, ApiError> {
+        if role.satisfies(BandRole::Admin) {
+            return Ok(true);
+        }
+
+        let allowed: Option<bool> = sqlx::query_scalar(
+            "SELECT allowed FROM band_role_permissions
+             WHERE band_id = $1 AND role = $2 AND permission = $3;",
+        )
+        .bind(band_id)
+        .bind(role)
+        .bind(permission)
+        .fetch_optional(&self.db)
+        .await?;
+
+        Ok(allowed.unwrap_or(false))
     }
 }

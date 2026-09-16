@@ -2,7 +2,7 @@ use crate::{
     database::AppState,
     errors::api_error::ApiError,
     models::{
-        auth::{LoginPayload, token::VerifyTokenPayload},
+        auth::{LoginPayload, LoginResponse, token::VerifyTokenPayload},
         user::{CreateUserPayload, RegisterPayload, Status, UserPublic},
     },
     utils::{
@@ -23,7 +23,7 @@ use validator::Validate;
     description = "If the credentials are correct, a JWT is returned.",
     request_body = LoginPayload,
     responses(
-        (status = 200, description = "Logged in successfully."),
+        (status = 200, description = "Logged in successfully.", body = LoginResponse),
         (status = 401, description = "Incorrect password, unauthorized."),
         (status = 404, description = "User not found."),
     )
@@ -49,10 +49,17 @@ pub async fn login(
     verify_password(&payload.password, &user.password_hash)?;
 
     let token = generate_jwt(&user)?;
+    let is_first_login = state.user_repo.mark_login(user.id).await?;
 
     info!("Login successful for user: {}", payload.username);
 
-    Ok((StatusCode::OK, Json(token)))
+    Ok((
+        StatusCode::OK,
+        Json(LoginResponse {
+            token,
+            is_first_login,
+        }),
+    ))
 }
 
 /// Register a new user.

@@ -53,6 +53,11 @@ pub trait SetlistRepository: Send + Sync {
     /// the band's setlist-management bar (`moderator`+, or `member` when the
     /// band allows it).
     async fn can_manage(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
+    /// Checks the caller may export this setlist to PDF: its personal
+    /// owner, or a band member whose role satisfies the band's
+    /// `export_pdf` permission (`admin`+ always can; `moderator`/`member`
+    /// follow the band's configurable permission matrix).
+    async fn can_export_pdf(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
     /// Generates a fresh public share token for the setlist, replacing any
     /// existing one (which immediately invalidates previously shared links).
     /// Returns the updated setlist.
@@ -63,12 +68,10 @@ pub trait SetlistRepository: Send + Sync {
     /// membership filter — this is the lookup used by the unauthenticated
     /// `/public/setlists/{token}` routes.
     async fn find_by_share_token(&self, token: &str) -> Result<Option<Setlist>, ApiError>;
-    async fn add_song(
-        &self,
-        setlist_id: Uuid,
-        song_id: Uuid,
-        position: i32,
-    ) -> Result<(), ApiError>;
+    /// Adds a song to the end of the setlist's shared song/marker ordering
+    /// space. The position is always computed server-side — callers never
+    /// choose where a song lands.
+    async fn add_song(&self, setlist_id: Uuid, song_id: Uuid) -> Result<(), ApiError>;
     /// Checks whether a song is already part of a setlist — used to reject
     /// adding the same song twice rather than silently repositioning it.
     async fn has_song(&self, setlist_id: Uuid, song_id: Uuid) -> Result<bool, ApiError>;
@@ -144,7 +147,7 @@ struct SetlistAccessRow {
     owner_id: Uuid,
     band_id: Option<Uuid>,
     band_role: Option<BandRole>,
-    members_can_manage_setlists: Option<bool>,
+    role_permission_allowed: Option<bool>,
 }
 
 #[async_trait::async_trait]
@@ -384,10 +387,56 @@ impl SetlistRepository for SetlistRepositoryImpl {
                 s.user_id AS owner_id,
                 s.band_id,
                 bm.role AS band_role,
-                b.members_can_manage_setlists
+                brp.allowed AS role_permission_allowed
             FROM setlists s
             LEFT JOIN band_members bm ON bm.band_id = s.band_id AND bm.user_id = $2
-            LEFT JOIN bands b ON b.id = s.band_id
+            LEFT JOIN band_role_permissions brp
+                ON brp.band_id = s.band_id
+                AND brp.role = bm.role
+                AND brp.permission = 'manage_setlists'
+            WHERE s.id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(user_id)
+        .fetch_optional(&self.db)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+        // Admin/owner are always allowed; member/moderator follow the
+        // band's configurable `manage_setlists` permission (defaulting to
+        // denied if no row exists at all — e.g. a race with band creation).
+        let allowed = match row.band_id {
+            None => row.owner_id == user_id,
+            Some(_) => match row.band_role {
+                Some(role) if role.satisfies(BandRole::Admin) => true,
+                Some(_) => row.role_permission_allowed.unwrap_or(false),
+                None => false,
+            },
+        };
+
+        if allowed {
+            Ok(())
+        } else {
+            error!(%id, %user_id, "User is not allowed to manage this setlist.");
+            Err(ApiError::Forbidden)
+        }
+    }
+
+    async fn can_export_pdf(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
+        let row = sqlx::query_as::<_, SetlistAccessRow>(
+            r#"
+            SELECT
+                s.user_id AS owner_id,
+                s.band_id,
+                bm.role AS band_role,
+                brp.allowed AS role_permission_allowed
+            FROM setlists s
+            LEFT JOIN band_members bm ON bm.band_id = s.band_id AND bm.user_id = $2
+            LEFT JOIN band_role_permissions brp
+                ON brp.band_id = s.band_id
+                AND brp.role = bm.role
+                AND brp.permission = 'export_pdf'
             WHERE s.id = $1
             "#,
         )
@@ -400,16 +449,16 @@ impl SetlistRepository for SetlistRepositoryImpl {
         let allowed = match row.band_id {
             None => row.owner_id == user_id,
             Some(_) => match row.band_role {
-                Some(role) if role.satisfies(BandRole::Moderator) => true,
-                Some(BandRole::Member) => row.members_can_manage_setlists.unwrap_or(false),
-                _ => false,
+                Some(role) if role.satisfies(BandRole::Admin) => true,
+                Some(_) => row.role_permission_allowed.unwrap_or(false),
+                None => false,
             },
         };
 
         if allowed {
             Ok(())
         } else {
-            error!(%id, %user_id, "User is not allowed to manage this setlist.");
+            error!(%id, %user_id, "User is not allowed to export this setlist to PDF.");
             Err(ApiError::Forbidden)
         }
     }
@@ -465,19 +514,29 @@ impl SetlistRepository for SetlistRepositoryImpl {
         Ok(setlist)
     }
 
-    async fn add_song(
-        &self,
-        setlist_id: Uuid,
-        song_id: Uuid,
-        position: i32,
-    ) -> Result<(), ApiError> {
+    async fn add_song(&self, setlist_id: Uuid, song_id: Uuid) -> Result<(), ApiError> {
+        // Append at the end of the shared song/marker ordering space — the
+        // same pattern used by create_marker for blocks/breaks, so songs,
+        // blocks and breaks all land after whatever already exists.
+        let next_position: i32 = sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(GREATEST(
+                (SELECT MAX(position) FROM setlist_songs WHERE setlist_id = $1),
+                (SELECT MAX(position) FROM setlist_markers WHERE setlist_id = $1)
+            ), 0) + 1
+            "#,
+        )
+        .bind(setlist_id)
+        .fetch_one(&self.db)
+        .await?;
+
         sqlx::query(
             "INSERT INTO setlist_songs (setlist_id, song_id, position) VALUES ($1, $2, $3)
              ON CONFLICT (setlist_id, song_id) DO UPDATE SET position = $3;",
         )
         .bind(setlist_id)
         .bind(song_id)
-        .bind(position)
+        .bind(next_position)
         .execute(&self.db)
         .await
         .map_err(|e| {

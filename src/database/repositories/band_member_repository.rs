@@ -27,6 +27,15 @@ pub trait BandMemberRepository: Send + Sync {
         role: BandRole,
     ) -> Result<(), ApiError>;
 
+    /// Sets (or clears, with `None`) a member's free-text title/function
+    /// label. Purely cosmetic — never checked for permissions.
+    async fn update_title(
+        &self,
+        band_id: Uuid,
+        user_id: Uuid,
+        title: Option<&str>,
+    ) -> Result<(), ApiError>;
+
     async fn remove(&self, band_id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
 
     /// Counts how many members currently hold the `owner` role (always 0 or 1
@@ -60,7 +69,7 @@ impl BandMemberRepository for BandMemberRepositoryImpl {
         let members = sqlx::query_as::<_, BandMember>(
             r#"
             SELECT
-                bm.id, bm.band_id, bm.user_id, bm.role, bm.joined_at,
+                bm.id, bm.band_id, bm.user_id, bm.role, bm.title, bm.joined_at,
                 u.username, u.first_name, u.last_name
             FROM band_members bm
             INNER JOIN users u ON u.id = bm.user_id
@@ -117,6 +126,27 @@ impl BandMemberRepository for BandMemberRepositoryImpl {
         let result =
             sqlx::query("UPDATE band_members SET role = $1 WHERE band_id = $2 AND user_id = $3")
                 .bind(role)
+                .bind(band_id)
+                .bind(user_id)
+                .execute(&self.db)
+                .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(ApiError::NotFound);
+        }
+
+        Ok(())
+    }
+
+    async fn update_title(
+        &self,
+        band_id: Uuid,
+        user_id: Uuid,
+        title: Option<&str>,
+    ) -> Result<(), ApiError> {
+        let result =
+            sqlx::query("UPDATE band_members SET title = $1 WHERE band_id = $2 AND user_id = $3")
+                .bind(title)
                 .bind(band_id)
                 .bind(user_id)
                 .execute(&self.db)

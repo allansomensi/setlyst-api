@@ -1,6 +1,9 @@
 use crate::{
     errors::api_error::ApiError,
-    models::song::{CreateSongPayload, Song, SongExport, SongWithArtist, UpdateSongPayload},
+    models::{
+        band::BandRole,
+        song::{CreateSongPayload, Song, SongExport, SongWithArtist, UpdateSongPayload},
+    },
 };
 use sqlx::PgPool;
 use tracing::error;
@@ -28,6 +31,14 @@ pub trait SongRepository: Send + Sync {
         exclude_id: Option<Uuid>,
     ) -> Result<(), ApiError>;
     async fn exists(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
+    /// Checks the caller may edit/delete this song: its personal owner
+    /// (`band_id IS NULL`), or — for a band-owned copy — a band member
+    /// whose role satisfies the band's `manage_songs` permission
+    /// (`admin`+ always can; `moderator`/`member` follow the band's
+    /// configurable permission matrix). This is what lets any authorized
+    /// band member fix a band's copy of a song (lyrics, BPM, key...)
+    /// without touching the original personal song it was forked from.
+    async fn can_manage(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
     async fn export_all_chordpro(&self, user_id: Uuid) -> Result<Vec<SongExport>, ApiError>;
     /// Fetches any song by ID (no ownership filter) with its artist name
     /// resolved, regardless of who owns it. Used internally when forking a
@@ -48,6 +59,16 @@ pub trait SongRepository: Send + Sync {
 
 pub struct SongRepositoryImpl {
     pub db: PgPool,
+}
+
+/// Row shape used to decide edit permission on a song without fetching its
+/// full column set. Mirrors `setlist_repository::SetlistAccessRow`.
+#[derive(sqlx::FromRow)]
+struct SongAccessRow {
+    owner_id: Uuid,
+    band_id: Option<Uuid>,
+    band_role: Option<BandRole>,
+    role_permission_allowed: Option<bool>,
 }
 
 impl SongRepositoryImpl {
@@ -86,9 +107,14 @@ impl SongRepository for SongRepositoryImpl {
     }
 
     async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Song>, ApiError> {
+        // Personal songs are only visible to their owner. Band-owned songs
+        // (band_id set) are visible to any member of that band, regardless
+        // of role — editing them is gated separately by `can_manage`.
         let song = sqlx::query_as::<_, Song>(
-            "SELECT id, title, artist_id, user_id, band_id, forked_from, tempo, lyrics, tonality, genre, duration, created_at, updated_at
-             FROM songs WHERE id = $1 AND user_id = $2",
+            "SELECT s.id, s.title, s.artist_id, s.user_id, s.band_id, s.forked_from, s.tempo, s.lyrics, s.tonality, s.genre, s.duration, s.created_at, s.updated_at
+             FROM songs s
+             LEFT JOIN band_members bm ON bm.band_id = s.band_id AND bm.user_id = $2
+             WHERE s.id = $1 AND (s.user_id = $2 OR (s.band_id IS NOT NULL AND bm.user_id IS NOT NULL))",
         )
         .bind(id)
         .bind(user_id)
@@ -255,6 +281,46 @@ impl SongRepository for SongRepositoryImpl {
             Err(ApiError::NotFound)
         } else {
             Ok(())
+        }
+    }
+
+    async fn can_manage(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
+        let row = sqlx::query_as::<_, SongAccessRow>(
+            r#"
+            SELECT
+                s.user_id AS owner_id,
+                s.band_id,
+                bm.role AS band_role,
+                brp.allowed AS role_permission_allowed
+            FROM songs s
+            LEFT JOIN band_members bm ON bm.band_id = s.band_id AND bm.user_id = $2
+            LEFT JOIN band_role_permissions brp
+                ON brp.band_id = s.band_id
+                AND brp.role = bm.role
+                AND brp.permission = 'manage_songs'
+            WHERE s.id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(user_id)
+        .fetch_optional(&self.db)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+        let allowed = match row.band_id {
+            None => row.owner_id == user_id,
+            Some(_) => match row.band_role {
+                Some(role) if role.satisfies(BandRole::Admin) => true,
+                Some(_) => row.role_permission_allowed.unwrap_or(false),
+                None => false,
+            },
+        };
+
+        if allowed {
+            Ok(())
+        } else {
+            error!(%id, %user_id, "User is not allowed to manage this song.");
+            Err(ApiError::Forbidden)
         }
     }
 

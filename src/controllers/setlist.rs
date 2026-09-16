@@ -386,7 +386,7 @@ pub async fn delete_setlist(
     path = "/api/v1/setlists/{id}/songs",
     tags = ["Setlists"],
     summary = "Add a song to a setlist.",
-    description = "Adds a specific song to a setlist at a given position.",
+    description = "Adds a specific song to the end of a setlist.",
     params(("id" = Uuid, Path, description = "The ID of the setlist")),
     request_body = AddSongToSetlistPayload,
     security(
@@ -475,7 +475,7 @@ pub async fn add_song_to_setlist(
 
     state
         .setlist_repo
-        .add_song(setlist_id, song_id_to_link, payload.position)
+        .add_song(setlist_id, song_id_to_link)
         .await?;
 
     info!(
@@ -934,7 +934,7 @@ pub async fn delete_setlist_marker(
     path = "/api/v1/setlists/{id}/export/pdf",
     tags = ["Setlists"],
     summary = "Export a setlist to PDF.",
-    description = "Generates and returns a PDF file containing the setlist's songs. Supports localization via query params.",
+    description = "Generates and returns a PDF file containing the setlist's songs, blocks and breaks. Supports localization via query params.",
     params(
         ("id" = Uuid, Path, description = "The ID of the setlist to export"),
         ExportQuery
@@ -945,6 +945,7 @@ pub async fn delete_setlist_marker(
     ),
     responses(
         (status = 200, description = "PDF exported successfully", content_type = "application/pdf"),
+        (status = 403, description = "The caller is not allowed to export this setlist to PDF."),
         (status = 404, description = "Setlist not found"),
         (status = 500, description = "An error occurred while exporting the setlist")
     )
@@ -959,17 +960,19 @@ pub async fn export_setlist_pdf(
 
     debug!(%user_id, setlist_id = %id, "Processing request to export setlist to PDF");
 
+    state.setlist_repo.can_export_pdf(id, user_id).await?;
+
     let setlist = state
         .setlist_repo
         .find_by_id(id, user_id)
         .await?
         .ok_or(ApiError::NotFound)?;
 
-    let (songs, _) = state.setlist_repo.get_songs(id, 1, 100).await?;
+    let items = state.setlist_repo.get_items(id).await?;
 
     let options = PdfExportOptions::from(query);
 
-    match generate_setlist_pdf(&setlist.title, setlist.total_duration, &songs, &options) {
+    match generate_setlist_pdf(&setlist.title, setlist.total_duration, &items, &options) {
         Ok(pdf_bytes) => {
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -1179,11 +1182,11 @@ pub async fn export_public_setlist_pdf(
         .await?
         .ok_or(ApiError::NotFound)?;
 
-    let (songs, _) = state.setlist_repo.get_songs(setlist.id, 1, 200).await?;
+    let items = state.setlist_repo.get_items(setlist.id).await?;
 
     let options = PdfExportOptions::from(query);
 
-    match generate_setlist_pdf(&setlist.title, setlist.total_duration, &songs, &options) {
+    match generate_setlist_pdf(&setlist.title, setlist.total_duration, &items, &options) {
         Ok(pdf_bytes) => {
             let mut headers = HeaderMap::new();
             headers.insert(

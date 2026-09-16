@@ -5,8 +5,13 @@ use crate::{
     export::pdf::PdfLocale,
     models::{
         artist::Artist,
+        auth::LoginResponse,
         backup::{BackupFile, ImportSummary},
-        band::{Band, BandInvite, BandMember, BandWithMembership},
+        band::{
+            Band, BandInvite, BandMember, BandPermission, BandRolePermission,
+            BandRolePermissionEntry, BandWithMembership, UpdateBandMemberTitlePayload,
+            UpdateBandRolePermissionsPayload,
+        },
         gig::{Gig, GigStatus, PublicGig},
         metrics::{
             AdminMetrics, ArtistSongCount, GenreCount, MetricsResponse, RoleCount, UserMetrics,
@@ -122,11 +127,14 @@ use utoipa::{
         band::transfer_ownership,
         band::list_band_members,
         band::update_band_member_role,
+        band::update_band_member_title,
         band::remove_band_member,
         band::create_band_invite,
         band::list_band_invites,
         band::revoke_band_invite,
         band::accept_band_invite,
+        band::get_band_role_permissions,
+        band::update_band_role_permissions,
         setlist::find_band_setlists,
         gig::find_band_gigs,
 
@@ -159,6 +167,11 @@ use utoipa::{
             BandWithMembership,
             BandMember,
             BandInvite,
+            BandPermission,
+            BandRolePermission,
+            BandRolePermissionEntry,
+            UpdateBandRolePermissionsPayload,
+            UpdateBandMemberTitlePayload,
             MetricsResponse,
             UserMetrics,
             AdminMetrics,
@@ -168,6 +181,7 @@ use utoipa::{
             BackupFile,
             ImportSummary,
             PdfLocale,
+            LoginResponse,
         )
     ),
     tags(

@@ -17,6 +17,10 @@ pub trait UserRepository: Send + Sync {
     async fn delete(&self, id: Uuid) -> Result<(), ApiError>;
     async fn is_unique(&self, username: &str, exclude_id: Option<Uuid>) -> Result<(), ApiError>;
     async fn exists(&self, user_id: Uuid) -> Result<(), ApiError>;
+    /// Records a successful login (sets `last_login_at` to now) and
+    /// returns whether this was the user's first login ever, i.e.
+    /// `last_login_at` was `NULL` immediately before this call.
+    async fn mark_login(&self, user_id: Uuid) -> Result<bool, ApiError>;
 }
 
 pub struct UserRepositoryImpl {
@@ -226,5 +230,31 @@ impl UserRepository for UserRepositoryImpl {
         } else {
             Ok(())
         }
+    }
+
+    async fn mark_login(&self, user_id: Uuid) -> Result<bool, ApiError> {
+        // Captures the pre-update value of `last_login_at` via the `old`
+        // subquery in FROM (evaluated against the row as it was before
+        // this statement's SET applies), so we get "was this NULL before
+        // now" and the update in a single atomic round trip.
+        let is_first_login: bool = sqlx::query_scalar(
+            r#"
+            UPDATE users u
+            SET last_login_at = $2
+            FROM (SELECT last_login_at FROM users WHERE id = $1) AS old
+            WHERE u.id = $1
+            RETURNING old.last_login_at IS NULL
+            "#,
+        )
+        .bind(user_id)
+        .bind(chrono::Utc::now().naive_utc())
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| {
+            error!("Failed to record login for user {user_id}: {e}");
+            ApiError::DatabaseError(e)
+        })?;
+
+        Ok(is_first_login)
     }
 }

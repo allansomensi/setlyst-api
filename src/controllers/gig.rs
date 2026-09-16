@@ -446,6 +446,7 @@ pub async fn get_public_gig(
 
     Ok(Json(PublicGig {
         venue: gig.venue,
+        location: gig.location,
         scheduled_at: gig.scheduled_at,
         status: gig.status,
         setlist,
