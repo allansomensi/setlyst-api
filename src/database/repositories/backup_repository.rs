@@ -1,8 +1,8 @@
 use crate::{
     errors::api_error::ApiError,
     models::backup::{
-        BACKUP_FORMAT_VERSION, BackupArtist, BackupFile, BackupSetlist, BackupSetlistSong,
-        BackupSong, ImportSummary,
+        BACKUP_FORMAT_VERSION, BackupArtist, BackupFile, BackupGig, BackupSetlist,
+        BackupSetlistSong, BackupSong, ImportSummary,
     },
 };
 use chrono::Utc;
@@ -41,6 +41,16 @@ struct SetlistSongRow {
     setlist_id: Uuid,
     song_id: Uuid,
     position: i32,
+}
+
+#[derive(sqlx::FromRow)]
+struct GigRow {
+    id: Uuid,
+    venue: String,
+    scheduled_at: chrono::NaiveDateTime,
+    setlist_id: Option<Uuid>,
+    status: crate::models::gig::GigStatus,
+    notes: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -98,8 +108,17 @@ impl BackupRepository for BackupRepositoryImpl {
         .bind(user_id)
         .fetch_all(&self.db);
 
-        let (artist_rows, song_rows, setlist_rows) =
-            tokio::try_join!(artists_fut, songs_fut, setlists_fut)?;
+        let gigs_fut = sqlx::query_as::<_, GigRow>(
+            "SELECT id, venue, scheduled_at, setlist_id, status, notes
+             FROM gigs
+             WHERE user_id = $1 AND band_id IS NULL
+             ORDER BY scheduled_at ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.db);
+
+        let (artist_rows, song_rows, setlist_rows, gig_rows) =
+            tokio::try_join!(artists_fut, songs_fut, setlists_fut, gigs_fut)?;
 
         let setlist_ids: Vec<Uuid> = setlist_rows.iter().map(|s| s.id).collect();
 
@@ -160,12 +179,25 @@ impl BackupRepository for BackupRepositoryImpl {
             })
             .collect();
 
+        let gigs = gig_rows
+            .into_iter()
+            .map(|r| BackupGig {
+                id: r.id,
+                venue: r.venue,
+                scheduled_at: r.scheduled_at,
+                setlist_id: r.setlist_id,
+                status: r.status,
+                notes: r.notes,
+            })
+            .collect();
+
         Ok(BackupFile {
             version: BACKUP_FORMAT_VERSION,
             exported_at: Utc::now().naive_utc(),
             artists,
             songs,
             setlists,
+            gigs,
         })
     }
 
@@ -175,6 +207,7 @@ impl BackupRepository for BackupRepositoryImpl {
         let artists_incoming = backup.artists.len();
         let songs_incoming = backup.songs.len();
         let setlists_incoming = backup.setlists.len();
+        let gigs_incoming = backup.gigs.len();
 
         let mut tx = self.db.begin().await?;
 
@@ -214,7 +247,6 @@ impl BackupRepository for BackupRepositoryImpl {
         }
 
         let mut song_id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(songs_incoming);
-
         for song in &backup.songs {
             let resolved_artist_id = match artist_id_map.get(&song.artist_id) {
                 Some(&id) => id,
@@ -269,6 +301,8 @@ impl BackupRepository for BackupRepositoryImpl {
             song_id_map.insert(song.id, resolved_id);
         }
 
+        let mut setlist_id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(setlists_incoming);
+
         for setlist in &backup.setlists {
             let new_setlist_id = Uuid::new_v4();
 
@@ -287,6 +321,8 @@ impl BackupRepository for BackupRepositoryImpl {
                 error!("Failed to insert setlist '{}': {e}", setlist.title);
                 ApiError::DatabaseError(e)
             })?;
+
+            setlist_id_map.insert(setlist.id, new_setlist_id);
 
             for entry in &setlist.songs {
                 let resolved_song_id = match song_id_map.get(&entry.song_id) {
@@ -319,12 +355,43 @@ impl BackupRepository for BackupRepositoryImpl {
             }
         }
 
+        for gig in &backup.gigs {
+            let new_gig_id = Uuid::new_v4();
+            // Unlike songs referenced by a setlist, a dangling setlist
+            // reference on a gig is not fatal to the whole import — the
+            // gig itself still carries useful information (venue, date,
+            // notes) on its own, so we just leave it unlinked.
+            let resolved_setlist_id = gig
+                .setlist_id
+                .and_then(|id| setlist_id_map.get(&id).copied());
+
+            sqlx::query(
+                "INSERT INTO gigs (id, user_id, band_id, setlist_id, venue, scheduled_at, status, notes, created_at, updated_at)
+                 VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8, $8)",
+            )
+            .bind(new_gig_id)
+            .bind(user_id)
+            .bind(resolved_setlist_id)
+            .bind(&gig.venue)
+            .bind(gig.scheduled_at)
+            .bind(gig.status)
+            .bind(&gig.notes)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                error!("Failed to insert gig '{}': {e}", gig.venue);
+                ApiError::DatabaseError(e)
+            })?;
+        }
+
         tx.commit().await?;
 
         Ok(ImportSummary {
             artists_imported: artists_incoming,
             songs_imported: songs_incoming,
             setlists_imported: setlists_incoming,
+            gigs_imported: gigs_incoming,
         })
     }
 }

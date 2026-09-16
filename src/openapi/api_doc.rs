@@ -1,10 +1,13 @@
 use crate::{
-    controllers::{artist, auth, backup, band, metrics, migrations, setlist, song, status, user},
+    controllers::{
+        artist, auth, backup, band, gig, metrics, migrations, setlist, song, status, user,
+    },
     export::pdf::PdfLocale,
     models::{
         artist::Artist,
         backup::{BackupFile, ImportSummary},
         band::{Band, BandInvite, BandMember, BandWithMembership},
+        gig::{Gig, GigStatus, PublicGig},
         metrics::{
             AdminMetrics, ArtistSongCount, GenreCount, MetricsResponse, RoleCount, UserMetrics,
         },
@@ -92,6 +95,16 @@ use utoipa::{
         setlist::get_public_setlist,
         setlist::export_public_setlist_pdf,
 
+        // Gigs
+        gig::find_gig_by_id,
+        gig::find_all_gigs,
+        gig::create_gig,
+        gig::update_gig,
+        gig::delete_gig,
+        gig::enable_gig_sharing,
+        gig::disable_gig_sharing,
+        gig::get_public_gig,
+
         // Bands
         band::find_all_bands,
         band::find_band_by_id,
@@ -107,6 +120,7 @@ use utoipa::{
         band::revoke_band_invite,
         band::accept_band_invite,
         setlist::find_band_setlists,
+        gig::find_band_gigs,
 
         // Metrics
         metrics::get_metrics,
@@ -126,6 +140,9 @@ use utoipa::{
             SongWithArtist,
             Setlist,
             PublicSetlist,
+            Gig,
+            GigStatus,
+            PublicGig,
             Tonality,
             Genre,
             Band,
@@ -151,6 +168,7 @@ use utoipa::{
         (name = "Artists",    description = "Artists endpoints"),
         (name = "Songs",      description = "Songs endpoints"),
         (name = "Setlists",   description = "Setlist endpoints"),
+        (name = "Gigs",       description = "Gig (show) endpoints"),
         (name = "Bands",      description = "Band, membership and invite endpoints"),
         (name = "Metrics",    description = "Metrics endpoints"),
         (name = "Backup",     description = "Backup and restore endpoints"),

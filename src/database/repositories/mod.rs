@@ -3,6 +3,7 @@ pub mod backup_repository;
 pub mod band_invite_repository;
 pub mod band_member_repository;
 pub mod band_repository;
+pub mod gig_repository;
 pub mod metrics_repository;
 pub mod setlist_repository;
 pub mod song_repository;

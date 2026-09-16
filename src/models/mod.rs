@@ -5,6 +5,7 @@ pub mod artist;
 pub mod auth;
 pub mod backup;
 pub mod band;
+pub mod gig;
 pub mod metrics;
 pub mod setlist;
 pub mod song;

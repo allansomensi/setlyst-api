@@ -108,6 +108,7 @@ pub async fn import_backup(
         artists = payload.artists.len(),
         songs = payload.songs.len(),
         setlists = payload.setlists.len(),
+        gigs = payload.gigs.len(),
         "Processing request to import backup"
     );
 
@@ -118,6 +119,7 @@ pub async fn import_backup(
                 artists_imported = summary.artists_imported,
                 songs_imported = summary.songs_imported,
                 setlists_imported = summary.setlists_imported,
+                gigs_imported = summary.gigs_imported,
                 "Backup imported successfully"
             );
             Ok((StatusCode::CREATED, Json(summary)))

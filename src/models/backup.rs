@@ -1,3 +1,4 @@
+use crate::models::gig::GigStatus;
 use crate::models::song::{Genre, Tonality};
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,8 @@ pub struct BackupFile {
     pub artists: Vec<BackupArtist>,
     pub songs: Vec<BackupSong>,
     pub setlists: Vec<BackupSetlist>,
+    #[serde(default)]
+    pub gigs: Vec<BackupGig>,
 }
 
 /// Artist entry inside a backup file.
@@ -54,10 +57,28 @@ pub struct BackupSetlistSong {
     pub position: i32,
 }
 
+/// Gig entry inside a backup file. Only personal (non-band) gigs are ever
+/// included — band data isn't part of a personal backup, same as band
+/// setlists.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BackupGig {
+    pub id: Uuid,
+    pub venue: String,
+    pub scheduled_at: NaiveDateTime,
+    /// References a [`BackupSetlist::id`] in the same file, if any. Left
+    /// unset on import if the referenced setlist can't be resolved,
+    /// rather than aborting the whole import over a missing link.
+    pub setlist_id: Option<Uuid>,
+    pub status: GigStatus,
+    pub notes: Option<String>,
+}
+
 /// Summary returned to the caller after a successful import.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ImportSummary {
     pub artists_imported: usize,
     pub songs_imported: usize,
     pub setlists_imported: usize,
+    #[serde(default)]
+    pub gigs_imported: usize,
 }

@@ -1,5 +1,5 @@
 use crate::{
-    controllers::{band, setlist},
+    controllers::{band, gig, setlist},
     database::AppState,
 };
 use axum::{Router, routing::post};
@@ -35,6 +35,7 @@ pub fn create_routes(state: AppState) -> Router {
             "/{id}/setlists",
             axum::routing::get(setlist::find_band_setlists),
         )
+        .route("/{id}/gigs", axum::routing::get(gig::find_band_gigs))
         .with_state(state)
 }
 

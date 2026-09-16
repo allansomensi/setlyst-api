@@ -47,6 +47,9 @@ pub enum ApiError {
     #[error("You do not have permission to perform this action.")]
     Forbidden,
 
+    #[error("{0}")]
+    BadRequest(String),
+
     #[error("Incorrect password! Try again.")]
     WrongPassword,
 }
@@ -143,6 +146,14 @@ impl IntoResponse for ApiError {
                     details: Some(String::from(
                         "Your current role does not grant access to this resource.",
                     )),
+                },
+            ),
+            ApiError::BadRequest(message) => (
+                StatusCode::BAD_REQUEST,
+                ErrorResponse {
+                    code: String::from("BAD_REQUEST"),
+                    message: message.clone(),
+                    details: None,
                 },
             ),
             ApiError::WrongPassword => (

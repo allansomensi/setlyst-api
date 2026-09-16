@@ -2,6 +2,7 @@ pub mod artist;
 pub mod auth;
 pub mod backup;
 pub mod band;
+pub mod gig;
 pub mod health;
 pub mod metrics;
 pub mod migrations;
@@ -35,6 +36,7 @@ pub fn create_routes(state: AppState) -> Router {
                 .nest("/artists", artist::create_routes(state.clone()))
                 .nest("/songs", song::create_routes(state.clone()))
                 .nest("/setlists", setlist::create_routes(state.clone()))
+                .nest("/gigs", gig::create_routes(state.clone()))
                 .nest("/bands", band::create_routes(state.clone()))
                 .nest("/invites", band::create_invite_routes(state.clone()))
                 .nest("/migrations", migrations::create_routes(state.clone()))
@@ -44,7 +46,11 @@ pub fn create_routes(state: AppState) -> Router {
                 .nest("/auth", auth::create_routes(state.clone()))
                 .nest("/status", status::create_routes(state.clone()))
                 .nest("/health", health::create_routes())
-                .nest("/public/setlists", setlist::create_public_routes(state)),
+                .nest(
+                    "/public/setlists",
+                    setlist::create_public_routes(state.clone()),
+                )
+                .nest("/public/gigs", gig::create_public_routes(state)),
         )
         .merge(swagger::swagger_routes())
         .layer(Config::cors())

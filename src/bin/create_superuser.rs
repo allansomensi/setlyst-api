@@ -8,8 +8,8 @@ use setlyst_api::{
             artist_repository::ArtistRepositoryImpl, backup_repository::BackupRepositoryImpl,
             band_invite_repository::BandInviteRepositoryImpl,
             band_member_repository::BandMemberRepositoryImpl, band_repository::BandRepositoryImpl,
-            metrics_repository::MetricsRepositoryImpl, setlist_repository::SetlistRepositoryImpl,
-            song_repository::SongRepositoryImpl,
+            gig_repository::GigRepositoryImpl, metrics_repository::MetricsRepositoryImpl,
+            setlist_repository::SetlistRepositoryImpl, song_repository::SongRepositoryImpl,
             user_preferences_repository::UserPreferencesRepositoryImpl,
             user_repository::UserRepositoryImpl,
         },
@@ -114,6 +114,7 @@ async fn main() {
     let artist_repo = Arc::new(ArtistRepositoryImpl::new(pool.clone()));
     let song_repo = Arc::new(SongRepositoryImpl::new(pool.clone()));
     let setlist_repo = Arc::new(SetlistRepositoryImpl::new(pool.clone()));
+    let gig_repo = Arc::new(GigRepositoryImpl::new(pool.clone()));
     let metrics_repo = Arc::new(MetricsRepositoryImpl::new(pool.clone()));
     let backup_repo = Arc::new(BackupRepositoryImpl::new(pool.clone()));
     let band_repo = Arc::new(BandRepositoryImpl::new(pool.clone()));
@@ -127,6 +128,7 @@ async fn main() {
         artist_repo,
         song_repo,
         setlist_repo,
+        gig_repo,
         metrics_repo,
         backup_repo,
         band_repo,
