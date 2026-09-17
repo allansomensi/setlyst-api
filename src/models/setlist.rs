@@ -18,6 +18,10 @@ pub struct Setlist {
     /// `None` if public sharing isn't enabled. See [`crate::utils::share_token::generate_share_token`].
     pub share_token: Option<String>,
     pub total_duration: i32,
+    /// Whether the *caller* has favorited this setlist — personal, never
+    /// affects anyone else's view or any permission. `false` on the
+    /// public (unauthenticated) share endpoints, which have no caller.
+    pub is_favorite: bool,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -185,6 +189,7 @@ impl Setlist {
             band_id,
             share_token: None,
             total_duration: 0,
+            is_favorite: false,
             created_at: now,
             updated_at: now,
         }

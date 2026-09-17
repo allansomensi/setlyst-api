@@ -50,6 +50,10 @@ pub struct User {
     pub last_name: Option<String>,
     pub role: Role,
     pub status: Status,
+    /// When the username was last changed — `None` if it has never been
+    /// changed since the account was created. Governs the 90-day cooldown
+    /// between changes; see [`crate::database::repositories::user_repository::UserRepository::update`].
+    pub username_changed_at: Option<NaiveDateTime>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -74,6 +78,7 @@ impl User {
             last_name,
             role: role.unwrap_or_default(),
             status: status.unwrap_or_default(),
+            username_changed_at: None,
             created_at: now,
             updated_at: now,
         }
@@ -89,6 +94,10 @@ pub struct UserPublic {
     pub last_name: Option<String>,
     pub role: Role,
     pub status: Status,
+    /// When the username was last changed — `None` if never changed.
+    /// The frontend uses this to compute the 90-day cooldown and show
+    /// when the user is next allowed to change it again.
+    pub username_changed_at: Option<NaiveDateTime>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -103,6 +112,7 @@ impl From<User> for UserPublic {
             last_name: user.last_name,
             role: user.role,
             status: user.status,
+            username_changed_at: user.username_changed_at,
             created_at: user.created_at,
             updated_at: user.updated_at,
         }
@@ -224,4 +234,65 @@ pub struct ChangePasswordPayload {
 
     #[validate(custom(function = "validate_password"))]
     pub new_password: String,
+}
+
+/// One past username a user has held, kept for admins to trace an
+/// account across a rename. Never exposed to non-admins.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize, ToSchema)]
+pub struct UsernameHistoryEntry {
+    pub old_username: String,
+    pub changed_at: NaiveDateTime,
+}
+
+/// Response for the live username-availability check shown in Settings.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UsernameAvailability {
+    pub available: bool,
+}
+
+/// Another user's profile, as seen by the caller. Regular users see only
+/// the basic public fields; admins additionally see the privileged block.
+/// Built by [`UserPublic::into_profile_view`] — never constructed by hand,
+/// so the redaction rule lives in exactly one place.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UserProfileView {
+    pub id: Uuid,
+    pub username: String,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub created_at: NaiveDateTime,
+    /// Set only when the caller is an admin — `None` for every other viewer.
+    pub admin_details: Option<UserProfileAdminDetails>,
+}
+
+/// Privileged fields shown only to admins viewing someone else's profile.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UserProfileAdminDetails {
+    pub email: Option<String>,
+    pub role: Role,
+    pub status: Status,
+    pub username_changed_at: Option<NaiveDateTime>,
+}
+
+impl UserPublic {
+    /// Builds the profile view of `self` as seen by a caller who is (or
+    /// isn't) an admin. This is the one place that decides which fields a
+    /// non-admin viewer never sees.
+    pub fn into_profile_view(self, viewer_is_admin: bool) -> UserProfileView {
+        let admin_details = viewer_is_admin.then_some(UserProfileAdminDetails {
+            email: self.email,
+            role: self.role,
+            status: self.status,
+            username_changed_at: self.username_changed_at,
+        });
+
+        UserProfileView {
+            id: self.id,
+            username: self.username,
+            first_name: self.first_name,
+            last_name: self.last_name,
+            created_at: self.created_at,
+            admin_details,
+        }
+    }
 }

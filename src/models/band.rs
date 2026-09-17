@@ -72,6 +72,9 @@ pub struct BandWithMembership {
     pub updated_at: NaiveDateTime,
     pub member_count: i64,
     pub my_role: BandRole,
+    /// Whether the *caller* has favorited this band — personal, never
+    /// affects anyone else's view or any permission.
+    pub is_favorite: bool,
 }
 
 impl Band {

@@ -18,6 +18,10 @@ pub fn create_routes(state: AppState) -> Router {
                 .delete(band::delete_band),
         )
         .route("/{id}/transfer-ownership", post(band::transfer_ownership))
+        .route(
+            "/{id}/favorite",
+            axum::routing::post(band::favorite_band).delete(band::unfavorite_band),
+        )
         .route("/{id}/members", axum::routing::get(band::list_band_members))
         .route(
             "/{id}/members/{user_id}",

@@ -4,5 +4,6 @@ use axum::{Router, routing::get};
 pub fn create_routes(state: AppState) -> Router {
     Router::new()
         .route("/", get(metrics::get_metrics))
+        .route("/timeseries", get(metrics::get_timeseries_metrics))
         .with_state(state)
 }

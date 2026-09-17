@@ -22,10 +22,12 @@ pub trait SetlistRepository: Send + Sync {
         size: i64,
     ) -> Result<(Vec<Setlist>, i64), ApiError>;
     /// Lists every setlist that belongs to a band. Callers must check band
-    /// membership themselves before calling this.
+    /// membership themselves before calling this. `user_id` is only used
+    /// to resolve each setlist's `is_favorite` for that caller.
     async fn find_all_for_band(
         &self,
         band_id: Uuid,
+        user_id: Uuid,
         page: i64,
         size: i64,
     ) -> Result<(Vec<Setlist>, i64), ApiError>;
@@ -39,6 +41,11 @@ pub trait SetlistRepository: Send + Sync {
     ) -> Result<Setlist, ApiError>;
     async fn update(&self, id: Uuid, payload: &UpdateSetlistPayload) -> Result<Uuid, ApiError>;
     async fn delete(&self, id: Uuid) -> Result<(), ApiError>;
+    /// Marks a setlist as a favorite for this user. Idempotent — favoriting
+    /// an already-favorited setlist is a no-op, not an error.
+    async fn add_favorite(&self, setlist_id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
+    /// Un-favorites a setlist for this user. Idempotent.
+    async fn remove_favorite(&self, setlist_id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
     async fn is_unique(
         &self,
         title: &str,
@@ -170,10 +177,11 @@ impl SetlistRepository for SetlistRepositoryImpl {
             r#"
             SELECT
                 s.id, s.title, s.description, s.user_id, s.band_id, s.share_token, s.created_at, s.updated_at,
-                setlist_total_duration(s.id) AS total_duration
+                setlist_total_duration(s.id) AS total_duration,
+                EXISTS(SELECT 1 FROM favorite_setlists f WHERE f.setlist_id = s.id AND f.user_id = $1) AS is_favorite
             FROM setlists s
             WHERE s.user_id = $1 AND s.band_id IS NULL
-            ORDER BY s.title ASC
+            ORDER BY is_favorite DESC, s.title ASC
             LIMIT $2 OFFSET $3
             "#,
         )
@@ -189,6 +197,7 @@ impl SetlistRepository for SetlistRepositoryImpl {
     async fn find_all_for_band(
         &self,
         band_id: Uuid,
+        user_id: Uuid,
         page: i64,
         size: i64,
     ) -> Result<(Vec<Setlist>, i64), ApiError> {
@@ -202,16 +211,18 @@ impl SetlistRepository for SetlistRepositoryImpl {
             r#"
             SELECT
                 s.id, s.title, s.description, s.user_id, s.band_id, s.share_token, s.created_at, s.updated_at,
-                setlist_total_duration(s.id) AS total_duration
+                setlist_total_duration(s.id) AS total_duration,
+                EXISTS(SELECT 1 FROM favorite_setlists f WHERE f.setlist_id = s.id AND f.user_id = $4) AS is_favorite
             FROM setlists s
             WHERE s.band_id = $1
-            ORDER BY s.title ASC
+            ORDER BY is_favorite DESC, s.title ASC
             LIMIT $2 OFFSET $3
             "#,
         )
         .bind(band_id)
         .bind(size)
         .bind(offset)
+        .bind(user_id)
         .fetch_all(&self.db);
 
         let (count, setlists) = tokio::try_join!(count, setlists)?;
@@ -223,7 +234,8 @@ impl SetlistRepository for SetlistRepositoryImpl {
             r#"
             SELECT
                 s.id, s.title, s.description, s.user_id, s.band_id, s.share_token, s.created_at, s.updated_at,
-                setlist_total_duration(s.id) AS total_duration
+                setlist_total_duration(s.id) AS total_duration,
+                EXISTS(SELECT 1 FROM favorite_setlists f WHERE f.setlist_id = s.id AND f.user_id = $2) AS is_favorite
             FROM setlists s
             LEFT JOIN band_members bm ON bm.band_id = s.band_id AND bm.user_id = $2
             WHERE s.id = $1 AND (s.user_id = $2 OR bm.user_id IS NOT NULL)
@@ -301,6 +313,28 @@ impl SetlistRepository for SetlistRepositoryImpl {
     async fn delete(&self, id: Uuid) -> Result<(), ApiError> {
         sqlx::query("DELETE FROM setlists WHERE id = $1")
             .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn add_favorite(&self, setlist_id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
+        sqlx::query(
+            "INSERT INTO favorite_setlists (user_id, setlist_id, created_at) VALUES ($1, $2, $3)
+             ON CONFLICT (user_id, setlist_id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(setlist_id)
+        .bind(chrono::Utc::now().naive_utc())
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn remove_favorite(&self, setlist_id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
+        sqlx::query("DELETE FROM favorite_setlists WHERE user_id = $1 AND setlist_id = $2")
+            .bind(user_id)
+            .bind(setlist_id)
             .execute(&self.db)
             .await?;
         Ok(())
@@ -502,7 +536,8 @@ impl SetlistRepository for SetlistRepositoryImpl {
             r#"
             SELECT
                 s.id, s.title, s.description, s.user_id, s.band_id, s.share_token, s.created_at, s.updated_at,
-                setlist_total_duration(s.id) AS total_duration
+                setlist_total_duration(s.id) AS total_duration,
+                false AS is_favorite
             FROM setlists s
             WHERE s.share_token = $1
             "#,

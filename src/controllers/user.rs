@@ -6,7 +6,8 @@ use crate::{
         auth::access::AccessControl,
         user::{
             ChangePasswordPayload, CreateUserPayload, Role, UpdateCurrentUserPayload,
-            UpdateUserPayload, User, UserPublic,
+            UpdateUserPayload, User, UserProfileView, UserPublic, UsernameAvailability,
+            UsernameHistoryEntry,
         },
         user_preferences::{UpdatePreferencesPayload, UserPreferences},
     },
@@ -18,9 +19,13 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header::LOCATION},
     response::IntoResponse,
 };
+use chrono::{Duration, Utc};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 use validator::Validate;
+
+/// How long a user must wait before changing their username again.
+const USERNAME_CHANGE_COOLDOWN_DAYS: i64 = 90;
 
 /// The languages the frontend actually ships (see `i18n/routing.ts`).
 const SUPPORTED_LANGUAGES: [&str; 3] = ["en", "pt-BR", "es"];
@@ -170,6 +175,96 @@ pub async fn find_user_by_id(
             Err(e)
         }
     }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/users/{id}/profile",
+    tags = ["Users"],
+    summary = "View another user's profile.",
+    description = "Any authenticated user can view any other user's basic profile (username, name, join date). Admins additionally see privileged details (email, role, status, last username change).",
+    security(
+        (),
+        ("jwt_token" = [])
+    ),
+    params(
+        ("id" = Uuid, Path, description = "User UUID")
+    ),
+    responses(
+        (status = 200, description = "Profile retrieved successfully.", body = UserProfileView),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "User not found")
+    )
+)]
+pub async fn get_user_profile(
+    Path(id): Path<Uuid>,
+    State(state): State<AppState>,
+    access: AccessControl,
+) -> Result<impl IntoResponse, ApiError> {
+    let requester_id = access.user_id();
+    let viewer_is_admin = access.0.role == Role::Admin;
+
+    debug!(
+        %requester_id,
+        target_user_id = %id,
+        "Processing request to view user profile"
+    );
+
+    let user = state
+        .user_repo
+        .find_by_id(id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    info!(%requester_id, target_user_id = %id, "User profile retrieved successfully");
+    Ok(Json(user.into_profile_view(viewer_is_admin)))
+}
+
+#[utoipa::path(
+get,
+path = "/api/v1/users/{id}/username-history",
+    tags = ["Users"],
+    summary = "Get a user's past usernames",
+    description = "Returns every username this user has previously held, oldest first. Requires Admin role.",
+    security(
+        (),
+        ("jwt_token" = [])
+    ),
+    params(
+        ("id" = Uuid, Path, description = "User UUID")
+    ),
+    responses(
+        (status = 200, description = "Username history retrieved successfully.", body = [UsernameHistoryEntry]),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - Admin role required"),
+        (status = 404, description = "User not found")
+    )
+)]
+pub async fn get_username_history(
+    Path(id): Path<Uuid>,
+    State(state): State<AppState>,
+    access: AccessControl,
+) -> Result<impl IntoResponse, ApiError> {
+    let requester_id = access.user_id();
+
+    debug!(
+        %requester_id,
+        target_user_id = %id,
+        "Processing request to retrieve username history"
+    );
+
+    access.require_any_role(&[Role::Admin])?;
+    state.user_repo.exists(id).await?;
+
+    let history = state.user_repo.get_username_history(id).await?;
+
+    info!(
+        %requester_id,
+        target_user_id = %id,
+        "Username history retrieved successfully"
+    );
+
+    Ok(Json(history))
 }
 
 #[utoipa::path(
@@ -438,6 +533,38 @@ pub async fn update_current_user(
 
     payload.validate()?;
 
+    if let Some(new_username) = &payload.username {
+        state
+            .user_repo
+            .is_unique(new_username, Some(user_id))
+            .await?;
+
+        // Only a byte-for-byte identical resubmission is a no-op; even a
+        // case-only change (e.g. "augusto" -> "Augusto") is treated as a
+        // real rename here — it still updates the displayed name, so it
+        // consumes the cooldown and gets recorded in history like any
+        // other change. Uniqueness above is checked case-insensitively,
+        // but that's a separate concern (is the name available at all).
+        let current = state
+            .user_repo
+            .find_by_id(user_id)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+
+        if new_username != &current.username
+            && let Some(changed_at) = current.username_changed_at
+        {
+            let eligible_at = changed_at + Duration::days(USERNAME_CHANGE_COOLDOWN_DAYS);
+            let now = Utc::now().naive_utc();
+            if now < eligible_at {
+                return Err(ApiError::BadRequest(format!(
+                    "You can change your username again on {}.",
+                    eligible_at.format("%Y-%m-%d")
+                )));
+            }
+        }
+    }
+
     let payload = UpdateUserPayload::from(payload);
 
     state.user_repo.update(user_id, &payload).await?;
@@ -448,6 +575,49 @@ pub async fn update_current_user(
     );
 
     Ok((StatusCode::OK, Json("Profile updated successfully")))
+}
+
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct UsernameAvailabilityQuery {
+    pub username: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/users/me/username-availability",
+    tags = ["Users"],
+    summary = "Check whether a username is available",
+    description = "Case-insensitive live check for the Settings page's username field. The caller's own current username always reports as available.",
+    params(UsernameAvailabilityQuery),
+    security(
+        (),
+        ("jwt_token" = [])
+    ),
+    responses(
+        (status = 200, description = "Availability checked successfully.", body = UsernameAvailability),
+        (status = 401, description = "Unauthorized")
+    )
+)]
+pub async fn check_username_availability(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Query(query): Query<UsernameAvailabilityQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
+    debug!(
+        %user_id,
+        username = %query.username,
+        "Processing request to check username availability"
+    );
+
+    let available = state
+        .user_repo
+        .is_username_available(&query.username, Some(user_id))
+        .await?;
+
+    Ok(Json(UsernameAvailability { available }))
 }
 
 #[utoipa::path(

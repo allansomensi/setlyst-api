@@ -13,6 +13,10 @@ pub fn create_routes(state: AppState) -> Router {
         )
         .route("/me/password", patch(user::change_current_user_password))
         .route(
+            "/me/username-availability",
+            get(user::check_username_availability),
+        )
+        .route(
             "/me/preferences",
             get(user::get_current_user_preferences).patch(user::update_current_user_preferences),
         )
@@ -22,6 +26,8 @@ pub fn create_routes(state: AppState) -> Router {
                 .patch(user::update_user)
                 .delete(user::delete_user),
         )
+        .route("/{id}/username-history", get(user::get_username_history))
+        .route("/{id}/profile", get(user::get_user_profile))
         .route("/{id}/preferences", get(user::get_user_preferences_by_id))
         .with_state(state)
 }

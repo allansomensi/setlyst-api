@@ -1,6 +1,6 @@
 use crate::{
     errors::api_error::ApiError,
-    models::user::{CreateUserPayload, UpdateUserPayload, User, UserPublic},
+    models::user::{CreateUserPayload, UpdateUserPayload, User, UserPublic, UsernameHistoryEntry},
     utils::hashing::encrypt_password,
 };
 use sqlx::PgPool;
@@ -16,11 +16,26 @@ pub trait UserRepository: Send + Sync {
     async fn update(&self, id: Uuid, payload: &UpdateUserPayload) -> Result<Uuid, ApiError>;
     async fn delete(&self, id: Uuid) -> Result<(), ApiError>;
     async fn is_unique(&self, username: &str, exclude_id: Option<Uuid>) -> Result<(), ApiError>;
+    /// `true` if `username` is free to take (case-insensitively), `false`
+    /// if it's already in use by someone other than `exclude_id`. Same
+    /// check as [`Self::is_unique`], as a plain boolean for the live
+    /// availability indicator in Settings rather than an error to bubble up.
+    async fn is_username_available(
+        &self,
+        username: &str,
+        exclude_id: Option<Uuid>,
+    ) -> Result<bool, ApiError>;
     async fn exists(&self, user_id: Uuid) -> Result<(), ApiError>;
     /// Records a successful login (sets `last_login_at` to now) and
     /// returns whether this was the user's first login ever, i.e.
     /// `last_login_at` was `NULL` immediately before this call.
     async fn mark_login(&self, user_id: Uuid) -> Result<bool, ApiError>;
+    /// Every past username this user has held, oldest first — visible to
+    /// platform admins only.
+    async fn get_username_history(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<UsernameHistoryEntry>, ApiError>;
 }
 
 pub struct UserRepositoryImpl {
@@ -39,7 +54,7 @@ impl UserRepository for UserRepositoryImpl {
         let offset = (page - 1) * size;
         let count = sqlx::query_scalar("SELECT COUNT(*) FROM users;").fetch_one(&self.db);
         let users = sqlx::query_as::<_, UserPublic>(
-            r#"SELECT id, username, email, first_name, last_name, role, status, created_at, updated_at
+            r#"SELECT id, username, email, first_name, last_name, role, status, username_changed_at, created_at, updated_at
             FROM users ORDER BY username ASC LIMIT $1 OFFSET $2"#,
         )
         .bind(size)
@@ -52,7 +67,7 @@ impl UserRepository for UserRepositoryImpl {
 
     async fn find_by_id(&self, id: Uuid) -> Result<Option<UserPublic>, ApiError> {
         let user = sqlx::query_as::<_, UserPublic>(
-            r#"SELECT id, username, email, first_name, last_name, role, status, created_at, updated_at
+            r#"SELECT id, username, email, first_name, last_name, role, status, username_changed_at, created_at, updated_at
             FROM users WHERE id = $1"#,
         )
         .bind(id)
@@ -62,8 +77,9 @@ impl UserRepository for UserRepositoryImpl {
     }
 
     async fn find_by_username(&self, username: &str) -> Result<Option<User>, ApiError> {
+        // Case-insensitive: "Augusto" and "augusto" are the same account.
         let user = sqlx::query_as::<_, User>(
-        "SELECT id, username, email, password_hash, first_name, last_name, role, status, created_at, updated_at FROM users WHERE username = $1",
+        "SELECT id, username, email, password_hash, first_name, last_name, role, status, username_changed_at, created_at, updated_at FROM users WHERE LOWER(username) = LOWER($1)",
     )
     .bind(username)
     .fetch_optional(&self.db)
@@ -108,11 +124,44 @@ impl UserRepository for UserRepositoryImpl {
         let mut updated = false;
 
         if let Some(username) = &payload.username {
-            sqlx::query("UPDATE users SET username = $1 WHERE id = $2;")
-                .bind(username)
+            // Capture the pre-update username via the `old` subquery in
+            // FROM (evaluated against the row as it stood before this
+            // statement's SET applies) so the history row and the change
+            // itself land in one atomic round trip. Skip recording history
+            // (and bumping the cooldown) when the new value is byte-for-byte
+            // identical to the old one — not a real change.
+            let previous_username: Option<String> = sqlx::query_scalar(
+                r#"
+                UPDATE users u
+                SET username = $2
+                FROM (SELECT username FROM users WHERE id = $1) AS old
+                WHERE u.id = $1 AND old.username IS DISTINCT FROM $2
+                RETURNING old.username
+                "#,
+            )
+            .bind(id)
+            .bind(username)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            if let Some(previous_username) = previous_username {
+                sqlx::query(
+                    "INSERT INTO username_history (id, user_id, old_username, changed_at) VALUES ($1, $2, $3, $4)",
+                )
+                .bind(Uuid::new_v4())
                 .bind(id)
+                .bind(&previous_username)
+                .bind(chrono::Utc::now().naive_utc())
                 .execute(&mut *tx)
                 .await?;
+
+                sqlx::query("UPDATE users SET username_changed_at = $1 WHERE id = $2")
+                    .bind(chrono::Utc::now().naive_utc())
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+
             updated = true;
         }
 
@@ -195,14 +244,17 @@ impl UserRepository for UserRepositoryImpl {
     }
 
     async fn is_unique(&self, username: &str, exclude_id: Option<Uuid>) -> Result<(), ApiError> {
+        // Case-insensitive: "Augusto" and "augusto" count as the same name.
         let exists = match exclude_id {
-            Some(id) => sqlx::query("SELECT id FROM users WHERE username = $1 AND id != $2;")
-                .bind(username)
-                .bind(id)
-                .fetch_optional(&self.db)
-                .await?
-                .is_some(),
-            None => sqlx::query("SELECT id FROM users WHERE username = $1;")
+            Some(id) => {
+                sqlx::query("SELECT id FROM users WHERE LOWER(username) = LOWER($1) AND id != $2;")
+                    .bind(username)
+                    .bind(id)
+                    .fetch_optional(&self.db)
+                    .await?
+                    .is_some()
+            }
+            None => sqlx::query("SELECT id FROM users WHERE LOWER(username) = LOWER($1);")
                 .bind(username)
                 .fetch_optional(&self.db)
                 .await?
@@ -214,6 +266,18 @@ impl UserRepository for UserRepositoryImpl {
             Err(ApiError::AlreadyExists)
         } else {
             Ok(())
+        }
+    }
+
+    async fn is_username_available(
+        &self,
+        username: &str,
+        exclude_id: Option<Uuid>,
+    ) -> Result<bool, ApiError> {
+        match self.is_unique(username, exclude_id).await {
+            Ok(()) => Ok(true),
+            Err(ApiError::AlreadyExists) => Ok(false),
+            Err(e) => Err(e),
         }
     }
 
@@ -256,5 +320,21 @@ impl UserRepository for UserRepositoryImpl {
         })?;
 
         Ok(is_first_login)
+    }
+
+    async fn get_username_history(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<UsernameHistoryEntry>, ApiError> {
+        let history = sqlx::query_as::<_, UsernameHistoryEntry>(
+            "SELECT old_username, changed_at FROM username_history
+             WHERE user_id = $1
+             ORDER BY changed_at ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.db)
+        .await?;
+
+        Ok(history)
     }
 }

@@ -19,6 +19,10 @@ pub fn create_routes(state: AppState) -> Router {
                 .delete(setlist::disable_setlist_sharing),
         )
         .route(
+            "/{id}/favorite",
+            axum::routing::post(setlist::favorite_setlist).delete(setlist::unfavorite_setlist),
+        )
+        .route(
             "/",
             get(setlist::find_all_setlists).post(setlist::create_setlist),
         )

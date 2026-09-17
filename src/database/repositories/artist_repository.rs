@@ -35,12 +35,15 @@ pub trait ArtistRepository: Send + Sync {
     /// or creates one. Used when forking a song into a band — see
     /// [`crate::models::song::Song::fork_for_band`] — so every member's
     /// contribution of, say, "The Beatles" resolves to the same band artist
-    /// instead of piling up duplicates.
+    /// instead of piling up duplicates. `source_artist_id`, when given, is
+    /// recorded as `forked_from` on a newly created band artist, so
+    /// platform-wide metrics can tell it apart from genuinely new content.
     async fn find_or_create_for_band(
         &self,
         band_id: Uuid,
         name: &str,
         creator_id: Uuid,
+        source_artist_id: Option<Uuid>,
     ) -> Result<Artist, ApiError>;
 }
 
@@ -71,7 +74,7 @@ impl ArtistRepository for ArtistRepositoryImpl {
         .fetch_one(&self.db);
 
         let artists = sqlx::query_as::<_, Artist>(
-            "SELECT id, name, user_id, band_id, created_at, updated_at FROM artists
+            "SELECT id, name, user_id, band_id, forked_from, created_at, updated_at FROM artists
              WHERE user_id = $1 AND band_id IS NULL
              ORDER BY name ASC LIMIT $2 OFFSET $3",
         )
@@ -87,7 +90,7 @@ impl ArtistRepository for ArtistRepositoryImpl {
 
     async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Artist>, ApiError> {
         let artist = sqlx::query_as::<_, Artist>(
-            "SELECT id, name, user_id, band_id, created_at, updated_at FROM artists WHERE id = $1 AND user_id = $2",
+            "SELECT id, name, user_id, band_id, forked_from, created_at, updated_at FROM artists WHERE id = $1 AND user_id = $2",
         )
         .bind(id)
         .bind(user_id)
@@ -103,12 +106,13 @@ impl ArtistRepository for ArtistRepositoryImpl {
     ) -> Result<Artist, ApiError> {
         let new_artist = Artist::new(&payload.name, user_id);
         sqlx::query(
-            "INSERT INTO artists (id, name, user_id, band_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO artists (id, name, user_id, band_id, forked_from, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(new_artist.id)
         .bind(&new_artist.name)
         .bind(new_artist.user_id)
         .bind(new_artist.band_id)
+        .bind(new_artist.forked_from)
         .bind(new_artist.created_at)
         .bind(new_artist.updated_at)
         .execute(&self.db)
@@ -205,9 +209,10 @@ impl ArtistRepository for ArtistRepositoryImpl {
         band_id: Uuid,
         name: &str,
         creator_id: Uuid,
+        source_artist_id: Option<Uuid>,
     ) -> Result<Artist, ApiError> {
         if let Some(existing) = sqlx::query_as::<_, Artist>(
-            "SELECT id, name, user_id, band_id, created_at, updated_at FROM artists
+            "SELECT id, name, user_id, band_id, forked_from, created_at, updated_at FROM artists
              WHERE band_id = $1 AND LOWER(name) = LOWER($2)",
         )
         .bind(band_id)
@@ -218,14 +223,15 @@ impl ArtistRepository for ArtistRepositoryImpl {
             return Ok(existing);
         }
 
-        let new_artist = Artist::new_for_band(name, band_id, creator_id);
+        let new_artist = Artist::new_for_band(name, band_id, creator_id, source_artist_id);
         sqlx::query(
-            "INSERT INTO artists (id, name, user_id, band_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO artists (id, name, user_id, band_id, forked_from, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(new_artist.id)
         .bind(&new_artist.name)
         .bind(new_artist.user_id)
         .bind(new_artist.band_id)
+        .bind(new_artist.forked_from)
         .bind(new_artist.created_at)
         .bind(new_artist.updated_at)
         .execute(&self.db)

@@ -442,7 +442,12 @@ pub async fn add_song_to_setlist(
             } else {
                 let band_artist = state
                     .artist_repo
-                    .find_or_create_for_band(band_id, &source.artist_name, user_id)
+                    .find_or_create_for_band(
+                        band_id,
+                        &source.artist_name,
+                        user_id,
+                        Some(source.artist_id),
+                    )
                     .await?;
 
                 let forked = state
@@ -1034,7 +1039,7 @@ pub async fn find_band_setlists(
 
     let (setlists, total_items) = state
         .setlist_repo
-        .find_all_for_band(band_id, current_page, per_page)
+        .find_all_for_band(band_id, user_id, current_page, per_page)
         .await?;
 
     let total_pages = (total_items as f64 / per_page as f64).ceil() as i64;
@@ -1050,6 +1055,64 @@ pub async fn find_band_setlists(
             total_pages,
         },
     }))
+}
+
+// ---------------------------------------------------------------------
+// Favorites
+// ---------------------------------------------------------------------
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/setlists/{id}/favorite",
+    tags = ["Setlists"],
+    summary = "Favorite a setlist.",
+    description = "Purely personal to the caller — never affects anyone else's view of the setlist, and grants no permission. Idempotent. Requires the caller be able to view the setlist (its own, or any band setlist they're a member of).",
+    params(("id" = Uuid, Path, description = "The ID of the setlist")),
+    security((), ("jwt_token" = [])),
+    responses(
+        (status = 204, description = "Favorited successfully."),
+        (status = 404, description = "Setlist not found.")
+    )
+)]
+pub async fn favorite_setlist(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+    debug!(%user_id, setlist_id = %id, "Processing request to favorite setlist");
+
+    state.setlist_repo.exists(id, user_id).await?;
+    state.setlist_repo.add_favorite(id, user_id).await?;
+
+    info!(%user_id, setlist_id = %id, "Setlist favorited successfully");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/setlists/{id}/favorite",
+    tags = ["Setlists"],
+    summary = "Un-favorite a setlist.",
+    description = "Idempotent — un-favoriting a setlist that isn't favorited is not an error.",
+    params(("id" = Uuid, Path, description = "The ID of the setlist")),
+    security((), ("jwt_token" = [])),
+    responses(
+        (status = 204, description = "Un-favorited successfully.")
+    )
+)]
+pub async fn unfavorite_setlist(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+    debug!(%user_id, setlist_id = %id, "Processing request to unfavorite setlist");
+
+    state.setlist_repo.remove_favorite(id, user_id).await?;
+
+    info!(%user_id, setlist_id = %id, "Setlist unfavorited successfully");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------------

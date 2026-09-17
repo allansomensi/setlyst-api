@@ -27,6 +27,10 @@ pub trait BandRepository: Send + Sync {
 
     async fn update(&self, id: Uuid, payload: &UpdateBandPayload) -> Result<Uuid, ApiError>;
     async fn delete(&self, id: Uuid) -> Result<(), ApiError>;
+    /// Marks a band as a favorite for this user. Idempotent.
+    async fn add_favorite(&self, band_id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
+    /// Un-favorites a band for this user. Idempotent.
+    async fn remove_favorite(&self, band_id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
 
     /// Returns the caller's role in a band, or `None` if they are not a member.
     async fn role_of(&self, band_id: Uuid, user_id: Uuid) -> Result<Option<BandRole>, ApiError>;
@@ -112,11 +116,12 @@ impl BandRepository for BandRepositoryImpl {
                 b.id, b.name, b.slug, b.description, b.logo_url, b.members_can_manage_setlists,
                 b.created_by, b.created_at, b.updated_at,
                 (SELECT COUNT(*) FROM band_members bm2 WHERE bm2.band_id = b.id) AS member_count,
-                bm.role AS my_role
+                bm.role AS my_role,
+                EXISTS(SELECT 1 FROM favorite_bands f WHERE f.band_id = b.id AND f.user_id = $1) AS is_favorite
             FROM bands b
             INNER JOIN band_members bm ON bm.band_id = b.id
             WHERE bm.user_id = $1
-            ORDER BY b.name ASC;
+            ORDER BY is_favorite DESC, b.name ASC;
             "#,
         )
         .bind(user_id)
@@ -137,7 +142,8 @@ impl BandRepository for BandRepositoryImpl {
                 b.id, b.name, b.slug, b.description, b.logo_url, b.members_can_manage_setlists,
                 b.created_by, b.created_at, b.updated_at,
                 (SELECT COUNT(*) FROM band_members bm2 WHERE bm2.band_id = b.id) AS member_count,
-                bm.role AS my_role
+                bm.role AS my_role,
+                EXISTS(SELECT 1 FROM favorite_bands f WHERE f.band_id = b.id AND f.user_id = $2) AS is_favorite
             FROM bands b
             INNER JOIN band_members bm ON bm.band_id = b.id
             WHERE b.id = $1 AND bm.user_id = $2;
@@ -271,6 +277,28 @@ impl BandRepository for BandRepositoryImpl {
     async fn delete(&self, id: Uuid) -> Result<(), ApiError> {
         sqlx::query("DELETE FROM bands WHERE id = $1")
             .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn add_favorite(&self, band_id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
+        sqlx::query(
+            "INSERT INTO favorite_bands (user_id, band_id, created_at) VALUES ($1, $2, $3)
+             ON CONFLICT (user_id, band_id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(band_id)
+        .bind(chrono::Utc::now().naive_utc())
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn remove_favorite(&self, band_id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
+        sqlx::query("DELETE FROM favorite_bands WHERE user_id = $1 AND band_id = $2")
+            .bind(user_id)
+            .bind(band_id)
             .execute(&self.db)
             .await?;
         Ok(())

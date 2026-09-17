@@ -180,6 +180,63 @@ pub async fn delete_band(
 
 #[utoipa::path(
     post,
+    path = "/api/v1/bands/{id}/favorite",
+    tags = ["Bands"],
+    summary = "Favorite a band.",
+    description = "Purely personal to the caller — never affects anyone else's view of the band, and grants no permission. Idempotent. The caller must be a member of the band.",
+    params(("id" = Uuid, Path, description = "The ID of the band")),
+    security((), ("jwt_token" = [])),
+    responses(
+        (status = 204, description = "Favorited successfully."),
+        (status = 404, description = "Band not found, or the caller is not a member.")
+    )
+)]
+pub async fn favorite_band(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+    debug!(%user_id, band_id = %id, "Processing request to favorite band");
+
+    state
+        .band_repo
+        .require_role(id, user_id, BandRole::Member)
+        .await?;
+    state.band_repo.add_favorite(id, user_id).await?;
+
+    info!(%user_id, band_id = %id, "Band favorited successfully");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/bands/{id}/favorite",
+    tags = ["Bands"],
+    summary = "Un-favorite a band.",
+    description = "Idempotent — un-favoriting a band that isn't favorited is not an error.",
+    params(("id" = Uuid, Path, description = "The ID of the band")),
+    security((), ("jwt_token" = [])),
+    responses(
+        (status = 204, description = "Un-favorited successfully.")
+    )
+)]
+pub async fn unfavorite_band(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+    debug!(%user_id, band_id = %id, "Processing request to unfavorite band");
+
+    state.band_repo.remove_favorite(id, user_id).await?;
+
+    info!(%user_id, band_id = %id, "Band unfavorited successfully");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post,
     path = "/api/v1/bands/{id}/transfer-ownership",
     tags = ["Bands"],
     summary = "Transfer band ownership to another member.",

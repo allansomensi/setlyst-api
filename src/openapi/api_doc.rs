@@ -14,12 +14,13 @@ use crate::{
         },
         gig::{Gig, GigStatus, PublicGig},
         metrics::{
-            AdminMetrics, ArtistSongCount, GenreCount, MetricsResponse, RoleCount, UserMetrics,
+            AdminMetrics, AdminTimeseries, ArtistSongCount, GenreCount, MetricsResponse, RoleCount,
+            TimeseriesPoint, TimeseriesResponse, UserMetrics, UserTimeseries,
         },
         setlist::{PublicSetlist, Setlist, SetlistItem, SetlistMarker},
         song::{Genre, Song, SongWithArtist, Tonality},
         status::Status,
-        user::{ChangePasswordPayload, User},
+        user::{ChangePasswordPayload, User, UsernameAvailability, UsernameHistoryEntry},
         user_preferences::UserPreferences,
     },
 };
@@ -65,6 +66,9 @@ use utoipa::{
         user::get_current_user,
         user::update_current_user,
         user::change_current_user_password,
+        user::check_username_availability,
+        user::get_username_history,
+        user::get_user_profile,
         user::get_current_user_preferences,
         user::update_current_user_preferences,
         user::get_user_preferences_by_id,
@@ -105,6 +109,8 @@ use utoipa::{
         setlist::export_setlist_pdf,
         setlist::enable_setlist_sharing,
         setlist::disable_setlist_sharing,
+        setlist::favorite_setlist,
+        setlist::unfavorite_setlist,
         setlist::get_public_setlist,
         setlist::export_public_setlist_pdf,
 
@@ -124,6 +130,8 @@ use utoipa::{
         band::create_band,
         band::update_band,
         band::delete_band,
+        band::favorite_band,
+        band::unfavorite_band,
         band::transfer_ownership,
         band::list_band_members,
         band::update_band_member_role,
@@ -140,6 +148,7 @@ use utoipa::{
 
         // Metrics
         metrics::get_metrics,
+        metrics::get_timeseries_metrics,
 
         // Backup
         backup::export_backup,
@@ -149,6 +158,8 @@ use utoipa::{
         schemas(
             Status,
             User,
+            UsernameAvailability,
+            UsernameHistoryEntry,
             ChangePasswordPayload,
             UserPreferences,
             Artist,
@@ -175,6 +186,10 @@ use utoipa::{
             MetricsResponse,
             UserMetrics,
             AdminMetrics,
+            TimeseriesResponse,
+            UserTimeseries,
+            AdminTimeseries,
+            TimeseriesPoint,
             GenreCount,
             ArtistSongCount,
             RoleCount,
