@@ -10,6 +10,9 @@ CREATE TABLE gigs (
     -- erase the gig's own history, so this only detaches it.
     setlist_id UUID REFERENCES setlists(id) ON DELETE SET NULL,
     venue VARCHAR(255) NOT NULL,
+    -- Free-text location (address, city, or a maps link) — independent of
+    -- `venue`, which is just the venue's name (e.g. "Bar do Zé").
+    location TEXT,
     scheduled_at TIMESTAMP NOT NULL,
     status gig_status NOT NULL DEFAULT 'confirmed',
     notes TEXT,

@@ -1,6 +1,6 @@
 -- Declared low-to-high on purpose: Postgres sorts enum values by their
--- declaration order, and the member listing below relies on
--- `ORDER BY role DESC` to show the band's owner first.
+-- declaration order, and the member listing relies on `ORDER BY role DESC`
+-- to show the band's owner first.
 CREATE TYPE band_role AS ENUM ('member', 'moderator', 'admin', 'owner');
 
 CREATE TABLE bands (
@@ -20,6 +20,9 @@ CREATE TABLE band_members (
     band_id UUID NOT NULL REFERENCES bands(id) ON DELETE CASCADE,
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     role band_role NOT NULL DEFAULT 'member',
+    -- Free-text identification label (e.g. "Guitarrista", "Baixista") —
+    -- purely cosmetic, unrelated to `role` and never affects permissions.
+    title VARCHAR(50),
     joined_at TIMESTAMP NOT NULL,
     UNIQUE (band_id, user_id)
 );
@@ -41,3 +44,26 @@ CREATE INDEX idx_band_members_band_id ON band_members(band_id);
 CREATE INDEX idx_band_members_user_id ON band_members(user_id);
 CREATE INDEX idx_band_invites_band_id ON band_invites(band_id);
 CREATE INDEX idx_band_invites_code ON band_invites(code);
+
+-- Granular per-role permissions. `admin` and `owner` always have every
+-- permission and are intentionally absent from this table — only
+-- `member` and `moderator` rows are meaningful. Default rows are seeded
+-- by the application at band-creation time — see BandRepository::create.
+CREATE TYPE band_permission AS ENUM (
+    'manage_setlists',
+    'manage_songs',
+    'export_pdf'
+);
+
+CREATE TABLE band_role_permissions (
+    band_id UUID NOT NULL REFERENCES bands(id) ON DELETE CASCADE,
+    role band_role NOT NULL,
+    permission band_permission NOT NULL,
+    allowed BOOLEAN NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (band_id, role, permission),
+    -- Only member/moderator rows are meaningful — admin/owner are never
+    -- restricted, so storing rows for them would be misleading.
+    CONSTRAINT band_role_permissions_role_check CHECK (role IN ('member', 'moderator'))
+);
+
+CREATE INDEX idx_band_role_permissions_band_id ON band_role_permissions(band_id);

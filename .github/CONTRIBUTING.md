@@ -159,7 +159,7 @@ Migrations live in `src/database/migrations/` and are numbered sequentially:
 
 ```
 0001_add_users_table.sql
-0002_add_artists_table.sql
+0002_add_user_preferences.sql
 ...
 ```
 
