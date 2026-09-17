@@ -5,9 +5,9 @@ use repositories::{
     artist_repository::ArtistRepository, backup_repository::BackupRepository,
     band_invite_repository::BandInviteRepository, band_member_repository::BandMemberRepository,
     band_repository::BandRepository, gig_repository::GigRepository,
-    metrics_repository::MetricsRepository, setlist_repository::SetlistRepository,
-    song_repository::SongRepository, user_preferences_repository::UserPreferencesRepository,
-    user_repository::UserRepository,
+    metrics_repository::MetricsRepository, notification_repository::NotificationRepository,
+    setlist_repository::SetlistRepository, song_repository::SongRepository,
+    user_preferences_repository::UserPreferencesRepository, user_repository::UserRepository,
 };
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -26,4 +26,5 @@ pub struct AppState {
     pub band_repo: Arc<dyn BandRepository>,
     pub band_member_repo: Arc<dyn BandMemberRepository>,
     pub band_invite_repo: Arc<dyn BandInviteRepository>,
+    pub notification_repo: Arc<dyn NotificationRepository>,
 }

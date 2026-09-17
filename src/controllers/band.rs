@@ -8,6 +8,7 @@ use crate::{
             UpdateBandMemberRolePayload, UpdateBandMemberTitlePayload, UpdateBandPayload,
             UpdateBandRolePermissionsPayload,
         },
+        notification::Notification,
     },
 };
 use axum::{
@@ -372,6 +373,20 @@ pub async fn update_band_member_role(
         .update_role(band_id, target_user_id, payload.role)
         .await?;
 
+    if let Some(band) = state.band_repo.find_by_id(band_id, user_id).await? {
+        let notification = Notification::band_role_changed(
+            target_user_id,
+            band_id,
+            &band.name,
+            target_role,
+            payload.role,
+            user_id,
+        );
+        if let Err(e) = state.notification_repo.create(&notification).await {
+            error!(%band_id, %target_user_id, error = %e, "Failed to create band role change notification");
+        }
+    }
+
     info!(%user_id, %band_id, %target_user_id, new_role = %payload.role, "Band member role updated successfully");
     Ok(Json("Member role updated successfully"))
 }
@@ -486,6 +501,18 @@ pub async fn remove_band_member(
         .band_member_repo
         .remove(band_id, target_user_id)
         .await?;
+
+    // Only notify when someone else removed the member — voluntarily
+    // leaving a band is not a notification-worthy event for the leaver.
+    if target_user_id != user_id
+        && let Some(band) = state.band_repo.find_by_id(band_id, user_id).await?
+    {
+        let notification =
+            Notification::band_member_removed(target_user_id, band_id, &band.name, user_id);
+        if let Err(e) = state.notification_repo.create(&notification).await {
+            error!(%band_id, %target_user_id, error = %e, "Failed to create band member removed notification");
+        }
+    }
 
     info!(%user_id, %band_id, %target_user_id, "Band member removed successfully");
     Ok(StatusCode::NO_CONTENT)

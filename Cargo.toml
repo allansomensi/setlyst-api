@@ -47,6 +47,7 @@ uuid = { version = "1.23", features = ["serde", "v4", "v7"] }
 validator = { version = "0.21", features = ["derive"] }
 tower_governor = { version = "0.8", features = ["tracing"] }
 genpdf = "0.2.0"
+serde_json = "1.0.151"
 
 [dev-dependencies.cargo-husky]
 version = "1.5"

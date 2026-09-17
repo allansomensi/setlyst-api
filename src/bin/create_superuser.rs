@@ -9,6 +9,7 @@ use setlyst_api::{
             band_invite_repository::BandInviteRepositoryImpl,
             band_member_repository::BandMemberRepositoryImpl, band_repository::BandRepositoryImpl,
             gig_repository::GigRepositoryImpl, metrics_repository::MetricsRepositoryImpl,
+            notification_repository::NotificationRepositoryImpl,
             setlist_repository::SetlistRepositoryImpl, song_repository::SongRepositoryImpl,
             user_preferences_repository::UserPreferencesRepositoryImpl,
             user_repository::UserRepositoryImpl,
@@ -120,6 +121,7 @@ async fn main() {
     let band_repo = Arc::new(BandRepositoryImpl::new(pool.clone()));
     let band_member_repo = Arc::new(BandMemberRepositoryImpl::new(pool.clone()));
     let band_invite_repo = Arc::new(BandInviteRepositoryImpl::new(pool.clone()));
+    let notification_repo = Arc::new(NotificationRepositoryImpl::new(pool.clone()));
 
     let state = AppState {
         db: pool.clone(),
@@ -134,6 +136,7 @@ async fn main() {
         band_repo,
         band_member_repo,
         band_invite_repo,
+        notification_repo,
     };
 
     // Use the argument if provided, otherwise prompt the user

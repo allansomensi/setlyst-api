@@ -4,6 +4,7 @@ use crate::{
     models::{
         PaginatedResponse, PaginationMeta, PaginationQuery,
         auth::access::AccessControl,
+        notification::Notification,
         user::{
             ChangePasswordPayload, CreateUserPayload, Role, UpdateCurrentUserPayload,
             UpdateUserPayload, User, UserProfileView, UserPublic, UsernameAvailability,
@@ -382,8 +383,31 @@ pub async fn update_user(
         state.user_repo.is_unique(username, Some(id)).await?;
     }
 
+    // Snapshot the role before updating so we can tell whether it actually
+    // changed — `update` accepts a full payload where `role` may simply be
+    // unset or re-sent unchanged, neither of which is notification-worthy.
+    let previous_role = if payload.role.is_some() {
+        state.user_repo.find_by_id(id).await?.map(|u| u.role)
+    } else {
+        None
+    };
+
     match state.user_repo.update(id, &payload).await {
         Ok(user_id) => {
+            if let (Some(previous_role), Some(new_role)) = (previous_role, &payload.role)
+                && previous_role != *new_role
+            {
+                let notification = Notification::platform_role_changed(
+                    user_id,
+                    previous_role,
+                    new_role.clone(),
+                    requester_id,
+                );
+                if let Err(e) = state.notification_repo.create(&notification).await {
+                    error!(%user_id, error = %e, "Failed to create platform role change notification");
+                }
+            }
+
             info!(
                 %requester_id,
                 target_user_id = %user_id,

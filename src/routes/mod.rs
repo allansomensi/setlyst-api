@@ -6,6 +6,7 @@ pub mod gig;
 pub mod health;
 pub mod metrics;
 pub mod migrations;
+pub mod notification;
 pub mod setlist;
 pub mod song;
 pub mod status;
@@ -39,6 +40,7 @@ pub fn create_routes(state: AppState) -> Router {
                 .nest("/gigs", gig::create_routes(state.clone()))
                 .nest("/bands", band::create_routes(state.clone()))
                 .nest("/invites", band::create_invite_routes(state.clone()))
+                .nest("/notifications", notification::create_routes(state.clone()))
                 .nest("/migrations", migrations::create_routes(state.clone()))
                 .nest("/metrics", metrics::create_routes(state.clone()))
                 .nest("/backup", backup::create_routes(state.clone()))

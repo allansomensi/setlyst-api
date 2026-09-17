@@ -1,6 +1,7 @@
 use crate::{
     controllers::{
-        artist, auth, backup, band, gig, metrics, migrations, setlist, song, status, user,
+        artist, auth, backup, band, gig, metrics, migrations, notification, setlist, song, status,
+        user,
     },
     export::pdf::PdfLocale,
     models::{
@@ -17,6 +18,7 @@ use crate::{
             AdminMetrics, AdminTimeseries, ArtistSongCount, GenreCount, MetricsResponse, RoleCount,
             TimeseriesPoint, TimeseriesResponse, UserMetrics, UserTimeseries,
         },
+        notification::{Notification, NotificationType, UnreadCountResponse},
         setlist::{PublicSetlist, Setlist, SetlistItem, SetlistMarker},
         song::{Genre, Song, SongWithArtist, Tonality},
         status::Status,
@@ -150,6 +152,13 @@ use utoipa::{
         metrics::get_metrics,
         metrics::get_timeseries_metrics,
 
+        // Notifications
+        notification::list_notifications,
+        notification::get_unread_count,
+        notification::mark_notification_read,
+        notification::mark_all_notifications_read,
+        notification::delete_notification,
+
         // Backup
         backup::export_backup,
         backup::import_backup,
@@ -197,6 +206,9 @@ use utoipa::{
             ImportSummary,
             PdfLocale,
             LoginResponse,
+            Notification,
+            NotificationType,
+            UnreadCountResponse,
         )
     ),
     tags(
@@ -210,6 +222,7 @@ use utoipa::{
         (name = "Gigs",       description = "Gig (show) endpoints"),
         (name = "Bands",      description = "Band, membership and invite endpoints"),
         (name = "Metrics",    description = "Metrics endpoints"),
+        (name = "Notifications", description = "In-app notification endpoints"),
         (name = "Backup",     description = "Backup and restore endpoints"),
     )
 )]

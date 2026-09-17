@@ -7,6 +7,7 @@ pub mod backup;
 pub mod band;
 pub mod gig;
 pub mod metrics;
+pub mod notification;
 pub mod setlist;
 pub mod song;
 pub mod status;
