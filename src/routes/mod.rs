@@ -23,8 +23,8 @@ use tower_http::{compression::CompressionLayer, timeout::TimeoutLayer};
 
 pub fn create_routes(state: AppState) -> Router {
     let global_governor_conf = GovernorConfigBuilder::default()
-        .per_millisecond(200)
-        .burst_size(60)
+        .per_millisecond(25)
+        .burst_size(300)
         .key_extractor(SmartIpKeyExtractor)
         .finish()
         .unwrap();
