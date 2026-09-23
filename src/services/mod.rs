@@ -5,3 +5,4 @@ pub mod billing;
 pub mod entitlements;
 pub mod google;
 pub mod notifier;
+pub mod payments;

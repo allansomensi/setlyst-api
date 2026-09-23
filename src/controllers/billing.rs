@@ -11,12 +11,12 @@ use crate::{
         auth::access::{AccessControl, ClientIp},
         billing::{
             AdjustCreditsPayload, AdminSubscriptionView, BillingMe, BillingOverview,
-            BillingPageQuery, BillingSettings, CreatePromoCodePayload, CreatePromotionPayload,
-            CreditEntry, GrantSubscriptionPayload, GrantTrialsPayload, GrantTrialsResponse, Plan,
-            PromoCode, PromoListQuery, PromoRedemption, Promotion, RedeemCodePayload,
-            RedeemResponse, RedeemRewardPayload, ReferralEntry, SubscriptionEvent,
-            SubscriptionSource, UpdatePromoCodePayload, UpdatePromotionPayload, UpsertPlanPayload,
-            check_plan_code,
+            BillingPageQuery, BillingSettings, CheckoutPayload, CreatePromoCodePayload,
+            CreatePromotionPayload, CreditEntry, GrantSubscriptionPayload, GrantTrialsPayload,
+            GrantTrialsResponse, Plan, PromoCode, PromoListQuery, PromoRedemption, Promotion,
+            RedeemCodePayload, RedeemResponse, RedeemRewardPayload, RedirectResponse,
+            ReferralEntry, SubscriptionEvent, SubscriptionSource, UpdatePromoCodePayload,
+            UpdatePromotionPayload, UpsertPlanPayload, check_plan_code,
         },
         notification::Notification,
         resolve_page,
@@ -25,13 +25,15 @@ use crate::{
         account::too_many_attempts,
         billing::{self, add_credits, grant_plan_time, lock_user_credits},
         notifier::{notify, notify_all},
+        payments,
     },
     utils::{codes::referral_code, rate_limit::SlidingWindowLimiter},
 };
 use axum::{
     Json,
+    body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use serde_json::json;
@@ -191,6 +193,117 @@ pub async fn history(
             .subscription_events(access.user_id(), 100)
             .await?,
     ))
+}
+
+// ---------------------------------------------------------------------
+// Payments
+// ---------------------------------------------------------------------
+
+/// Checkouts, plan changes and portal sessions per account per hour: each
+/// one calls the payment provider.
+static PAYMENT_LIMITER: LazyLock<SlidingWindowLimiter<Uuid>> =
+    LazyLock::new(|| SlidingWindowLimiter::new(20, Duration::from_secs(3600)));
+
+fn payment_attempt(access: &AccessControl) -> Result<(), ApiError> {
+    PAYMENT_LIMITER
+        .check(&access.user_id())
+        .map_err(|retry| too_many_attempts(retry.as_secs() as i64))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/billing/checkout",
+    tags = ["Billing"],
+    summary = "Start a paid subscription.",
+    description = "Answers the URL of a checkout page hosted by the payment provider; send the browser there. It returns to `/dashboard/settings?checkout=success` (or `=canceled`) and the subscription shows up in `/billing/me` once the provider confirms the payment (usually within seconds). A running trial carries over: the first charge waits for its end. A running promotion or a redeemed `discount` code comes off the first charge instead. Errors: `PAYMENTS_UNAVAILABLE`, `BILLING_NOT_ENFORCED`, `PLAN_NOT_FOUND`, `PLAN_NOT_PURCHASABLE`, `EMAIL_NOT_VERIFIED`, `PAID_SUBSCRIPTION_ACTIVE` (use `/billing/subscription/change`), `PAYMENT_PROVIDER_ERROR`.",
+    request_body = CheckoutPayload,
+    security(("jwt_token" = [])),
+    responses(
+        (status = 200, description = "Checkout page.", body = RedirectResponse),
+        (status = 403, description = "E-mail not verified."),
+        (status = 404, description = "Unknown plan."),
+        (status = 409, description = "Not enforced, or already subscribed."),
+        (status = 502, description = "The payment provider failed."),
+        (status = 503, description = "Payments not configured."),
+    )
+)]
+pub async fn checkout(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Json(payload): Json<CheckoutPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    payment_attempt(&access)?;
+    Ok(Json(
+        payments::start_checkout(&state, access.user_id(), &payload).await?,
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/billing/subscription/change",
+    tags = ["Billing"],
+    summary = "Switch the paid subscription to another plan or interval.",
+    description = "Charges the prorated difference now; the change only applies if that charge succeeds (`PAYMENT_DECLINED` otherwise, with the plan unchanged). Answers the updated billing state. Errors: `NO_PAID_SUBSCRIPTION`, `PLAN_ALREADY_ACTIVE`, `SUBSCRIPTION_PAST_DUE`, `SUBSCRIPTION_CANCELING` (renew it in the portal first), plus those of `/billing/checkout`.",
+    request_body = CheckoutPayload,
+    security(("jwt_token" = [])),
+    responses(
+        (status = 200, description = "Plan changed.", body = BillingMe),
+        (status = 402, description = "The charge was declined."),
+        (status = 409, description = "Nothing to change."),
+    )
+)]
+pub async fn change_subscription(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Json(payload): Json<CheckoutPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    payment_attempt(&access)?;
+    Ok(Json(
+        payments::change_plan(&state, access.user_id(), &payload).await?,
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/billing/portal",
+    tags = ["Billing"],
+    summary = "Open the billing portal.",
+    description = "Answers the URL of the payment provider's portal, where the caller updates the card, downloads invoices and cancels or renews the subscription. Errors: `PAYMENTS_UNAVAILABLE`, `NO_PAID_SUBSCRIPTION` (never paid).",
+    security(("jwt_token" = [])),
+    responses(
+        (status = 200, description = "Portal page.", body = RedirectResponse),
+        (status = 409, description = "No billing account."),
+    )
+)]
+pub async fn portal(
+    State(state): State<AppState>,
+    access: AccessControl,
+) -> Result<impl IntoResponse, ApiError> {
+    payment_attempt(&access)?;
+    Ok(Json(payments::open_portal(&state, access.user_id()).await?))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/webhooks/stripe",
+    tags = ["Billing"],
+    summary = "Stripe webhook.",
+    description = "Called by Stripe, not by clients. The body must carry a valid `Stripe-Signature`. Redelivered events are acknowledged without effect.",
+    responses(
+        (status = 200, description = "Received."),
+        (status = 400, description = "Bad signature or body."),
+    )
+)]
+pub async fn stripe_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, ApiError> {
+    let signature = headers
+        .get("stripe-signature")
+        .and_then(|v| v.to_str().ok());
+    payments::handle_webhook(&state, &body, signature).await?;
+    Ok(Json(json!({ "received": true })))
 }
 
 // ---------------------------------------------------------------------

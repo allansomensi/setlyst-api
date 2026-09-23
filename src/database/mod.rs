@@ -2,7 +2,9 @@ pub mod connection;
 pub mod repositories;
 
 use crate::{
+    config::Config,
     moderation::{DefaultModerationService, ModerationService},
+    payments::Payments,
     services::google::{GoogleJwksVerifier, GoogleTokenVerifier},
 };
 use repositories::{
@@ -69,6 +71,8 @@ pub struct AppState {
     pub google_verifier: Arc<dyn GoogleTokenVerifier>,
     /// Automatic moderation checks (replaced in tests).
     pub moderation: Arc<dyn ModerationService>,
+    /// Card payments; `None` when not configured (replaced in tests).
+    pub payments: Option<Payments>,
 }
 
 impl AppState {
@@ -119,7 +123,14 @@ impl AppState {
             pin_repo: Arc::new(PinRepositoryImpl::new(pool.clone())),
             google_verifier,
             moderation,
+            payments: Config::try_get().and_then(Payments::from_config),
             db: pool,
         }
+    }
+
+    /// Replaces the payment integration (tests use a fake gateway).
+    pub fn with_payments(mut self, payments: Option<Payments>) -> Self {
+        self.payments = payments;
+        self
     }
 }

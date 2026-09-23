@@ -857,6 +857,10 @@ pub async fn delete_current_user(
     }
     confirm_password(&user, payload.password.as_deref()).await?;
 
+    // Stop the card being charged before the account (and its link to the
+    // subscription) is gone. A provider failure aborts the deletion.
+    crate::services::payments::cancel_paid_subscription(&state, user.id).await?;
+
     // Queued before the deletion, with no user reference (which would
     // cascade away), so the goodbye reaches the owner. Withdrawn if the
     // deletion fails.

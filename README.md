@@ -33,7 +33,7 @@ Built with Rust for reliability and performance, using Axum, SQLx, and PostgreSQ
 - **Account security** — Sign-in by username or e-mail, per-account lockout after repeated failures, two-factor authentication (TOTP, RFC 6238) with single-use recovery codes, e-mail verification and change by code, password recovery by e-mail, Google sign-in, self-service account deletion and consent tracking
 - **Transactional e-mail** — Localized (`en`, `pt-BR`, `es`) templates delivered through an outbox and a background worker (SMTP via `lettre`), with per-category communication preferences and one-click unsubscribe links
 - **Announcements & release notes** — Staff-published announcements (modal, banner, notification, e-mail) targeted by role, plan and language, and editable "What's new" notes
-- **Plans & billing** — Plans with feature flags and limits (enforced only when switched on), trials, promo codes, promotions, credits, referral rewards and complimentary grants
+- **Plans & billing** — Plans with feature flags and limits (enforced only when switched on), trials, promo codes, promotions, credits, referral rewards and complimentary grants; card subscriptions through Stripe Checkout, with in-place plan changes and the Stripe billing portal
 - **Moderation** — Automatic checks of usernames, avatars and band logos (word list, blocked domains, optional image classification), user reports and a staff queue
 - **Rate Limiting** — Per-client-IP rate limiting (trusted-proxy aware) on sign-in, password recovery, Google sign-in and globally across all endpoints
 - **OpenAPI / Swagger UI** — Interactive API documentation available at `/swagger-ui`
@@ -143,12 +143,15 @@ Swagger UI: `http://127.0.0.1:8000/swagger-ui`
 | `INTERNAL_API_SECRET` | Shared secret the web server sends as `X-Setlyst-Internal`, with the visitor's address in `X-Setlyst-Client-IP` | — |
 | `GOOGLE_CLIENT_IDS` | Comma-separated OAuth client IDs accepted for Google sign-in. Empty = disabled | empty |
 | `SMTP_HOST` | SMTP server. When unset, e-mails are rendered and logged only | — |
-| `SMTP_PORT` | SMTP port | `587` / `465` / `25` by `SMTP_TLS` |
+| `SMTP_PORT` | SMTP port. Hosts that block the standard ports (Render's free instances block 25, 465 and 587) need an alternative such as Resend's `2465` with `SMTP_TLS=tls` | `587` / `465` / `25` by `SMTP_TLS` |
 | `SMTP_USERNAME` / `SMTP_PASSWORD` | SMTP credentials | — |
 | `SMTP_TLS` | `starttls`, `tls` or `none` | `starttls` |
 | `SMTP_FROM` | Sender, e.g. `Setlyst <no-reply@setlyst.app>` | `Setlyst <no-reply@setlyst.app>` |
 | `SMTP_REPLY_TO` | Optional reply-to address | — |
 | `EMAIL_WORKER_INTERVAL_SECS` | E-mail outbox polling interval | `10` |
+| `STRIPE_SECRET_KEY` | Stripe secret (`sk_...`) or restricted (`rk_...`) key. With `STRIPE_WEBHOOK_SECRET`, turns paid checkout on | — |
+| `STRIPE_WEBHOOK_SECRET` | Signing secret (`whsec_...`) of the webhook endpoint `/api/v1/webhooks/stripe` | — |
+| `STRIPE_API_BASE` | Stripe API origin (only for stripe-mock or a proxy) | `https://api.stripe.com` |
 | `MODERATION_VISION_API_KEY` | Google Cloud Vision key for image classification. Unset = URL heuristics only | — |
 | `TRASH_RETENTION_DAYS` | Days before trashed items are purged | `30` |
 | `ENABLE_SWAGGER` | Serve `/swagger-ui` and `/api-docs/openapi.json` | `true` |
@@ -174,7 +177,8 @@ Full interactive documentation is available via Swagger UI at `/swagger-ui` when
 | Backup | `/api/v1/backup` | Data export and import |
 | Status | `/api/v1/status` | Health and version (details for staff at `/status/details`) |
 | Public | `/api/v1/public` | Legal version, plans, release notes, e-mail unsubscribe |
-| Billing | `/api/v1/billing` | The caller's plan, credits, promo codes and referrals |
+| Billing | `/api/v1/billing` | The caller's plan, credits, promo codes, referrals, checkout, plan changes and the billing portal |
+| Webhooks | `/api/v1/webhooks` | Stripe events (signature-verified, no auth) |
 | Announcements | `/api/v1/announcements` | Announcements for the caller |
 | Admin | `/api/v1/admin` | Staff console (content, audit log, limits, announcements, release notes, plans, promo codes, moderation) |
 | Health | `/api/v1/health` | API health |
@@ -255,6 +259,13 @@ TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres cargo tes
 ```
 
 Integration tests (`tests/api.rs`) exercise the HTTP API end to end, each on its own throwaway database.
+
+The Stripe client itself is checked against [stripe-mock](https://github.com/stripe/stripe-mock), which validates requests against Stripe's API spec (skipped unless `STRIPE_MOCK_URL` is set):
+
+```bash
+stripe-mock -http-port 12111 &
+STRIPE_MOCK_URL=http://localhost:12111 cargo test --test stripe_mock
+```
 
 ---
 

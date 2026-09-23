@@ -744,6 +744,42 @@ impl EmailTemplate {
                             "Se retiró el plan {p} de tu cuenta. Tus canciones, setlists y conciertos siguen guardados.",
                         )
                         .to_string(),
+                    // Paid subscriptions.
+                    ("subscribed" | "resumed", Some(d)) => l
+                        .pick(
+                            "Your subscription to the {p} plan is active. The next charge is on {d}.",
+                            "Sua assinatura do plano {p} está ativa. A próxima cobrança será em {d}.",
+                            "Tu suscripción al plan {p} está activa. El próximo cobro será el {d}.",
+                        )
+                        .replace("{d}", d),
+                    ("plan_changed", Some(d)) => l
+                        .pick(
+                            "Your subscription is now on the {p} plan. The next charge is on {d}.",
+                            "Sua assinatura agora é do plano {p}. A próxima cobrança será em {d}.",
+                            "Tu suscripción ahora es del plan {p}. El próximo cobro será el {d}.",
+                        )
+                        .replace("{d}", d),
+                    ("payment_failed", _) => l
+                        .pick(
+                            "We couldn't charge your {p} plan subscription. Update your payment method under Settings, in the Subscription section, to keep your plan.",
+                            "Não conseguimos cobrar a assinatura do plano {p}. Atualize a forma de pagamento em Configurações, na seção Assinatura, para manter o seu plano.",
+                            "No pudimos cobrar la suscripción del plan {p}. Actualiza el método de pago en Configuración, en la sección Suscripción, para mantener tu plan.",
+                        )
+                        .to_string(),
+                    ("cancel_scheduled", Some(d)) => l
+                        .pick(
+                            "Your subscription was canceled. The {p} plan stays active until {d} and you won't be charged again.",
+                            "Sua assinatura foi cancelada. O plano {p} continua ativo até {d} e não haverá novas cobranças.",
+                            "Se canceló tu suscripción. El plan {p} sigue activo hasta el {d} y no habrá más cobros.",
+                        )
+                        .replace("{d}", d),
+                    ("canceled", _) => l
+                        .pick(
+                            "Your subscription to the {p} plan has ended. Your songs, setlists and gigs stay saved.",
+                            "A assinatura do plano {p} foi encerrada. Suas músicas, setlists e shows continuam salvos.",
+                            "Terminó tu suscripción al plan {p}. Tus canciones, setlists y conciertos siguen guardados.",
+                        )
+                        .to_string(),
                     (_, Some(d)) => l
                         .pick(
                             "Your account now has the {p} plan until {d}.",
@@ -1252,6 +1288,45 @@ mod tests {
                 assert!(!rendered.html.contains("<img"), "no remote images");
             }
         }
+    }
+
+    #[test]
+    fn payment_events_have_their_own_wording() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 10, 23)
+            .unwrap()
+            .and_hms_opt(12, 0, 0);
+        let generic = EmailTemplate::SubscriptionChanged {
+            username: "ana".into(),
+            kind: "plan_granted".into(),
+            plan_name: json!({"en": "Pro", "pt-BR": "Pro", "es": "Pro"}),
+            current_period_end: date,
+        }
+        .render(&ctx(Locale::PtBr, false))
+        .text;
+        let mut seen = Vec::new();
+        for kind in [
+            "subscribed",
+            "resumed",
+            "plan_changed",
+            "payment_failed",
+            "cancel_scheduled",
+            "canceled",
+        ] {
+            let text = EmailTemplate::SubscriptionChanged {
+                username: "ana".into(),
+                kind: kind.into(),
+                plan_name: json!({"en": "Pro", "pt-BR": "Pro", "es": "Pro"}),
+                current_period_end: date,
+            }
+            .render(&ctx(Locale::PtBr, false))
+            .text;
+            assert!(!text.contains("{p}") && !text.contains("{d}"), "{kind}");
+            assert!(text.contains("Pro"), "{kind}");
+            assert_ne!(text, generic, "{kind} falls back to the generic line");
+            seen.push(text);
+        }
+        assert!(seen[3].contains("forma de pagamento"));
+        assert!(seen[4].contains("não haverá novas cobranças"));
     }
 
     #[test]

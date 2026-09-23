@@ -10,6 +10,7 @@ pub mod middlewares;
 pub mod models;
 pub mod moderation;
 mod openapi;
+pub mod payments;
 pub mod routes;
 pub mod server;
 pub mod services;

@@ -396,23 +396,100 @@ pub enum SubscriptionSource {
     Payment,
 }
 
+/// Days a paid subscription keeps its plan past `current_period_end`, so a
+/// renewal confirmed late by the payment provider never interrupts access.
+pub const PAYMENT_GRACE_DAYS: i64 = 2;
+
+/// `true` while a subscription with these fields grants its plan at `now`.
+pub fn subscription_in_effect(
+    status: SubscriptionStatus,
+    source: SubscriptionSource,
+    current_period_end: Option<NaiveDateTime>,
+    now: NaiveDateTime,
+) -> bool {
+    let grace = match source {
+        SubscriptionSource::Payment => chrono::Duration::days(PAYMENT_GRACE_DAYS),
+        _ => chrono::Duration::zero(),
+    };
+    status.is_live() && current_period_end.is_none_or(|end| end + grace > now)
+}
+
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize, ToSchema)]
 pub struct Subscription {
     pub plan_code: String,
     pub status: SubscriptionStatus,
     pub source: SubscriptionSource,
     pub started_at: NaiveDateTime,
-    /// `None` = open-ended.
+    /// `None` = open-ended. For a paid subscription: the next charge (or,
+    /// with `cancel_at_period_end`, when it ends).
     pub current_period_end: Option<NaiveDateTime>,
     pub trial_ends_at: Option<NaiveDateTime>,
     pub cancel_at_period_end: bool,
+    /// `monthly` or `yearly` for paid subscriptions.
+    #[sqlx(default)]
+    pub billing_interval: Option<String>,
 }
 
 impl Subscription {
     /// `true` while the subscription grants its plan at `now`.
     pub fn is_effective(&self, now: NaiveDateTime) -> bool {
-        self.status.is_live() && self.current_period_end.is_none_or(|end| end > now)
+        subscription_in_effect(self.status, self.source, self.current_period_end, now)
     }
+}
+
+/// How often a paid plan is charged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingInterval {
+    Monthly,
+    Yearly,
+}
+
+impl BillingInterval {
+    pub fn key(&self) -> &'static str {
+        match self {
+            BillingInterval::Monthly => "monthly",
+            BillingInterval::Yearly => "yearly",
+        }
+    }
+
+    /// The interval as the payment provider names it.
+    pub fn provider_key(&self) -> &'static str {
+        match self {
+            BillingInterval::Monthly => "month",
+            BillingInterval::Yearly => "year",
+        }
+    }
+
+    pub fn from_provider(value: &str) -> Option<Self> {
+        match value {
+            "month" => Some(BillingInterval::Monthly),
+            "year" => Some(BillingInterval::Yearly),
+            _ => None,
+        }
+    }
+
+    /// The plan's price for this interval, in cents.
+    pub fn price_of(&self, plan: &Plan) -> i32 {
+        match self {
+            BillingInterval::Monthly => plan.price_monthly_cents,
+            BillingInterval::Yearly => plan.price_yearly_cents,
+        }
+    }
+}
+
+/// Body of `POST /billing/checkout` and `POST /billing/subscription/change`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Validate)]
+pub struct CheckoutPayload {
+    #[validate(length(min = 2, max = 32))]
+    pub plan_code: String,
+    pub interval: BillingInterval,
+}
+
+/// Where to send the browser next (a page hosted by the payment provider).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RedirectResponse {
+    pub url: String,
 }
 
 /// One change in a subscription's history.
@@ -450,6 +527,8 @@ pub struct ReferralSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BillingMe {
     pub enforced: bool,
+    /// Card payments are configured (checkout and the billing portal work).
+    pub payments_enabled: bool,
     /// The plan in effect, if any.
     pub plan: Option<Plan>,
     pub subscription: Option<Subscription>,

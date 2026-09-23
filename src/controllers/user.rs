@@ -620,6 +620,8 @@ pub async fn delete_user(
 ) -> Result<impl IntoResponse, ApiError> {
     let target = load_managed_target(&state, &access, id).await?;
 
+    // Stop the card being charged before the account is gone.
+    crate::services::payments::cancel_paid_subscription(&state, id).await?;
     state.user_repo.delete(id).await?;
 
     AuditEvent::by(&access, actions::USER_DELETED)

@@ -8,12 +8,12 @@ use crate::{
     errors::api_error::ApiError,
     models::billing::{
         BILLING_SETTINGS_KEY, BillingOverview, BillingSettings, CreatePromoCodePayload,
-        CreatePromotionPayload, CreditEntry, Plan, PlanPromotion, PlanRow, PromoCode,
-        PromoRedemption, Promotion, ReferralEntry, Subscription, SubscriptionEvent,
+        CreatePromotionPayload, CreditEntry, PAYMENT_GRACE_DAYS, Plan, PlanPromotion, PlanRow,
+        PromoCode, PromoRedemption, Promotion, ReferralEntry, Subscription, SubscriptionEvent,
         UpdatePromoCodePayload, UpdatePromotionPayload, UpsertPlanPayload, trim_localized,
     },
 };
-use chrono::{NaiveDateTime, Utc};
+use chrono::{Duration, NaiveDateTime, Utc};
 use serde_json::{Value, json};
 use sqlx::{PgExecutor, PgPool};
 use std::collections::BTreeMap;
@@ -34,7 +34,8 @@ macro_rules! plan_columns {
 /// Columns of a [`Subscription`] from `subscriptions`.
 macro_rules! subscription_columns {
     () => {
-        "plan_code, status, source, started_at, current_period_end, trial_ends_at, cancel_at_period_end"
+        "plan_code, status, source, started_at, current_period_end, trial_ends_at, cancel_at_period_end,
+         billing_interval"
     };
 }
 
@@ -64,11 +65,14 @@ pub async fn load_settings<'e, E: PgExecutor<'e>>(
 }
 
 /// The plan in effect for `user_id` (a live subscription whose period has
-/// not ended), if any.
+/// not ended), if any. Paid subscriptions keep their plan for
+/// [`PAYMENT_GRACE_DAYS`] past the period end, so a renewal webhook that
+/// arrives late never locks a paying customer out.
 pub async fn load_effective_plan<'e, E: PgExecutor<'e>>(
     executor: E,
     user_id: Uuid,
 ) -> Result<Option<Plan>, ApiError> {
+    let now = now();
     let row: Option<PlanRow> = sqlx::query_as(
         "SELECT p.code, p.name, p.description, p.price_monthly_cents, p.price_yearly_cents, p.currency,
                 p.limits, p.features, p.highlighted, p.is_public, p.sort_order, p.updated_at
@@ -76,10 +80,13 @@ pub async fn load_effective_plan<'e, E: PgExecutor<'e>>(
          JOIN plans p ON p.code = s.plan_code
          WHERE s.user_id = $1
            AND s.status IN ('trialing', 'active', 'past_due')
-           AND (s.current_period_end IS NULL OR s.current_period_end > $2)",
+           AND (s.current_period_end IS NULL
+                OR s.current_period_end > $2
+                OR (s.source = 'payment' AND s.current_period_end > $3))",
     )
     .bind(user_id)
-    .bind(now())
+    .bind(now)
+    .bind(now - Duration::days(PAYMENT_GRACE_DAYS))
     .fetch_optional(executor)
     .await?;
     Ok(row.map(Plan::from))

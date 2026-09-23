@@ -45,6 +45,9 @@ pub struct Config {
     pub google_client_ids: Vec<String>,
     /// Outgoing e-mail. `None` = e-mails are rendered and logged only.
     pub smtp: Option<SmtpConfig>,
+    /// Card payments. `None` = payments are unavailable (checkout answers
+    /// `PAYMENTS_UNAVAILABLE`).
+    pub stripe: Option<StripeConfig>,
     pub email_worker_interval_secs: u64,
     /// Google Cloud Vision key for image moderation (optional).
     pub moderation_vision_api_key: Option<String>,
@@ -90,6 +93,33 @@ impl std::fmt::Debug for SmtpConfig {
     }
 }
 
+#[derive(Clone)]
+pub struct StripeConfig {
+    /// Secret (`sk_...`) or restricted (`rk_...`) API key.
+    pub secret_key: String,
+    /// Signing secret of the webhook endpoint (`whsec_...`).
+    pub webhook_secret: String,
+    /// `https://api.stripe.com`; overridable for a local mock server.
+    pub api_base: String,
+}
+
+impl StripeConfig {
+    /// `true` for test-mode keys.
+    pub fn is_test_mode(&self) -> bool {
+        self.secret_key.contains("_test_")
+    }
+}
+
+// Hand-written so the keys never end up in a log line.
+impl std::fmt::Debug for StripeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StripeConfig")
+            .field("test_mode", &self.is_test_mode())
+            .field("api_base", &self.api_base)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for Config {
     /// Development defaults. Production always goes through
     /// [`Config::from_env`]; this exists so tests and tools can build a
@@ -112,6 +142,7 @@ impl Default for Config {
             internal_api_secret: None,
             google_client_ids: Vec::new(),
             smtp: None,
+            stripe: None,
             email_worker_interval_secs: 10,
             moderation_vision_api_key: None,
             trash_retention_days: 30,
@@ -235,6 +266,44 @@ fn smtp_from_env() -> Result<Option<SmtpConfig>, ConfigError> {
     }))
 }
 
+/// Payments are on when both Stripe secrets are set; one without the other
+/// is a configuration error rather than a silently broken checkout.
+pub fn parse_stripe(
+    secret_key: Option<String>,
+    webhook_secret: Option<String>,
+    api_base: Option<String>,
+) -> Result<Option<StripeConfig>, ConfigError> {
+    match (secret_key, webhook_secret) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(ConfigError::Invalid(
+            "STRIPE_WEBHOOK_SECRET is required when STRIPE_SECRET_KEY is set".into(),
+        )),
+        (None, Some(_)) => Err(ConfigError::Invalid(
+            "STRIPE_SECRET_KEY is required when STRIPE_WEBHOOK_SECRET is set".into(),
+        )),
+        (Some(secret_key), Some(webhook_secret)) => {
+            if !(secret_key.starts_with("sk_") || secret_key.starts_with("rk_")) {
+                return Err(ConfigError::Invalid(
+                    "STRIPE_SECRET_KEY must be a secret (sk_...) or restricted (rk_...) key".into(),
+                ));
+            }
+            if !webhook_secret.starts_with("whsec_") {
+                return Err(ConfigError::Invalid(
+                    "STRIPE_WEBHOOK_SECRET must be a webhook signing secret (whsec_...)".into(),
+                ));
+            }
+            Ok(Some(StripeConfig {
+                secret_key,
+                webhook_secret,
+                api_base: api_base
+                    .unwrap_or_else(|| "https://api.stripe.com".to_string())
+                    .trim_end_matches('/')
+                    .to_string(),
+            }))
+        }
+    }
+}
+
 static CONFIG: OnceLock<Config> = OnceLock::new();
 
 fn env_or<T: std::str::FromStr>(key: &str, default: T) -> Result<T, ConfigError>
@@ -309,6 +378,11 @@ impl Config {
             internal_api_secret: env_opt("INTERNAL_API_SECRET"),
             google_client_ids: split_list(&std::env::var("GOOGLE_CLIENT_IDS").unwrap_or_default()),
             smtp: smtp_from_env()?,
+            stripe: parse_stripe(
+                env_opt("STRIPE_SECRET_KEY"),
+                env_opt("STRIPE_WEBHOOK_SECRET"),
+                env_opt("STRIPE_API_BASE"),
+            )?,
             email_worker_interval_secs: env_or("EMAIL_WORKER_INTERVAL_SECS", 10u64)?.max(1),
             moderation_vision_api_key: env_opt("MODERATION_VISION_API_KEY"),
             trash_retention_days: env_or("TRASH_RETENTION_DAYS", 30i64)?.clamp(1, 3650),
@@ -372,6 +446,30 @@ mod tests {
         assert!(resolve_data_key(Some("short"), true).is_err());
         let message = ConfigError::MissingDataEncryptionKey.to_string();
         assert!(message.contains("openssl rand -base64 32"), "{message}");
+    }
+
+    #[test]
+    fn stripe_needs_both_secrets_with_the_right_prefixes() {
+        let s = |v: &str| Some(v.to_string());
+        assert!(parse_stripe(None, None, None).unwrap().is_none());
+        assert!(parse_stripe(s("sk_test_1"), None, None).is_err());
+        assert!(parse_stripe(None, s("whsec_1"), None).is_err());
+        assert!(parse_stripe(s("pk_test_1"), s("whsec_1"), None).is_err());
+        assert!(parse_stripe(s("sk_test_1"), s("secret"), None).is_err());
+
+        let config = parse_stripe(s("sk_test_1"), s("whsec_1"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.api_base, "https://api.stripe.com");
+        assert!(config.is_test_mode());
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("sk_test_1") && !debug.contains("whsec_1"));
+
+        let live = parse_stripe(s("rk_live_1"), s("whsec_1"), s("http://localhost:12111/"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.api_base, "http://localhost:12111");
+        assert!(!live.is_test_mode());
     }
 
     #[test]

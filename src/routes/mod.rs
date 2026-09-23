@@ -85,6 +85,7 @@ pub fn api_router(state: AppState) -> Router {
                 setlist::create_public_routes(state.clone()),
             )
             .nest("/public/gigs", gig::create_public_routes(state.clone()))
+            .nest("/webhooks", billing::create_webhook_routes(state.clone()))
             .merge(public::create_routes(state)),
     )
 }
