@@ -90,6 +90,8 @@ just services-up
 
 **4. Run database migrations**
 
+Migrations run automatically when the server starts (set `RUN_MIGRATIONS=false` to opt out). To run them by hand:
+
 ```bash
 just migrate-run
 ```
@@ -111,7 +113,10 @@ Swagger UI: `http://127.0.0.1:8000/swagger-ui`
 |---|---|---|
 | `JWT_SECRET` | Secret key for JWT signing (min. 32 chars) | — |
 | `JWT_EXPIRATION_TIME` | Token expiration in seconds | `86400` |
+| `IMPERSONATION_EXPIRATION_TIME` | Lifetime of a staff "view as" session, in seconds | `3600` |
 | `DATABASE_URL` | Full PostgreSQL connection URL | — |
+| `DATABASE_MAX_CONNECTIONS` | Connection pool size | `10` |
+| `RUN_MIGRATIONS` | Apply pending migrations on startup | `true` |
 | `POSTGRES_HOST` | Database host | `localhost` |
 | `POSTGRES_PORT` | Database port | `5432` |
 | `POSTGRES_USER` | Database user | `postgres` |
@@ -122,6 +127,7 @@ Swagger UI: `http://127.0.0.1:8000/swagger-ui`
 | `RUST_LOG_CONSOLE` | Console log level | `info` |
 | `RUST_LOG_FILE` | File log level | `trace` |
 | `LOG_TO_FILE` | Enable rolling file logs | `false` |
+| `TEST_DATABASE_URL` | PostgreSQL server used by the integration tests (tests are skipped when unset) | — |
 
 ---
 
@@ -192,10 +198,34 @@ The backup system uses a versioned, self-contained JSON structure:
 Generate a printable setlist via:
 
 ```
-GET /api/v1/setlists/{id}/export/pdf?show_title=true&show_key=true&show_bpm=true&show_total_duration=true&lang=en
+GET /api/v1/setlists/{id}/export/pdf?show_key=true&show_bpm=true&compact=true&columns=2&font_scale=85&lang=pt-BR
 ```
 
-Supported locales: `en`, `pt-BR`, `es`.
+Every option is optional. Content: `show_title`, `subtitle`, `show_description`, `show_band_name`, `show_date`, `show_total_duration`, `show_numbers`, `show_artist`, `show_key`, `show_bpm`, `show_song_duration`, `show_tags`, `show_blocks`, `show_breaks`. Songbook: `include_lyrics`, `chords` (`above` | `inline` | `hide`), `page_break_per_song`. Layout: `compact`, `columns` (1–2), `font_scale` (60–200 %), `uppercase_titles`, `watermark`, `page_numbers`, `paper` (`a4` | `letter` | `legal`), `orientation` (`portrait` | `landscape`), `margins` (`narrow` | `normal` | `wide`).
+
+Supported locales: `en`, `pt-BR`, `es`. The file name is sent RFC 5987-encoded, so non-ASCII titles survive.
+
+---
+
+## Staff, Limits & Audit
+
+- **Roles are hierarchical.** Moderators manage regular users only; admins manage users and moderators; nobody manages their own account through the staff endpoints. Only admins change roles, limits and other people's content.
+- **Suspensions** (`POST /users/{id}/ban`, with optional duration and reason) and **deactivation** sign the account out immediately — every request re-checks the account state. Prefer them to deletion.
+- **View as** (`POST /users/{id}/impersonate`) issues a short-lived, read-only token; every write is refused with `IMPERSONATION_READ_ONLY`.
+- **Limits** — platform defaults (`/admin/settings/quotas`) and per-user overrides (`/users/{id}/quotas`) cap songs, setlists, bands, tags and more. Exceeding one answers `QUOTA_EXCEEDED` with the resource and limit.
+- **Public links** can be taken down by staff (`/admin/{setlists,gigs}/{id}/share/revoke`); the owner is notified and can't re-share until unlocked.
+- **Audit log** (`/admin/audit-logs`) records who did what, when and from where. Records also carry `updated_by` for "last modified by".
+- **Errors** carry a stable machine-readable `code` (see `src/errors/api_error.rs`) for clients to translate.
+
+---
+
+## Testing
+
+```bash
+TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres cargo test
+```
+
+Integration tests (`tests/api.rs`) exercise the HTTP API end to end, each on its own throwaway database.
 
 ---
 

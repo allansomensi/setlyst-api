@@ -9,6 +9,7 @@ use crate::{
             UpdateBandRolePermissionsPayload,
         },
         notification::Notification,
+        quota::QuotaResource,
     },
 };
 use axum::{
@@ -17,7 +18,6 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header::LOCATION},
     response::IntoResponse,
 };
-use chrono::Utc;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 use validator::Validate;
@@ -97,6 +97,15 @@ pub async fn create_band(
 
     payload.validate()?;
 
+    state
+        .quota_repo
+        .ensure_user(user_id, QuotaResource::BandsOwned, 1)
+        .await?;
+    state
+        .quota_repo
+        .ensure_user(user_id, QuotaResource::BandMemberships, 1)
+        .await?;
+
     let new_band = state.band_repo.create(&payload, user_id).await?;
 
     info!(%user_id, band_id = %new_band.id, "Band created successfully");
@@ -141,7 +150,7 @@ pub async fn update_band(
         .require_role(id, user_id, BandRole::Admin)
         .await?;
 
-    let band_id = state.band_repo.update(id, &payload).await?;
+    let band_id = state.band_repo.update(id, &payload, user_id).await?;
 
     info!(%user_id, band_id = %band_id, "Band updated successfully");
     Ok(Json(band_id))
@@ -725,37 +734,31 @@ pub async fn accept_band_invite(
     let user_id = access.user_id();
     debug!(%user_id, invite_code = %code, "Processing request to accept a band invite");
 
-    let invite = state
+    // Peek at the invite only to know which band's limits apply; the
+    // actual validation and redemption happen atomically in `redeem`.
+    if let Some(invite) = state
         .band_invite_repo
-        .find_by_code(&code)
+        .find_by_code(&code.trim().to_uppercase())
         .await?
-        .ok_or(ApiError::NotFound)?;
-
-    let is_expired = invite
-        .expires_at
-        .is_some_and(|expires_at| expires_at <= Utc::now().naive_utc());
-    let is_exhausted = invite
-        .max_uses
-        .is_some_and(|max_uses| invite.uses_count >= max_uses);
-
-    if invite.revoked_at.is_some() || is_expired || is_exhausted {
-        error!(invite_code = %code, "Attempted to use an invalid or exhausted invite.");
-        return Err(ApiError::NotFound);
+    {
+        state
+            .quota_repo
+            .ensure_band(invite.band_id, QuotaResource::BandMembers, 1)
+            .await?;
+        state
+            .quota_repo
+            .ensure_user(user_id, QuotaResource::BandMemberships, 1)
+            .await?;
     }
 
-    state
-        .band_member_repo
-        .add_member(invite.band_id, user_id, invite.role)
-        .await?;
-
-    state.band_invite_repo.increment_uses(invite.id).await?;
+    let (band_id, _role) = state.band_invite_repo.redeem(&code, user_id).await?;
 
     let band = state
         .band_repo
-        .find_by_id(invite.band_id, user_id)
+        .find_by_id(band_id, user_id)
         .await?
         .ok_or(ApiError::NotFound)?;
 
-    info!(%user_id, band_id = %invite.band_id, "User joined band via invite successfully");
+    info!(%user_id, %band_id, "User joined band via invite successfully");
     Ok(Json(band))
 }

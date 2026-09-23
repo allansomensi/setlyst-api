@@ -1,11 +1,15 @@
 use crate::{
     database::AppState,
     errors::api_error::ApiError,
-    export::pdf::{ExportQuery, PdfExportOptions, generate_setlist_pdf},
+    export::pdf::{
+        ExportQuery, PdfExportOptions, SetlistPdfData, content_disposition, generate_setlist_pdf,
+        pdf_filename,
+    },
     models::{
         PaginatedResponse, PaginationMeta, PaginationQuery,
         auth::access::AccessControl,
-        band::BandRole,
+        band::{BandPermission, BandRole},
+        quota::QuotaResource,
         setlist::{
             AddSongToSetlistPayload, CreateSetlistBlockPayload, CreateSetlistBreakPayload,
             CreateSetlistPayload, DuplicateSetlistPayload, PublicSetlist,
@@ -175,24 +179,40 @@ pub async fn create_setlist(
 
     payload.validate()?;
 
-    if let Some(band_id) = payload.band_id {
-        let band = state
-            .band_repo
-            .find_by_id(band_id, user_id)
-            .await?
-            .ok_or(ApiError::NotFound)?;
+    match payload.band_id {
+        Some(band_id) => {
+            // Same rule as editing a band setlist: the band's configurable
+            // `manage_setlists` permission (admin/owner always pass).
+            let role = state
+                .band_repo
+                .role_of(band_id, user_id)
+                .await?
+                .ok_or(ApiError::NotFound)?;
 
-        let can_create = band.my_role.satisfies(BandRole::Moderator)
-            || (band.my_role.satisfies(BandRole::Member) && band.members_can_manage_setlists);
+            if !state
+                .band_repo
+                .role_has_permission(band_id, role, BandPermission::ManageSetlists)
+                .await?
+            {
+                return Err(ApiError::Forbidden);
+            }
 
-        if !can_create {
-            return Err(ApiError::Forbidden);
+            state
+                .quota_repo
+                .ensure_band(band_id, QuotaResource::BandSetlists, 1)
+                .await?;
+        }
+        None => {
+            state
+                .quota_repo
+                .ensure_user(user_id, QuotaResource::Setlists, 1)
+                .await?;
         }
     }
 
     state
         .setlist_repo
-        .is_unique(&payload.title, user_id, payload.band_id, None)
+        .is_unique(payload.title.trim(), user_id, payload.band_id, None)
         .await?;
 
     match state.setlist_repo.create(&payload, user_id).await {
@@ -253,6 +273,10 @@ pub async fn duplicate_setlist(
     // lands in the caller's own personal setlists, so no write access to
     // the original (e.g. a band setlist) is required.
     state.setlist_repo.exists(id, user_id).await?;
+    state
+        .quota_repo
+        .ensure_user(user_id, QuotaResource::Setlists, 1)
+        .await?;
 
     match state
         .setlist_repo
@@ -315,7 +339,7 @@ pub async fn update_setlist(
             .await?;
     }
 
-    match state.setlist_repo.update(id, &payload).await {
+    match state.setlist_repo.update(id, &payload, user_id).await {
         Ok(setlist_id) => {
             info!(
                 %user_id,
@@ -414,9 +438,14 @@ pub async fn add_song_to_setlist(
     );
 
     state.setlist_repo.can_manage(setlist_id, user_id).await?;
-    // The song being contributed must always be the caller's own — this
-    // holds regardless of whether it ends up personal or forked into a band.
-    state.song_repo.exists(payload.song_id, user_id).await?;
+    // The song being contributed must always be one of the caller's own
+    // personal songs, or a copy the setlist's band already owns.
+    let source_song = state
+        .song_repo
+        .find_by_id(payload.song_id, user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    state.quota_repo.ensure_setlist_items(setlist_id, 1).await?;
 
     let setlist = state
         .setlist_repo
@@ -439,7 +468,17 @@ pub async fn add_song_to_setlist(
 
             if source.band_id == Some(band_id) {
                 payload.song_id
+            } else if source.band_id.is_some() {
+                // Another band's copy can't be pulled into this band.
+                return Err(ApiError::NotFound);
             } else {
+                if !state.song_repo.has_band_fork(band_id, source.id).await? {
+                    state
+                        .quota_repo
+                        .ensure_band(band_id, QuotaResource::BandSongs, 1)
+                        .await?;
+                }
+
                 let band_artist = state
                     .artist_repo
                     .find_or_create_for_band(
@@ -463,7 +502,13 @@ pub async fn add_song_to_setlist(
                 forked.id
             }
         }
-        None => payload.song_id,
+        None => {
+            if source_song.band_id.is_some() {
+                // Band copies stay inside their band.
+                return Err(ApiError::NotFound);
+            }
+            payload.song_id
+        }
     };
 
     // A setlist never plays the same song twice — reject outright rather
@@ -482,6 +527,7 @@ pub async fn add_song_to_setlist(
         .setlist_repo
         .add_song(setlist_id, song_id_to_link)
         .await?;
+    state.setlist_repo.touch(setlist_id, user_id).await?;
 
     info!(
         %user_id,
@@ -531,6 +577,7 @@ pub async fn remove_song_from_setlist(
 
     state.setlist_repo.can_manage(setlist_id, user_id).await?;
     state.setlist_repo.remove_song(setlist_id, song_id).await?;
+    state.setlist_repo.touch(setlist_id, user_id).await?;
 
     info!(
         %user_id,
@@ -661,6 +708,7 @@ pub async fn reorder_setlist_songs(
         .setlist_repo
         .reorder_songs(setlist_id, &payload.song_ids)
         .await?;
+    state.setlist_repo.touch(setlist_id, user_id).await?;
 
     info!(
         %user_id,
@@ -732,6 +780,7 @@ pub async fn reorder_setlist_items(
         .setlist_repo
         .reorder_items(setlist_id, &payload.items)
         .await?;
+    state.setlist_repo.touch(setlist_id, user_id).await?;
 
     info!(%user_id, %setlist_id, "Setlist items reordered successfully");
 
@@ -766,10 +815,13 @@ pub async fn create_setlist_block(
 
     state.setlist_repo.can_manage(setlist_id, user_id).await?;
 
+    state.quota_repo.ensure_setlist_items(setlist_id, 1).await?;
+
     let marker = state
         .setlist_repo
-        .create_block(setlist_id, &payload.name)
+        .create_block(setlist_id, payload.name.trim())
         .await?;
+    state.setlist_repo.touch(setlist_id, user_id).await?;
 
     info!(%user_id, %setlist_id, marker_id = %marker.id, "Setlist block created successfully");
 
@@ -808,8 +860,9 @@ pub async fn update_setlist_block(
 
     let marker = state
         .setlist_repo
-        .update_block(setlist_id, marker_id, &payload.name)
+        .update_block(setlist_id, marker_id, payload.name.trim())
         .await?;
+    state.setlist_repo.touch(setlist_id, user_id).await?;
 
     info!(%user_id, %setlist_id, %marker_id, "Setlist block updated successfully");
 
@@ -844,10 +897,13 @@ pub async fn create_setlist_break(
 
     state.setlist_repo.can_manage(setlist_id, user_id).await?;
 
+    state.quota_repo.ensure_setlist_items(setlist_id, 1).await?;
+
     let marker = state
         .setlist_repo
         .create_break(setlist_id, payload.label, payload.duration_minutes)
         .await?;
+    state.setlist_repo.touch(setlist_id, user_id).await?;
 
     info!(%user_id, %setlist_id, marker_id = %marker.id, "Setlist break created successfully");
 
@@ -893,6 +949,7 @@ pub async fn update_setlist_break(
             payload.duration_minutes,
         )
         .await?;
+    state.setlist_repo.touch(setlist_id, user_id).await?;
 
     info!(%user_id, %setlist_id, %marker_id, "Setlist break updated successfully");
 
@@ -928,6 +985,7 @@ pub async fn delete_setlist_marker(
         .setlist_repo
         .delete_marker(setlist_id, marker_id)
         .await?;
+    state.setlist_repo.touch(setlist_id, user_id).await?;
 
     info!(%user_id, %setlist_id, %marker_id, "Setlist marker deleted successfully");
 
@@ -974,35 +1032,68 @@ pub async fn export_setlist_pdf(
         .ok_or(ApiError::NotFound)?;
 
     let items = state.setlist_repo.get_items(id).await?;
-
     let options = PdfExportOptions::from(query);
 
-    match generate_setlist_pdf(&setlist.title, setlist.total_duration, &items, &options) {
+    render_setlist_pdf(&state, &setlist, &items, &options).await
+}
+
+/// Renders a setlist to PDF on the blocking pool (PDF layout is CPU-bound
+/// and would otherwise stall the async runtime for every other request)
+/// and wraps it in a download response.
+async fn render_setlist_pdf(
+    state: &AppState,
+    setlist: &Setlist,
+    items: &[SetlistItem],
+    options: &PdfExportOptions,
+) -> Result<axum::response::Response, ApiError> {
+    let band_name = match setlist.band_id {
+        Some(band_id) => state.band_repo.find_any(band_id).await?.map(|b| b.name),
+        None => None,
+    };
+
+    let title = setlist.title.clone();
+    let description = setlist.description.clone();
+    let total_duration_secs = setlist.total_duration;
+    let items = items.to_vec();
+    let options = options.clone();
+    let setlist_id = setlist.id;
+
+    let rendered = tokio::task::spawn_blocking(move || {
+        let data = SetlistPdfData {
+            title: &title,
+            description: description.as_deref(),
+            band_name: band_name.as_deref(),
+            total_duration_secs,
+            items: &items,
+        };
+        generate_setlist_pdf(&data, &options)
+    })
+    .await
+    .map_err(|e| ApiError::ServerError(axum::Error::new(e)))?;
+
+    match rendered {
         Ok(pdf_bytes) => {
             let mut headers = HeaderMap::new();
             headers.insert(
                 axum::http::header::CONTENT_TYPE,
                 HeaderValue::from_static("application/pdf"),
             );
-
-            let filename = format!(
-                "setlist-{}.pdf",
-                setlist.title.replace(" ", "-").to_lowercase()
-            );
-
             if let Ok(disposition) =
-                HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+                HeaderValue::from_str(&content_disposition(&pdf_filename(&setlist.title)))
             {
                 headers.insert(axum::http::header::CONTENT_DISPOSITION, disposition);
             }
-
-            info!(%user_id, setlist_id = %id, "Setlist PDF exported successfully");
-
+            headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store"),
+            );
             Ok((StatusCode::OK, headers, pdf_bytes).into_response())
         }
         Err(e) => {
-            error!(%user_id, setlist_id = %id, error = ?e, "Failed to generate PDF");
-            Ok((StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate PDF").into_response())
+            error!(%setlist_id, error = ?e, "Failed to generate PDF");
+            Err(ApiError::ServerError(axum::Error::new(
+                std::io::Error::other("Failed to generate PDF"),
+            )))
         }
     }
 }
@@ -1202,7 +1293,7 @@ pub async fn get_public_setlist(
         .await?
         .ok_or(ApiError::NotFound)?;
 
-    let songs = state.setlist_repo.get_songs(setlist.id, 1, 200);
+    let songs = state.setlist_repo.get_songs(setlist.id, 1, 10_000);
     let markers = state.setlist_repo.get_markers(setlist.id);
     let ((songs, _), markers) = tokio::try_join!(songs, markers)?;
 
@@ -1246,35 +1337,7 @@ pub async fn export_public_setlist_pdf(
         .ok_or(ApiError::NotFound)?;
 
     let items = state.setlist_repo.get_items(setlist.id).await?;
-
     let options = PdfExportOptions::from(query);
 
-    match generate_setlist_pdf(&setlist.title, setlist.total_duration, &items, &options) {
-        Ok(pdf_bytes) => {
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_static("application/pdf"),
-            );
-
-            let filename = format!(
-                "setlist-{}.pdf",
-                setlist.title.replace(" ", "-").to_lowercase()
-            );
-
-            if let Ok(disposition) =
-                HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
-            {
-                headers.insert(axum::http::header::CONTENT_DISPOSITION, disposition);
-            }
-
-            info!(setlist_id = %setlist.id, "Public setlist PDF exported successfully");
-
-            Ok((StatusCode::OK, headers, pdf_bytes).into_response())
-        }
-        Err(e) => {
-            error!(setlist_id = %setlist.id, error = ?e, "Failed to generate PDF for public setlist");
-            Ok((StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate PDF").into_response())
-        }
-    }
+    render_setlist_pdf(&state, &setlist, &items, &options).await
 }

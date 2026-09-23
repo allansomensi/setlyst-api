@@ -448,18 +448,28 @@ pub struct Song {
     pub band_id: Option<Uuid>,
     /// The personal song this band-owned copy was forked from, or `None`
     /// for a personal song (or a fork whose source was later deleted — the
-    /// link is cleared, not the copy). Lets re-adding the same source song
-    /// to the same band resolve to the existing fork instead of creating a
-    /// new duplicate. See [`Song::fork_for_band`].
+    /// link is cleared, not the copy).
     pub forked_from: Option<Uuid>,
     pub tempo: Option<i32>,
     pub lyrics: Option<String>,
     pub tonality: Option<Tonality>,
     pub genre: Option<Genre>,
     pub duration: Option<i32>,
+    /// Normalized (lowercase) tags, alphabetically sorted.
+    #[sqlx(default)]
+    pub tags: Vec<String>,
+    /// Who last changed the song (`None` if never edited since creation,
+    /// or if that account was deleted).
+    #[sqlx(default)]
+    pub updated_by: Option<Uuid>,
+    #[sqlx(default)]
+    pub updated_by_username: Option<String>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
+
+/// Longest song duration accepted, in seconds (2 hours).
+pub const MAX_SONG_DURATION_SECS: i32 = 7_200;
 
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
 pub struct CreateSongPayload {
@@ -468,25 +478,46 @@ pub struct CreateSongPayload {
     pub artist_id: Uuid,
     #[validate(range(min = 1, max = 500, message = "Tempo must be a valid BPM."))]
     pub tempo: Option<i32>,
+    #[validate(custom(function = "crate::validations::text::validate_lyrics"))]
     pub lyrics: Option<String>,
     pub tonality: Option<Tonality>,
     pub genre: Option<Genre>,
-    #[validate(range(min = 1, message = "Duration must be positive."))]
+    #[validate(range(
+        min = 1,
+        max = 7200,
+        message = "Duration must be between 1 second and 2 hours."
+    ))]
     pub duration: Option<i32>,
+    /// Free-form tags; normalized server-side (see `validations::tag`).
+    pub tags: Option<Vec<String>>,
 }
 
-#[derive(Deserialize, Serialize, ToSchema, Validate)]
+/// Every nullable field uses `Option<Option<T>>`: absent leaves it
+/// unchanged, `null` clears it (see [`crate::models::patch`]).
+#[derive(Deserialize, Serialize, ToSchema, Validate, Default)]
 pub struct UpdateSongPayload {
     #[validate(length(min = 1, max = 255, message = "Title must be between 1 and 255 chars."))]
     pub title: Option<String>,
     pub artist_id: Option<Uuid>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
     #[validate(range(min = 1, max = 500, message = "Tempo must be a valid BPM."))]
-    pub tempo: Option<i32>,
-    pub lyrics: Option<String>,
-    pub tonality: Option<Tonality>,
-    pub genre: Option<Genre>,
-    #[validate(range(min = 1, message = "Duration must be positive."))]
-    pub duration: Option<i32>,
+    pub tempo: Option<Option<i32>>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    #[validate(custom(function = "crate::validations::text::validate_lyrics"))]
+    pub lyrics: Option<Option<String>>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    pub tonality: Option<Option<Tonality>>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    pub genre: Option<Option<Genre>>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    #[validate(range(
+        min = 1,
+        max = 7200,
+        message = "Duration must be between 1 second and 2 hours."
+    ))]
+    pub duration: Option<Option<i32>>,
+    /// Replaces the song's whole tag set when present.
+    pub tags: Option<Vec<String>>,
 }
 
 impl Song {
@@ -504,6 +535,9 @@ impl Song {
             tonality: payload.tonality,
             genre: payload.genre,
             duration: payload.duration,
+            tags: Vec::new(),
+            updated_by: None,
+            updated_by_username: None,
             created_at: now,
             updated_at: now,
         }
@@ -531,6 +565,9 @@ impl Song {
             tonality: source.tonality,
             genre: source.genre,
             duration: source.duration,
+            tags: source.tags.clone(),
+            updated_by: None,
+            updated_by_username: None,
             created_at: now,
             updated_at: now,
         }
@@ -564,6 +601,37 @@ pub struct SongWithArtist {
     pub tonality: Option<Tonality>,
     pub genre: Option<Genre>,
     pub duration: Option<i32>,
+    #[sqlx(default)]
+    pub tags: Vec<String>,
+    #[sqlx(default)]
+    pub updated_by: Option<Uuid>,
+    #[sqlx(default)]
+    pub updated_by_username: Option<String>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
+}
+
+/// One tag in the caller's vocabulary, with how many songs use it.
+#[derive(ToSchema, Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct TagCount {
+    pub tag: String,
+    pub song_count: i64,
+}
+
+#[derive(Deserialize, Serialize, ToSchema, Validate)]
+pub struct RenameTagPayload {
+    #[validate(length(min = 1, max = 30, message = "Tags must be between 1 and 30 chars."))]
+    pub new_name: String,
+}
+
+/// Filters for `GET /songs`.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct SongListQuery {
+    pub page: Option<i64>,
+    pub per_page: Option<i64>,
+    /// Case-insensitive search over title and artist name.
+    pub q: Option<String>,
+    /// Only songs carrying *all* of these tags (comma-separated).
+    pub tags: Option<String>,
 }

@@ -1,12 +1,12 @@
 pub mod config;
-mod controllers;
+pub mod controllers;
 pub mod database;
 pub mod errors;
-mod export;
-mod middlewares;
+pub mod export;
+pub mod middlewares;
 pub mod models;
 mod openapi;
-mod routes;
+pub mod routes;
 pub mod server;
-mod utils;
-mod validations;
+pub mod utils;
+pub mod validations;

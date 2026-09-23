@@ -3,6 +3,7 @@ use argon2::{
     Argon2,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
 };
+use std::sync::OnceLock;
 use tracing::error;
 
 /// Encrypt a password.
@@ -22,12 +23,17 @@ pub fn verify_password(plain_password: &str, hash: &str) -> Result<(), ApiError>
         ApiError::WrongPassword
     })?;
 
-    let argon2 = Argon2::default();
-
-    argon2
+    Argon2::default()
         .verify_password(plain_password.as_bytes(), &parsed_hash)
-        .map_err(|e| {
-            error!("Error verifying password: {e}");
-            ApiError::WrongPassword
-        })
+        .map_err(|_| ApiError::WrongPassword)
+}
+
+/// Burns roughly the same time as a real verification. Called when a
+/// sign-in names an account that doesn't exist, so response timing can't
+/// be used to find out which usernames are registered.
+pub fn dummy_verify(plain_password: &str) {
+    static DUMMY_HASH: OnceLock<String> = OnceLock::new();
+    let hash =
+        DUMMY_HASH.get_or_init(|| encrypt_password("setlyst-timing-equalizer").unwrap_or_default());
+    let _ = verify_password(plain_password, hash);
 }

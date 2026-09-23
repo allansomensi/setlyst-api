@@ -3,43 +3,59 @@ use crate::{
     errors::api_error::ApiError,
     models::{auth::token::Claims, user::User},
 };
-use chrono::{Duration, TimeDelta, Utc};
+use chrono::{Duration, NaiveDateTime, Utc};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, TokenData, Validation, decode, encode};
+use uuid::Uuid;
 
-pub fn generate_jwt(user: &User) -> Result<String, ApiError> {
+fn sign(claims: &Claims) -> Result<String, ApiError> {
     let config = Config::get();
-    let now = Utc::now();
-    let expire: TimeDelta = Duration::seconds(config.jwt_expiration_time);
-    let exp: usize = (now + expire).timestamp() as usize;
-    let iat: usize = now.timestamp() as usize;
+    Ok(encode(
+        &Header::default(),
+        claims,
+        &EncodingKey::from_secret(config.jwt_secret.as_bytes()),
+    )?)
+}
 
-    let claims = Claims {
+fn build_claims(user: &User, ttl_seconds: i64, impersonator: Option<Uuid>) -> Claims {
+    let now = Utc::now();
+    Claims {
         sub: user.id,
         username: user.username.clone(),
         role: user.role.clone(),
         status: user.status.clone(),
-        exp,
-        iat,
-    };
+        exp: (now + Duration::seconds(ttl_seconds)).timestamp() as usize,
+        iat: now.timestamp() as usize,
+        ver: user.token_version,
+        imp: impersonator,
+    }
+}
 
-    let token = encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(config.jwt_secret.as_bytes()),
-    )?;
+/// A regular session token for `user`.
+pub fn generate_jwt(user: &User) -> Result<String, ApiError> {
+    let config = Config::get();
+    sign(&build_claims(user, config.jwt_expiration_time, None))
+}
 
-    Ok(token)
+/// A short-lived, read-only token that lets `impersonator_id` see the
+/// platform as `target`. Returns the token and its expiry.
+pub fn generate_impersonation_jwt(
+    target: &User,
+    impersonator_id: Uuid,
+) -> Result<(String, NaiveDateTime), ApiError> {
+    let config = Config::get();
+    let claims = build_claims(
+        target,
+        config.impersonation_expiration_time,
+        Some(impersonator_id),
+    );
+    let expires_at = chrono::DateTime::from_timestamp(claims.exp as i64, 0)
+        .map(|dt| dt.naive_utc())
+        .unwrap_or_else(|| Utc::now().naive_utc());
+    Ok((sign(&claims)?, expires_at))
 }
 
 pub fn validate_jwt(token: &str) -> Result<(), ApiError> {
-    let config = Config::get();
-    let validation = Validation::default();
-    let _: TokenData<Claims> = decode(
-        token,
-        &DecodingKey::from_secret(config.jwt_secret.as_bytes()),
-        &validation,
-    )?;
-    Ok(())
+    decode_jwt(token.to_string()).map(|_| ())
 }
 
 pub fn decode_jwt(token: String) -> Result<TokenData<Claims>, ApiError> {

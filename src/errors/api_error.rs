@@ -7,7 +7,36 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use chrono::NaiveDateTime;
+use serde_json::{Value, json};
 use thiserror::Error;
+use tracing::error;
+
+/// Stable, machine-readable error codes.
+///
+/// These are part of the public API contract: the frontend keys its
+/// translated messages off them, so a code must never be renamed once
+/// shipped. Add new ones instead.
+pub mod codes {
+    pub const INVALID_CREDENTIALS: &str = "INVALID_CREDENTIALS";
+    pub const ACCOUNT_BANNED: &str = "ACCOUNT_BANNED";
+    pub const ACCOUNT_DEACTIVATED: &str = "ACCOUNT_DEACTIVATED";
+    pub const SESSION_REVOKED: &str = "SESSION_REVOKED";
+    pub const PASSWORD_CHANGE_REQUIRED: &str = "PASSWORD_CHANGE_REQUIRED";
+    pub const WEAK_PASSWORD: &str = "WEAK_PASSWORD";
+    pub const PASSWORD_REUSED: &str = "PASSWORD_REUSED";
+    pub const IMPERSONATION_READ_ONLY: &str = "IMPERSONATION_READ_ONLY";
+    pub const QUOTA_EXCEEDED: &str = "QUOTA_EXCEEDED";
+    pub const INSUFFICIENT_ROLE: &str = "INSUFFICIENT_ROLE";
+    pub const CANNOT_TARGET_SELF: &str = "CANNOT_TARGET_SELF";
+    pub const LAST_ADMIN: &str = "LAST_ADMIN";
+    pub const SHARE_LOCKED: &str = "SHARE_LOCKED";
+    pub const USERNAME_COOLDOWN: &str = "USERNAME_COOLDOWN";
+    pub const USERNAME_TAKEN: &str = "USERNAME_TAKEN";
+    pub const INVITE_INVALID: &str = "INVITE_INVALID";
+    pub const ALREADY_MEMBER: &str = "ALREADY_MEMBER";
+    pub const PAYLOAD_TOO_LARGE: &str = "PAYLOAD_TOO_LARGE";
+}
 
 #[derive(Error, Debug)]
 pub enum ApiError {
@@ -52,6 +81,148 @@ pub enum ApiError {
 
     #[error("Incorrect password! Try again.")]
     WrongPassword,
+
+    /// A business-rule failure with a stable [`codes`] entry, so clients can
+    /// react to (and translate) it without parsing English prose.
+    #[error("{message}")]
+    Rule {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+        meta: Option<Value>,
+    },
+}
+
+impl ApiError {
+    pub fn rule(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self::Rule {
+            status,
+            code,
+            message: message.into(),
+            meta: None,
+        }
+    }
+
+    pub fn rule_with_meta(
+        status: StatusCode,
+        code: &'static str,
+        message: impl Into<String>,
+        meta: Value,
+    ) -> Self {
+        Self::Rule {
+            status,
+            code,
+            message: message.into(),
+            meta: Some(meta),
+        }
+    }
+
+    pub fn invalid_credentials() -> Self {
+        Self::rule(
+            StatusCode::UNAUTHORIZED,
+            codes::INVALID_CREDENTIALS,
+            "Invalid username or password.",
+        )
+    }
+
+    pub fn account_banned(until: Option<NaiveDateTime>, reason: Option<String>) -> Self {
+        Self::rule_with_meta(
+            StatusCode::FORBIDDEN,
+            codes::ACCOUNT_BANNED,
+            match until {
+                Some(until) => format!(
+                    "This account is suspended until {} UTC.",
+                    until.format("%Y-%m-%d %H:%M")
+                ),
+                None => "This account is permanently suspended.".to_string(),
+            },
+            json!({ "until": until, "reason": reason }),
+        )
+    }
+
+    pub fn account_deactivated() -> Self {
+        Self::rule(
+            StatusCode::FORBIDDEN,
+            codes::ACCOUNT_DEACTIVATED,
+            "This account is deactivated. Contact an administrator.",
+        )
+    }
+
+    pub fn session_revoked() -> Self {
+        Self::rule(
+            StatusCode::UNAUTHORIZED,
+            codes::SESSION_REVOKED,
+            "Your session is no longer valid. Please sign in again.",
+        )
+    }
+
+    pub fn password_change_required() -> Self {
+        Self::rule(
+            StatusCode::FORBIDDEN,
+            codes::PASSWORD_CHANGE_REQUIRED,
+            "You must change your password before continuing.",
+        )
+    }
+
+    pub fn impersonation_read_only() -> Self {
+        Self::rule(
+            StatusCode::FORBIDDEN,
+            codes::IMPERSONATION_READ_ONLY,
+            "Changes are disabled while viewing the platform as another user.",
+        )
+    }
+
+    pub fn insufficient_role(message: impl Into<String>) -> Self {
+        Self::rule(StatusCode::FORBIDDEN, codes::INSUFFICIENT_ROLE, message)
+    }
+
+    pub fn cannot_target_self(message: impl Into<String>) -> Self {
+        Self::rule(StatusCode::FORBIDDEN, codes::CANNOT_TARGET_SELF, message)
+    }
+
+    pub fn quota_exceeded(resource: &str, limit: i64) -> Self {
+        Self::rule_with_meta(
+            StatusCode::FORBIDDEN,
+            codes::QUOTA_EXCEEDED,
+            format!("You have reached the limit of {limit} for '{resource}'."),
+            json!({ "resource": resource, "limit": limit }),
+        )
+    }
+
+    pub fn weak_password(issues: &[&'static str]) -> Self {
+        Self::rule_with_meta(
+            StatusCode::BAD_REQUEST,
+            codes::WEAK_PASSWORD,
+            "The password does not meet the security requirements.",
+            json!({ "issues": issues }),
+        )
+    }
+
+    /// The machine-readable code this error serializes with.
+    pub fn code(&self) -> &str {
+        match self {
+            ApiError::DatabaseError(e) if is_unique_violation(e) => "ALREADY_EXISTS",
+            ApiError::DatabaseError(_) => "DATABASE_ERROR",
+            ApiError::ValidationError(_) => "VALIDATION_ERROR",
+            ApiError::EncryptionError(_) => "ENCRYPT_ERROR",
+            ApiError::JWTError(_) => "JWT_ERROR",
+            ApiError::ServerError(_) => "SERVER_ERROR",
+            ApiError::AuthError(_) => "AUTH_ERROR",
+            ApiError::ConfigError(_) => "CONFIG_ERROR",
+            ApiError::NotFound => "NOT_FOUND",
+            ApiError::AlreadyExists => "ALREADY_EXISTS",
+            ApiError::NotModified => "UNPROCESSABLE_ENTITY",
+            ApiError::Unauthorized => "UNAUTHORIZED",
+            ApiError::Forbidden => "FORBIDDEN",
+            ApiError::BadRequest(_) => "BAD_REQUEST",
+            ApiError::WrongPassword => "WRONG_PASSWORD",
+            ApiError::Rule { code, .. } => code,
+        }
+    }
+}
+
+fn is_unique_violation(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
 }
 
 #[derive(serde::Serialize)]
@@ -59,129 +230,182 @@ struct ErrorResponse {
     code: String,
     message: String,
     details: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta: Option<Value>,
+}
+
+impl ErrorResponse {
+    fn new(code: &str, message: impl Into<String>, details: Option<&str>) -> Self {
+        Self {
+            code: code.to_string(),
+            message: message.into(),
+            details: details.map(str::to_string),
+            meta: None,
+        }
+    }
+}
+
+/// Flattens `validator` errors into `{ field: [{ code, message }] }` and
+/// picks the first human-readable message, so a client can both show a
+/// useful toast and highlight the offending fields.
+fn describe_validation_errors(errors: &validator::ValidationErrors) -> (String, Value) {
+    let mut fields = serde_json::Map::new();
+    let mut first_message: Option<String> = None;
+
+    let mut field_errors: Vec<_> = errors.field_errors().into_iter().collect();
+    field_errors.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (field, errs) in field_errors {
+        let entries: Vec<Value> = errs
+            .iter()
+            .map(|err| {
+                let message = err
+                    .message
+                    .as_ref()
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| format!("Invalid value for '{field}'."));
+                if first_message.is_none() {
+                    first_message = Some(message.clone());
+                }
+                json!({ "code": err.code, "message": message })
+            })
+            .collect();
+        fields.insert(field.to_string(), Value::Array(entries));
+    }
+
+    (
+        first_message.unwrap_or_else(|| "One or more validation errors occurred.".to_string()),
+        json!({ "fields": fields }),
+    )
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let code = self.code().to_string();
+
         let (status_code, error_response) = match &self {
-            ApiError::DatabaseError(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse {
-                    code: String::from("DATABASE_ERROR"),
-                    message: String::from("An unexpected database error occurred."),
-                    details: Some(String::from("Please try again later or contact support.")),
-                },
+            ApiError::DatabaseError(e) if is_unique_violation(e) => (
+                StatusCode::CONFLICT,
+                ErrorResponse::new(
+                    &code,
+                    "A resource with the provided details already exists.",
+                    Some("Please choose a different name."),
+                ),
             ),
-            ApiError::ValidationError(e) => (
-                StatusCode::BAD_REQUEST,
-                ErrorResponse {
-                    code: String::from("VALIDATION_ERROR"),
-                    message: String::from("One or more validation errors occurred."),
-                    details: Some(e.to_string()),
-                },
-            ),
-            ApiError::EncryptionError(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse {
-                    code: String::from("ENCRYPT_ERROR"),
-                    message: String::from("One or more encryption errors occurred."),
-                    details: Some(e.to_string()),
-                },
-            ),
-            ApiError::JWTError(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse {
-                    code: String::from("JWT_ERROR"),
-                    message: String::from("One or more JWT errors occurred."),
-                    details: Some(e.to_string()),
-                },
-            ),
-            ApiError::ServerError(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse {
-                    code: String::from("SERVER_ERROR"),
-                    message: String::from("One or more server errors occurred."),
-                    details: Some(e.to_string()),
-                },
-            ),
+            ApiError::DatabaseError(e) => {
+                error!(error = %e, "Unhandled database error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new(
+                        &code,
+                        "An unexpected database error occurred.",
+                        Some("Please try again later or contact support."),
+                    ),
+                )
+            }
+            ApiError::ValidationError(e) => {
+                let (message, meta) = describe_validation_errors(e);
+                let mut response = ErrorResponse::new(&code, message, None);
+                response.meta = Some(meta);
+                (StatusCode::BAD_REQUEST, response)
+            }
+            // Internal failures never echo their inner message back: it can
+            // carry library internals that are meaningless (or sensitive)
+            // to a client. The detail goes to the logs instead.
+            ApiError::EncryptionError(e) => {
+                error!(error = %e, "Encryption error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new(&code, "One or more encryption errors occurred.", None),
+                )
+            }
+            ApiError::JWTError(e) => {
+                error!(error = %e, "JWT error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new(&code, "One or more JWT errors occurred.", None),
+                )
+            }
+            ApiError::ServerError(e) => {
+                error!(error = %e, "Server error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new(&code, "One or more server errors occurred.", None),
+                )
+            }
+            ApiError::ConfigError(e) => {
+                error!(error = %e, "Configuration error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new(&code, "One or more config errors occurred.", None),
+                )
+            }
             ApiError::AuthError(e) => (
                 StatusCode::UNAUTHORIZED,
-                ErrorResponse {
-                    code: String::from("AUTH_ERROR"),
-                    message: String::from("One or more auth errors occurred."),
-                    details: Some(e.to_string()),
-                },
-            ),
-            ApiError::ConfigError(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse {
-                    code: String::from("CONFIG_ERROR"),
-                    message: String::from("One or more config errors occurred."),
-                    details: Some(e.to_string()),
-                },
+                ErrorResponse::new(&code, e.to_string(), None),
             ),
             ApiError::NotFound => (
                 StatusCode::NOT_FOUND,
-                ErrorResponse {
-                    code: String::from("NOT_FOUND"),
-                    message: String::from("The data provided does not exist."),
-                    details: Some(String::from(
-                        "Please check if the data is correct and try again.",
-                    )),
-                },
+                ErrorResponse::new(
+                    &code,
+                    "The data provided does not exist.",
+                    Some("Please check if the data is correct and try again."),
+                ),
             ),
             ApiError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
-                ErrorResponse {
-                    code: String::from("UNAUTHORIZED"),
-                    message: String::from("You are not allowed to continue."),
-                    details: Some(String::from("Please try again later.")),
-                },
+                ErrorResponse::new(
+                    &code,
+                    "You are not allowed to continue.",
+                    Some("Please sign in again."),
+                ),
             ),
             ApiError::Forbidden => (
                 StatusCode::FORBIDDEN,
-                ErrorResponse {
-                    code: String::from("FORBIDDEN"),
-                    message: String::from("You do not have permission to perform this action"),
-                    details: Some(String::from(
-                        "Your current role does not grant access to this resource.",
-                    )),
-                },
+                ErrorResponse::new(
+                    &code,
+                    "You do not have permission to perform this action.",
+                    Some("Your current role does not grant access to this resource."),
+                ),
             ),
             ApiError::BadRequest(message) => (
                 StatusCode::BAD_REQUEST,
-                ErrorResponse {
-                    code: String::from("BAD_REQUEST"),
-                    message: message.clone(),
-                    details: None,
-                },
+                ErrorResponse::new(&code, message.clone(), None),
             ),
             ApiError::WrongPassword => (
                 StatusCode::UNAUTHORIZED,
-                ErrorResponse {
-                    code: String::from("WRONG_PASSWORD"),
-                    message: String::from("Incorrect password! Try again."),
-                    details: Some(String::from("Please try again.")),
-                },
+                ErrorResponse::new(
+                    &code,
+                    "Incorrect password! Try again.",
+                    Some("Please try again."),
+                ),
             ),
             ApiError::NotModified => (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                ErrorResponse {
-                    code: String::from("UNPROCESSABLE_ENTITY"),
-                    message: String::from("No updates were made for the provided ID."),
-                    details: Some(String::from(
-                        "The provided ID may not exist, or no fields were changed. Please verify the ID and the update values.",
-                    )),
-                },
+                ErrorResponse::new(
+                    &code,
+                    "No updates were made for the provided ID.",
+                    Some("No fields were changed. Please verify the update values."),
+                ),
             ),
             ApiError::AlreadyExists => (
                 StatusCode::CONFLICT,
-                ErrorResponse {
-                    code: String::from("ALREADY_EXISTS"),
-                    message: String::from("A resource with the provided details already exists."),
-                    details: Some(String::from("Please choose a different name.")),
-                },
+                ErrorResponse::new(
+                    &code,
+                    "A resource with the provided details already exists.",
+                    Some("Please choose a different name."),
+                ),
             ),
+            ApiError::Rule {
+                status,
+                message,
+                meta,
+                ..
+            } => {
+                let mut response = ErrorResponse::new(&code, message.clone(), None);
+                response.meta = meta.clone();
+                (*status, response)
+            }
         };
 
         (status_code, Json(error_response)).into_response()
@@ -191,5 +415,57 @@ impl IntoResponse for ApiError {
 impl From<std::env::VarError> for ApiError {
     fn from(e: std::env::VarError) -> ApiError {
         ApiError::ConfigError(ConfigError::EnvVarNotFound(e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    async fn body_json(error: ApiError) -> (StatusCode, Value) {
+        let response = error.into_response();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn quota_errors_carry_structured_meta() {
+        let (status, body) = body_json(ApiError::quota_exceeded("songs", 10)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], "QUOTA_EXCEEDED");
+        assert_eq!(body["meta"]["resource"], "songs");
+        assert_eq!(body["meta"]["limit"], 10);
+    }
+
+    #[tokio::test]
+    async fn internal_errors_do_not_leak_details() {
+        let (status, body) =
+            body_json(ApiError::ServerError(axum::Error::new("secret internals"))).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body.to_string().contains("secret internals"));
+    }
+
+    #[tokio::test]
+    async fn validation_errors_surface_the_first_field_message() {
+        use validator::Validate;
+
+        #[derive(Validate)]
+        struct Payload {
+            #[validate(length(min = 3, message = "Too short."))]
+            name: String,
+        }
+
+        let err = Payload {
+            name: "a".to_string(),
+        }
+        .validate()
+        .unwrap_err();
+
+        let (status, body) = body_json(ApiError::from(err)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["message"], "Too short.");
+        assert_eq!(body["meta"]["fields"]["name"][0]["code"], "length");
     }
 }

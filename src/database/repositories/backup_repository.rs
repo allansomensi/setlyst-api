@@ -1,9 +1,13 @@
 use crate::{
     errors::api_error::ApiError,
-    models::backup::{
-        BACKUP_FORMAT_VERSION, BackupArtist, BackupFile, BackupGig, BackupSetlist,
-        BackupSetlistSong, BackupSong, ImportSummary,
+    models::{
+        backup::{
+            BACKUP_FORMAT_VERSION, BackupArtist, BackupFile, BackupGig, BackupSetlist,
+            BackupSetlistSong, BackupSong, ImportSummary,
+        },
+        quota::QuotaLimits,
     },
+    validations::tag::normalize_tags,
 };
 use chrono::Utc;
 use sqlx::PgPool;
@@ -27,6 +31,7 @@ struct SongRow {
     tonality: Option<crate::models::song::Tonality>,
     genre: Option<crate::models::song::Genre>,
     duration: Option<i32>,
+    tags: Vec<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -71,7 +76,15 @@ pub trait BackupRepository: Send + Sync {
     ///
     /// The entire operation is wrapped in a single database transaction; any
     /// failure rolls back completely, leaving the target account untouched.
-    async fn import(&self, user_id: Uuid, backup: BackupFile) -> Result<ImportSummary, ApiError>;
+    /// When `limits` is given, the account's totals are checked against
+    /// them *after* merging (so re-importing overlapping data isn't
+    /// penalized) and the whole import is rolled back if any is exceeded.
+    async fn import(
+        &self,
+        user_id: Uuid,
+        backup: BackupFile,
+        limits: Option<QuotaLimits>,
+    ) -> Result<ImportSummary, ApiError>;
 }
 
 pub struct BackupRepositoryImpl {
@@ -94,10 +107,11 @@ impl BackupRepository for BackupRepositoryImpl {
         .fetch_all(&self.db);
 
         let songs_fut = sqlx::query_as::<_, SongRow>(
-            "SELECT id, title, artist_id, tempo, lyrics, tonality, genre, duration
-             FROM songs
-             WHERE user_id = $1 AND band_id IS NULL
-             ORDER BY title ASC",
+            "SELECT s.id, s.title, s.artist_id, s.tempo, s.lyrics, s.tonality, s.genre, s.duration,
+                    COALESCE((SELECT array_agg(st.tag ORDER BY st.tag) FROM song_tags st WHERE st.song_id = s.id), '{}') AS tags
+             FROM songs s
+             WHERE s.user_id = $1 AND s.band_id IS NULL
+             ORDER BY s.title ASC",
         )
         .bind(user_id)
         .fetch_all(&self.db);
@@ -166,6 +180,7 @@ impl BackupRepository for BackupRepositoryImpl {
                 tonality: r.tonality,
                 genre: r.genre,
                 duration: r.duration,
+                tags: r.tags,
             })
             .collect();
 
@@ -201,7 +216,14 @@ impl BackupRepository for BackupRepositoryImpl {
         })
     }
 
-    async fn import(&self, user_id: Uuid, backup: BackupFile) -> Result<ImportSummary, ApiError> {
+    async fn import(
+        &self,
+        user_id: Uuid,
+        backup: BackupFile,
+        limits: Option<QuotaLimits>,
+    ) -> Result<ImportSummary, ApiError> {
+        backup.validate_contents().map_err(ApiError::BadRequest)?;
+
         let now = Utc::now().naive_utc();
 
         let artists_incoming = backup.artists.len();
@@ -215,7 +237,7 @@ impl BackupRepository for BackupRepositoryImpl {
 
         for artist in &backup.artists {
             let resolved_id: Uuid = match sqlx::query_scalar(
-                "SELECT id FROM artists WHERE name = $1 AND user_id = $2 AND band_id IS NULL",
+                "SELECT id FROM artists WHERE LOWER(name) = LOWER($1) AND user_id = $2 AND band_id IS NULL",
             )
             .bind(&artist.name)
             .bind(user_id)
@@ -256,12 +278,15 @@ impl BackupRepository for BackupRepositoryImpl {
                         song.title, song.artist_id
                     );
                     tx.rollback().await?;
-                    return Err(ApiError::DatabaseError(sqlx::Error::RowNotFound));
+                    return Err(ApiError::BadRequest(format!(
+                        "Invalid backup: the song \"{}\" references an artist that isn't in the file.",
+                        song.title
+                    )));
                 }
             };
 
             let resolved_id: Uuid = match sqlx::query_scalar(
-                "SELECT id FROM songs WHERE title = $1 AND artist_id = $2 AND user_id = $3 AND band_id IS NULL",
+                "SELECT id FROM songs WHERE LOWER(TRIM(title)) = LOWER(TRIM($1)) AND artist_id = $2 AND user_id = $3 AND band_id IS NULL",
             )
             .bind(&song.title)
             .bind(resolved_artist_id)
@@ -298,6 +323,20 @@ impl BackupRepository for BackupRepositoryImpl {
                 }
             };
 
+            let tags = normalize_tags(&song.tags).unwrap_or_default();
+            if !tags.is_empty() {
+                sqlx::query(
+                    "INSERT INTO song_tags (song_id, tag, created_at)
+                     SELECT $1, t, $3 FROM UNNEST($2::text[]) AS t
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(resolved_id)
+                .bind(&tags)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
+
             song_id_map.insert(song.id, resolved_id);
         }
 
@@ -333,7 +372,10 @@ impl BackupRepository for BackupRepositoryImpl {
                             setlist.title, entry.song_id
                         );
                         tx.rollback().await?;
-                        return Err(ApiError::DatabaseError(sqlx::Error::RowNotFound));
+                        return Err(ApiError::BadRequest(format!(
+                            "Invalid backup: the setlist \"{}\" references a song that isn't in the file.",
+                            setlist.title
+                        )));
                     }
                 };
 
@@ -383,6 +425,35 @@ impl BackupRepository for BackupRepositoryImpl {
                 error!("Failed to insert gig '{}': {e}", gig.venue);
                 ApiError::DatabaseError(e)
             })?;
+        }
+
+        if let Some(limits) = limits {
+            let (artists, songs, setlists, gigs, tags): (i64, i64, i64, i64, i64) = sqlx::query_as(
+                "SELECT
+                    (SELECT COUNT(*) FROM artists WHERE user_id = $1 AND band_id IS NULL),
+                    (SELECT COUNT(*) FROM songs WHERE user_id = $1 AND band_id IS NULL),
+                    (SELECT COUNT(*) FROM setlists WHERE user_id = $1 AND band_id IS NULL),
+                    (SELECT COUNT(*) FROM gigs WHERE user_id = $1 AND band_id IS NULL),
+                    (SELECT COUNT(DISTINCT st.tag) FROM song_tags st
+                        INNER JOIN songs s ON s.id = st.song_id
+                        WHERE s.user_id = $1 AND s.band_id IS NULL)",
+            )
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            for (resource, used, limit) in [
+                ("artists", artists, limits.artists),
+                ("songs", songs, limits.songs),
+                ("setlists", setlists, limits.setlists),
+                ("gigs", gigs, limits.gigs),
+                ("tags", tags, limits.tags),
+            ] {
+                if used > limit {
+                    tx.rollback().await?;
+                    return Err(ApiError::quota_exceeded(resource, limit));
+                }
+            }
         }
 
         tx.commit().await?;

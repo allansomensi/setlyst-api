@@ -21,7 +21,12 @@ pub trait ArtistRepository: Send + Sync {
         payload: &CreateArtistPayload,
         user_id: Uuid,
     ) -> Result<Artist, ApiError>;
-    async fn update(&self, id: Uuid, payload: &UpdateArtistPayload) -> Result<Uuid, ApiError>;
+    async fn update(
+        &self,
+        id: Uuid,
+        payload: &UpdateArtistPayload,
+        actor_id: Uuid,
+    ) -> Result<Uuid, ApiError>;
     async fn delete(&self, id: Uuid) -> Result<(), ApiError>;
     /// Checks name uniqueness among the caller's *personal* artists.
     async fn is_unique(
@@ -74,9 +79,13 @@ impl ArtistRepository for ArtistRepositoryImpl {
         .fetch_one(&self.db);
 
         let artists = sqlx::query_as::<_, Artist>(
-            "SELECT id, name, user_id, band_id, forked_from, created_at, updated_at FROM artists
-             WHERE user_id = $1 AND band_id IS NULL
-             ORDER BY name ASC LIMIT $2 OFFSET $3",
+            "SELECT a.id, a.name, a.user_id, a.band_id, a.forked_from, a.updated_by,
+                    (SELECT u.username FROM users u WHERE u.id = a.updated_by) AS updated_by_username,
+                    (SELECT COUNT(*) FROM songs s WHERE s.artist_id = a.id) AS song_count,
+                    a.created_at, a.updated_at
+             FROM artists a
+             WHERE a.user_id = $1 AND a.band_id IS NULL
+             ORDER BY LOWER(a.name) ASC LIMIT $2 OFFSET $3",
         )
         .bind(user_id)
         .bind(size)
@@ -90,7 +99,11 @@ impl ArtistRepository for ArtistRepositoryImpl {
 
     async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Artist>, ApiError> {
         let artist = sqlx::query_as::<_, Artist>(
-            "SELECT id, name, user_id, band_id, forked_from, created_at, updated_at FROM artists WHERE id = $1 AND user_id = $2",
+            "SELECT a.id, a.name, a.user_id, a.band_id, a.forked_from, a.updated_by,
+                    (SELECT u.username FROM users u WHERE u.id = a.updated_by) AS updated_by_username,
+                    (SELECT COUNT(*) FROM songs s WHERE s.artist_id = a.id) AS song_count,
+                    a.created_at, a.updated_at
+             FROM artists a WHERE a.id = $1 AND a.user_id = $2",
         )
         .bind(id)
         .bind(user_id)
@@ -104,7 +117,7 @@ impl ArtistRepository for ArtistRepositoryImpl {
         payload: &CreateArtistPayload,
         user_id: Uuid,
     ) -> Result<Artist, ApiError> {
-        let new_artist = Artist::new(&payload.name, user_id);
+        let new_artist = Artist::new(payload.name.trim(), user_id);
         sqlx::query(
             "INSERT INTO artists (id, name, user_id, band_id, forked_from, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
@@ -120,30 +133,31 @@ impl ArtistRepository for ArtistRepositoryImpl {
         Ok(new_artist)
     }
 
-    async fn update(&self, id: Uuid, payload: &UpdateArtistPayload) -> Result<Uuid, ApiError> {
-        let mut tx = self.db.begin().await?;
-        let mut updated = false;
+    async fn update(
+        &self,
+        id: Uuid,
+        payload: &UpdateArtistPayload,
+        actor_id: Uuid,
+    ) -> Result<Uuid, ApiError> {
+        let Some(name) = &payload.name else {
+            return Err(ApiError::NotModified);
+        };
 
-        if let Some(name) = &payload.name {
-            sqlx::query("UPDATE artists SET name = $1 WHERE id = $2")
-                .bind(name)
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-            updated = true;
+        let result = sqlx::query(
+            "UPDATE artists SET name = $1, updated_at = $2, updated_by = $3 WHERE id = $4",
+        )
+        .bind(name.trim())
+        .bind(chrono::Utc::now().naive_utc())
+        .bind(actor_id)
+        .bind(id)
+        .execute(&self.db)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(ApiError::NotFound);
         }
 
-        if updated {
-            sqlx::query("UPDATE artists SET updated_at = $1 WHERE id = $2")
-                .bind(chrono::Utc::now().naive_utc())
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-            tx.commit().await?;
-            Ok(id)
-        } else {
-            Err(ApiError::NotModified)
-        }
+        Ok(id)
     }
 
     async fn delete(&self, id: Uuid) -> Result<(), ApiError> {
@@ -162,7 +176,7 @@ impl ArtistRepository for ArtistRepositoryImpl {
     ) -> Result<(), ApiError> {
         let exists = match exclude_id {
             Some(id) => sqlx::query(
-                "SELECT id FROM artists WHERE name = $1 AND user_id = $2 AND band_id IS NULL AND id != $3;",
+                "SELECT id FROM artists WHERE LOWER(name) = LOWER($1) AND user_id = $2 AND band_id IS NULL AND id != $3;",
             )
             .bind(name)
             .bind(user_id)
@@ -171,7 +185,7 @@ impl ArtistRepository for ArtistRepositoryImpl {
             .await?
             .is_some(),
             None => sqlx::query(
-                "SELECT id FROM artists WHERE name = $1 AND user_id = $2 AND band_id IS NULL;",
+                "SELECT id FROM artists WHERE LOWER(name) = LOWER($1) AND user_id = $2 AND band_id IS NULL;",
             )
             .bind(name)
             .bind(user_id)
@@ -189,12 +203,16 @@ impl ArtistRepository for ArtistRepositoryImpl {
     }
 
     async fn exists(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
-        let exists = sqlx::query("SELECT id FROM artists WHERE id = $1 AND user_id = $2;")
-            .bind(id)
-            .bind(user_id)
-            .fetch_optional(&self.db)
-            .await?
-            .is_some();
+        // Personal artists only: a band-owned artist this user happened to
+        // fork must not be attachable to their personal songs.
+        let exists = sqlx::query(
+            "SELECT id FROM artists WHERE id = $1 AND user_id = $2 AND band_id IS NULL;",
+        )
+        .bind(id)
+        .bind(user_id)
+        .fetch_optional(&self.db)
+        .await?
+        .is_some();
 
         if !exists {
             error!("Artist ID not found or unauthorized.");

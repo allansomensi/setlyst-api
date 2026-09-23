@@ -25,8 +25,15 @@ pub trait BandRepository: Send + Sync {
     /// Creates a new band and makes `owner_id` its first member with the `owner` role.
     async fn create(&self, payload: &CreateBandPayload, owner_id: Uuid) -> Result<Band, ApiError>;
 
-    async fn update(&self, id: Uuid, payload: &UpdateBandPayload) -> Result<Uuid, ApiError>;
+    async fn update(
+        &self,
+        id: Uuid,
+        payload: &UpdateBandPayload,
+        actor_id: Uuid,
+    ) -> Result<Uuid, ApiError>;
     async fn delete(&self, id: Uuid) -> Result<(), ApiError>;
+    /// Any band by ID, without a membership filter (staff tooling).
+    async fn find_any(&self, id: Uuid) -> Result<Option<Band>, ApiError>;
     /// Marks a band as a favorite for this user. Idempotent.
     async fn add_favorite(&self, band_id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
     /// Un-favorites a band for this user. Idempotent.
@@ -114,14 +121,16 @@ impl BandRepository for BandRepositoryImpl {
             r#"
             SELECT
                 b.id, b.name, b.slug, b.description, b.logo_url, b.members_can_manage_setlists,
-                b.created_by, b.created_at, b.updated_at,
+                b.created_by, b.updated_by,
+                (SELECT u.username FROM users u WHERE u.id = b.updated_by) AS updated_by_username,
+                b.created_at, b.updated_at,
                 (SELECT COUNT(*) FROM band_members bm2 WHERE bm2.band_id = b.id) AS member_count,
                 bm.role AS my_role,
                 EXISTS(SELECT 1 FROM favorite_bands f WHERE f.band_id = b.id AND f.user_id = $1) AS is_favorite
             FROM bands b
             INNER JOIN band_members bm ON bm.band_id = b.id
             WHERE bm.user_id = $1
-            ORDER BY is_favorite DESC, b.name ASC;
+            ORDER BY is_favorite DESC, LOWER(b.name) ASC;
             "#,
         )
         .bind(user_id)
@@ -140,7 +149,9 @@ impl BandRepository for BandRepositoryImpl {
             r#"
             SELECT
                 b.id, b.name, b.slug, b.description, b.logo_url, b.members_can_manage_setlists,
-                b.created_by, b.created_at, b.updated_at,
+                b.created_by, b.updated_by,
+                (SELECT u.username FROM users u WHERE u.id = b.updated_by) AS updated_by_username,
+                b.created_at, b.updated_at,
                 (SELECT COUNT(*) FROM band_members bm2 WHERE bm2.band_id = b.id) AS member_count,
                 bm.role AS my_role,
                 EXISTS(SELECT 1 FROM favorite_bands f WHERE f.band_id = b.id AND f.user_id = $2) AS is_favorite
@@ -160,7 +171,13 @@ impl BandRepository for BandRepositoryImpl {
     async fn create(&self, payload: &CreateBandPayload, owner_id: Uuid) -> Result<Band, ApiError> {
         let name = payload.name.trim();
         let slug = self.generate_unique_slug(name).await?;
-        let new_band = Band::new(name, slug, payload.description.clone(), owner_id);
+        let description = payload
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string);
+        let new_band = Band::new(name, slug, description, owner_id);
 
         let mut tx = self.db.begin().await?;
 
@@ -220,7 +237,12 @@ impl BandRepository for BandRepositoryImpl {
         Ok(new_band)
     }
 
-    async fn update(&self, id: Uuid, payload: &UpdateBandPayload) -> Result<Uuid, ApiError> {
+    async fn update(
+        &self,
+        id: Uuid,
+        payload: &UpdateBandPayload,
+        actor_id: Uuid,
+    ) -> Result<Uuid, ApiError> {
         let mut tx = self.db.begin().await?;
         let mut updated = false;
 
@@ -234,6 +256,10 @@ impl BandRepository for BandRepositoryImpl {
         }
 
         if let Some(description) = &payload.description {
+            let description = description
+                .as_deref()
+                .map(str::trim)
+                .filter(|d| !d.is_empty());
             sqlx::query("UPDATE bands SET description = $1 WHERE id = $2")
                 .bind(description)
                 .bind(id)
@@ -243,6 +269,7 @@ impl BandRepository for BandRepositoryImpl {
         }
 
         if let Some(logo_url) = &payload.logo_url {
+            let logo_url = logo_url.as_deref().map(str::trim).filter(|u| !u.is_empty());
             sqlx::query("UPDATE bands SET logo_url = $1 WHERE id = $2")
                 .bind(logo_url)
                 .bind(id)
@@ -260,25 +287,41 @@ impl BandRepository for BandRepositoryImpl {
             updated = true;
         }
 
-        if updated {
-            sqlx::query("UPDATE bands SET updated_at = $1 WHERE id = $2")
-                .bind(chrono::Utc::now().naive_utc())
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-
-            tx.commit().await?;
-            Ok(id)
-        } else {
-            Err(ApiError::NotModified)
+        if !updated {
+            return Err(ApiError::NotModified);
         }
+
+        sqlx::query("UPDATE bands SET updated_at = $1, updated_by = $2 WHERE id = $3")
+            .bind(chrono::Utc::now().naive_utc())
+            .bind(actor_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    async fn find_any(&self, id: Uuid) -> Result<Option<Band>, ApiError> {
+        let band = sqlx::query_as::<_, Band>(
+            "SELECT id, name, slug, description, logo_url, members_can_manage_setlists,
+                    created_by, updated_by, created_at, updated_at
+             FROM bands WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.db)
+        .await?;
+        Ok(band)
     }
 
     async fn delete(&self, id: Uuid) -> Result<(), ApiError> {
-        sqlx::query("DELETE FROM bands WHERE id = $1")
+        let result = sqlx::query("DELETE FROM bands WHERE id = $1")
             .bind(id)
             .execute(&self.db)
             .await?;
+        if result.rows_affected() == 0 {
+            return Err(ApiError::NotFound);
+        }
         Ok(())
     }
 

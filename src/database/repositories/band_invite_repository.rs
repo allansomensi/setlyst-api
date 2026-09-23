@@ -27,6 +27,13 @@ pub trait BandInviteRepository: Send + Sync {
     async fn revoke(&self, id: Uuid, band_id: Uuid) -> Result<(), ApiError>;
 
     async fn increment_uses(&self, id: Uuid) -> Result<(), ApiError>;
+
+    /// Redeems an invite for `user_id` atomically: the invite row is
+    /// locked, re-validated (not revoked, expired or exhausted), the
+    /// membership is created and the use counted in one transaction — so
+    /// two people racing for the last use of a single-use invite can't
+    /// both get in. Returns `(band_id, role)`.
+    async fn redeem(&self, code: &str, user_id: Uuid) -> Result<(Uuid, BandRole), ApiError>;
 }
 
 pub struct BandInviteRepositoryImpl {
@@ -138,6 +145,61 @@ impl BandInviteRepository for BandInviteRepositoryImpl {
         }
 
         Ok(())
+    }
+
+    async fn redeem(&self, code: &str, user_id: Uuid) -> Result<(Uuid, BandRole), ApiError> {
+        let invalid = || {
+            ApiError::rule(
+                axum::http::StatusCode::NOT_FOUND,
+                crate::errors::api_error::codes::INVITE_INVALID,
+                "This invite link is invalid, expired or has already been used.",
+            )
+        };
+
+        let mut tx = self.db.begin().await?;
+
+        let invite = sqlx::query_as::<_, BandInvite>(
+            "SELECT * FROM band_invites WHERE code = $1 FOR UPDATE",
+        )
+        .bind(code.trim().to_uppercase())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(invalid)?;
+
+        let now = Utc::now().naive_utc();
+        let expired = invite.expires_at.is_some_and(|at| at <= now);
+        let exhausted = invite.max_uses.is_some_and(|max| invite.uses_count >= max);
+        if invite.revoked_at.is_some() || expired || exhausted {
+            return Err(invalid());
+        }
+
+        let inserted = sqlx::query(
+            "INSERT INTO band_members (id, band_id, user_id, role, joined_at) VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (band_id, user_id) DO NOTHING",
+        )
+        .bind(Uuid::new_v4())
+        .bind(invite.band_id)
+        .bind(user_id)
+        .bind(invite.role)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        if inserted.rows_affected() == 0 {
+            return Err(ApiError::rule(
+                axum::http::StatusCode::CONFLICT,
+                crate::errors::api_error::codes::ALREADY_MEMBER,
+                "You are already a member of this band.",
+            ));
+        }
+
+        sqlx::query("UPDATE band_invites SET uses_count = uses_count + 1 WHERE id = $1")
+            .bind(invite.id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok((invite.band_id, invite.role))
     }
 
     async fn increment_uses(&self, id: Uuid) -> Result<(), ApiError> {

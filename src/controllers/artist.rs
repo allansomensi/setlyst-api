@@ -5,6 +5,7 @@ use crate::{
         PaginatedResponse, PaginationMeta, PaginationQuery,
         artist::{Artist, CreateArtistPayload, UpdateArtistPayload},
         auth::access::AccessControl,
+        quota::QuotaResource,
     },
 };
 use axum::{
@@ -184,7 +185,11 @@ pub async fn create_artist(
 
     state
         .artist_repo
-        .is_unique(&payload.name, user_id, None)
+        .is_unique(payload.name.trim(), user_id, None)
+        .await?;
+    state
+        .quota_repo
+        .ensure_user(user_id, QuotaResource::Artists, 1)
         .await?;
 
     match state.artist_repo.create(&payload, user_id).await {
@@ -255,10 +260,13 @@ pub async fn update_artist(
 
     state.artist_repo.exists(id, user_id).await?;
     if let Some(name) = &payload.name {
-        state.artist_repo.is_unique(name, user_id, Some(id)).await?;
+        state
+            .artist_repo
+            .is_unique(name.trim(), user_id, Some(id))
+            .await?;
     }
 
-    match state.artist_repo.update(id, &payload).await {
+    match state.artist_repo.update(id, &payload, user_id).await {
         Ok(artist_id) => {
             info!(
                 %user_id,

@@ -1,4 +1,4 @@
-use crate::validations::band::validate_band_name;
+use crate::validations::band::{validate_band_description, validate_band_name, validate_logo_url};
 use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::prelude::{FromRow, Type};
@@ -49,7 +49,11 @@ pub struct Band {
     pub description: Option<String>,
     pub logo_url: Option<String>,
     pub members_can_manage_setlists: bool,
-    pub created_by: Uuid,
+    /// The account that created the band — `None` once that account is
+    /// deleted. Ownership is tracked by the `owner` membership, not here.
+    pub created_by: Option<Uuid>,
+    #[sqlx(default)]
+    pub updated_by: Option<Uuid>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -67,7 +71,11 @@ pub struct BandWithMembership {
     pub description: Option<String>,
     pub logo_url: Option<String>,
     pub members_can_manage_setlists: bool,
-    pub created_by: Uuid,
+    pub created_by: Option<Uuid>,
+    #[sqlx(default)]
+    pub updated_by: Option<Uuid>,
+    #[sqlx(default)]
+    pub updated_by_username: Option<String>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
     pub member_count: i64,
@@ -87,7 +95,8 @@ impl Band {
             description,
             logo_url: None,
             members_can_manage_setlists: true,
-            created_by,
+            created_by: Some(created_by),
+            updated_by: None,
             created_at: now,
             updated_at: now,
         }
@@ -98,15 +107,22 @@ impl Band {
 pub struct CreateBandPayload {
     #[validate(custom(function = "validate_band_name"))]
     pub name: String,
+    #[validate(custom(function = "validate_band_description"))]
     pub description: Option<String>,
 }
 
-#[derive(Deserialize, Serialize, ToSchema, Validate)]
+/// Nullable fields use `Option<Option<T>>`: absent = unchanged, `null` =
+/// clear (see [`crate::models::patch`]).
+#[derive(Deserialize, Serialize, ToSchema, Validate, Default)]
 pub struct UpdateBandPayload {
     #[validate(custom(function = "validate_band_name"))]
     pub name: Option<String>,
-    pub description: Option<String>,
-    pub logo_url: Option<String>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    #[validate(custom(function = "validate_band_description"))]
+    pub description: Option<Option<String>>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    #[validate(custom(function = "validate_logo_url"))]
+    pub logo_url: Option<Option<String>>,
     pub members_can_manage_setlists: Option<bool>,
 }
 
@@ -210,9 +226,23 @@ pub struct BandInvite {
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
 pub struct CreateBandInvitePayload {
     pub role: Option<BandRole>,
-    #[validate(range(min = 1, message = "Max uses must be at least 1 when provided."))]
+    #[validate(range(min = 1, max = 1000, message = "Max uses must be between 1 and 1000."))]
     pub max_uses: Option<i32>,
+    /// Up to one year.
+    #[validate(range(
+        min = 1,
+        max = 8760,
+        message = "Expiry must be between 1 hour and 1 year."
+    ))]
     pub expires_in_hours: Option<i64>,
+}
+
+/// Staff adding a user straight into a band (no invite).
+#[derive(Deserialize, Serialize, ToSchema, Validate)]
+pub struct AdminAddBandMemberPayload {
+    pub user_id: Uuid,
+    /// Defaults to `member`. `owner` is not accepted — use transfer-ownership.
+    pub role: Option<BandRole>,
 }
 
 #[derive(Deserialize, Serialize, ToSchema, Validate)]

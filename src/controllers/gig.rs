@@ -4,8 +4,9 @@ use crate::{
     models::{
         PaginatedResponse, PaginationMeta, PaginationQuery,
         auth::access::AccessControl,
-        band::BandRole,
+        band::{BandPermission, BandRole},
         gig::{CreateGigPayload, Gig, PublicGig, UpdateGigPayload},
+        quota::QuotaResource,
         setlist::PublicSetlist,
     },
 };
@@ -160,18 +161,34 @@ pub async fn create_gig(
 
     payload.validate()?;
 
-    if let Some(band_id) = payload.band_id {
-        let band = state
-            .band_repo
-            .find_by_id(band_id, user_id)
-            .await?
-            .ok_or(ApiError::NotFound)?;
+    match payload.band_id {
+        Some(band_id) => {
+            // Gigs follow the band's `manage_setlists` permission, the same
+            // rule used to edit or delete them (see `GigRepository::can_manage`).
+            let role = state
+                .band_repo
+                .role_of(band_id, user_id)
+                .await?
+                .ok_or(ApiError::NotFound)?;
 
-        let can_create = band.my_role.satisfies(BandRole::Moderator)
-            || (band.my_role.satisfies(BandRole::Member) && band.members_can_manage_setlists);
+            if !state
+                .band_repo
+                .role_has_permission(band_id, role, BandPermission::ManageSetlists)
+                .await?
+            {
+                return Err(ApiError::Forbidden);
+            }
 
-        if !can_create {
-            return Err(ApiError::Forbidden);
+            state
+                .quota_repo
+                .ensure_band(band_id, QuotaResource::BandGigs, 1)
+                .await?;
+        }
+        None => {
+            state
+                .quota_repo
+                .ensure_user(user_id, QuotaResource::Gigs, 1)
+                .await?;
         }
     }
 
@@ -226,7 +243,7 @@ pub async fn update_gig(
 
     state.gig_repo.can_manage(id, user_id).await?;
 
-    if let Some(setlist_id) = payload.setlist_id {
+    if let Some(Some(setlist_id)) = payload.setlist_id {
         let gig = state
             .gig_repo
             .find_by_id(id, user_id)
@@ -236,7 +253,7 @@ pub async fn update_gig(
         validate_setlist_scope(&state, user_id, setlist_id, gig.band_id).await?;
     }
 
-    match state.gig_repo.update(id, &payload).await {
+    match state.gig_repo.update(id, &payload, user_id).await {
         Ok(gig_id) => {
             info!(%user_id, gig_id = %gig_id, "Gig updated successfully");
             Ok(Json(gig_id))
@@ -419,13 +436,13 @@ pub async fn get_public_gig(
 
     let setlist = match gig.setlist_id {
         Some(setlist_id) => {
-            let setlist = state
-                .setlist_repo
-                .find_by_id(setlist_id, gig.user_id)
-                .await?;
+            // Resolved without an access filter: the share token already
+            // authorizes the gig, and its creator may have since left the
+            // band (which would otherwise hide the band's setlist).
+            let setlist = state.setlist_repo.find_any(setlist_id).await?;
             match setlist {
                 Some(setlist) => {
-                    let songs = state.setlist_repo.get_songs(setlist.id, 1, 200);
+                    let songs = state.setlist_repo.get_songs(setlist.id, 1, 10_000);
                     let markers = state.setlist_repo.get_markers(setlist.id);
                     let ((songs, _), markers) = tokio::try_join!(songs, markers)?;
                     Some(PublicSetlist {

@@ -36,6 +36,14 @@ pub struct Gig {
     /// if public sharing isn't enabled. Same convention as
     /// [`crate::models::setlist::Setlist::share_token`].
     pub share_token: Option<String>,
+    #[sqlx(default)]
+    pub share_locked_at: Option<NaiveDateTime>,
+    #[sqlx(default)]
+    pub share_lock_reason: Option<String>,
+    #[sqlx(default)]
+    pub updated_by: Option<Uuid>,
+    #[sqlx(default)]
+    pub updated_by_username: Option<String>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -56,19 +64,26 @@ pub struct CreateGigPayload {
     /// setlist).
     pub setlist_id: Option<Uuid>,
     pub status: Option<GigStatus>,
+    #[validate(custom(function = "crate::validations::text::validate_description"))]
     pub notes: Option<String>,
 }
 
-#[derive(Deserialize, Serialize, ToSchema, Validate)]
+/// Nullable fields use `Option<Option<T>>`: absent = unchanged, `null` =
+/// clear (see [`crate::models::patch`]).
+#[derive(Deserialize, Serialize, ToSchema, Validate, Default)]
 pub struct UpdateGigPayload {
     #[validate(length(min = 1, max = 255, message = "Venue must be between 1 and 255 chars."))]
     pub venue: Option<String>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
     #[validate(length(max = 500, message = "Location must be at most 500 chars."))]
-    pub location: Option<String>,
+    pub location: Option<Option<String>>,
     pub scheduled_at: Option<NaiveDateTime>,
-    pub setlist_id: Option<Uuid>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    pub setlist_id: Option<Option<Uuid>>,
     pub status: Option<GigStatus>,
-    pub notes: Option<String>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    #[validate(custom(function = "crate::validations::text::validate_description"))]
+    pub notes: Option<Option<String>>,
 }
 
 impl Gig {
@@ -89,6 +104,10 @@ impl Gig {
             status: payload.status.unwrap_or_default(),
             notes: payload.notes,
             share_token: None,
+            share_locked_at: None,
+            share_lock_reason: None,
+            updated_by: None,
+            updated_by_username: None,
             created_at: now,
             updated_at: now,
         }

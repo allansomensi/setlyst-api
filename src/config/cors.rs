@@ -1,8 +1,10 @@
 use super::Config;
 use axum::http::{
-    header::{AUTHORIZATION, CONTENT_TYPE},
+    HeaderName,
+    header::{ACCEPT, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_TYPE, RETRY_AFTER},
     method::Method,
 };
+use std::time::Duration;
 use tower_http::cors::CorsLayer;
 
 impl Config {
@@ -13,7 +15,25 @@ impl Config {
 
         CorsLayer::new()
             .allow_origin(origins)
-            .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE])
-            .allow_headers([CONTENT_TYPE, AUTHORIZATION])
+            // PUT is used by the band permission matrix; it was missing,
+            // so browsers calling it cross-origin got a CORS failure.
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+            ])
+            .allow_headers([
+                CONTENT_TYPE,
+                AUTHORIZATION,
+                ACCEPT,
+                HeaderName::from_static("x-app-locale"),
+            ])
+            // Without this, `fetch` can't read the file name of a PDF or
+            // backup download from a cross-origin response, and every
+            // export fell back to a generic name.
+            .expose_headers([CONTENT_DISPOSITION, RETRY_AFTER])
+            .max_age(Duration::from_secs(60 * 60))
     }
 }

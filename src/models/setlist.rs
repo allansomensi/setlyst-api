@@ -22,6 +22,22 @@ pub struct Setlist {
     /// affects anyone else's view or any permission. `false` on the
     /// public (unauthenticated) share endpoints, which have no caller.
     pub is_favorite: bool,
+    /// Set when staff took the public link down; the owner can't re-share
+    /// until it's unlocked.
+    #[sqlx(default)]
+    pub share_locked_at: Option<NaiveDateTime>,
+    #[sqlx(default)]
+    pub share_lock_reason: Option<String>,
+    /// Number of songs in the running order (blocks/breaks excluded).
+    #[sqlx(default)]
+    pub song_count: i64,
+    /// Username of the creator (`user_id`).
+    #[sqlx(default)]
+    pub owner_username: Option<String>,
+    #[sqlx(default)]
+    pub updated_by: Option<Uuid>,
+    #[sqlx(default)]
+    pub updated_by_username: Option<String>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -30,6 +46,7 @@ pub struct Setlist {
 pub struct CreateSetlistPayload {
     #[validate(length(min = 1, max = 255, message = "Title must be between 1 and 255 chars."))]
     pub title: String,
+    #[validate(custom(function = "crate::validations::text::validate_description"))]
     pub description: Option<String>,
     /// Optionally create the setlist under a band instead of personally.
     /// The caller must be a member of the band with permission to manage its setlists.
@@ -40,7 +57,10 @@ pub struct CreateSetlistPayload {
 pub struct UpdateSetlistPayload {
     #[validate(length(min = 1, max = 255, message = "Title must be between 1 and 255 chars."))]
     pub title: Option<String>,
-    pub description: Option<String>,
+    /// Absent = unchanged, `null` = clear.
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    #[validate(custom(function = "crate::validations::text::validate_description"))]
+    pub description: Option<Option<String>>,
 }
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
@@ -134,7 +154,7 @@ pub struct UpdateSetlistBreakPayload {
 pub enum SetlistItem {
     Song {
         position: i32,
-        song: crate::models::song::SongWithArtist,
+        song: Box<crate::models::song::SongWithArtist>,
     },
     Block {
         position: i32,
@@ -190,6 +210,12 @@ impl Setlist {
             share_token: None,
             total_duration: 0,
             is_favorite: false,
+            share_locked_at: None,
+            share_lock_reason: None,
+            song_count: 0,
+            owner_username: None,
+            updated_by: None,
+            updated_by_username: None,
             created_at: now,
             updated_at: now,
         }

@@ -35,6 +35,7 @@ thiserror = "2"
 tokio = { version = "1.52", features = ["full"] }
 tower-http = { version = "0.7", features = [
     "cors",
+    "set-header",
     "compression-full",
     "timeout",
 ] }
@@ -48,6 +49,10 @@ validator = { version = "0.21", features = ["derive"] }
 tower_governor = { version = "0.8", features = ["tracing"] }
 genpdf = "0.2.0"
 serde_json = "1.0.151"
+serde_urlencoded = "0.7"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies.cargo-husky]
 version = "1.5"

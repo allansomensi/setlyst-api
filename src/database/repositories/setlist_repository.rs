@@ -1,3 +1,4 @@
+use crate::database::repositories::song_repository::song_columns;
 use crate::{
     errors::api_error::ApiError,
     models::{
@@ -11,6 +12,20 @@ use crate::{
 use sqlx::PgPool;
 use tracing::error;
 use uuid::Uuid;
+
+/// Columns selected for a [`Setlist`] from `setlists s` (everything but the
+/// caller-specific `is_favorite`). A macro so it can be spliced into
+/// `concat!` — sqlx only accepts literal query strings.
+macro_rules! setlist_columns {
+    () => {
+        "s.id, s.title, s.description, s.user_id, s.band_id, s.share_token,
+         s.share_locked_at, s.share_lock_reason, s.created_at, s.updated_at, s.updated_by,
+         (SELECT u.username FROM users u WHERE u.id = s.updated_by) AS updated_by_username,
+         (SELECT u.username FROM users u WHERE u.id = s.user_id) AS owner_username,
+         (SELECT COUNT(*) FROM setlist_songs sc WHERE sc.setlist_id = s.id) AS song_count,
+         setlist_total_duration(s.id) AS total_duration"
+    };
+}
 
 #[async_trait::async_trait]
 pub trait SetlistRepository: Send + Sync {
@@ -39,8 +54,28 @@ pub trait SetlistRepository: Send + Sync {
         payload: &CreateSetlistPayload,
         user_id: Uuid,
     ) -> Result<Setlist, ApiError>;
-    async fn update(&self, id: Uuid, payload: &UpdateSetlistPayload) -> Result<Uuid, ApiError>;
+    async fn update(
+        &self,
+        id: Uuid,
+        payload: &UpdateSetlistPayload,
+        actor_id: Uuid,
+    ) -> Result<Uuid, ApiError>;
     async fn delete(&self, id: Uuid) -> Result<(), ApiError>;
+    /// Records that the setlist's contents changed (songs, blocks, breaks,
+    /// order) — bumps `updated_at` and `updated_by`, so "last modified"
+    /// reflects the running order, not just the title.
+    async fn touch(&self, id: Uuid, actor_id: Uuid) -> Result<(), ApiError>;
+    /// Any setlist by ID, without an access filter (staff tooling).
+    async fn find_any(&self, id: Uuid) -> Result<Option<Setlist>, ApiError>;
+    /// Staff takedown: clears the share token and locks sharing so the
+    /// owner can't re-enable it until staff unlocks it.
+    async fn lock_sharing(
+        &self,
+        id: Uuid,
+        actor_id: Uuid,
+        reason: Option<&str>,
+    ) -> Result<(), ApiError>;
+    async fn unlock_sharing(&self, id: Uuid) -> Result<(), ApiError>;
     /// Marks a setlist as a favorite for this user. Idempotent — favoriting
     /// an already-favorited setlist is a no-op, not an error.
     async fn add_favorite(&self, setlist_id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
@@ -173,18 +208,15 @@ impl SetlistRepository for SetlistRepositoryImpl {
         .bind(user_id)
         .fetch_one(&self.db);
 
-        let setlists = sqlx::query_as::<_, Setlist>(
-            r#"
-            SELECT
-                s.id, s.title, s.description, s.user_id, s.band_id, s.share_token, s.created_at, s.updated_at,
-                setlist_total_duration(s.id) AS total_duration,
-                EXISTS(SELECT 1 FROM favorite_setlists f WHERE f.setlist_id = s.id AND f.user_id = $1) AS is_favorite
+        let setlists = sqlx::query_as::<_, Setlist>(concat!(
+            "SELECT ",
+            setlist_columns!(),
+            ", EXISTS(SELECT 1 FROM favorite_setlists f WHERE f.setlist_id = s.id AND f.user_id = $1) AS is_favorite
             FROM setlists s
             WHERE s.user_id = $1 AND s.band_id IS NULL
-            ORDER BY is_favorite DESC, s.title ASC
-            LIMIT $2 OFFSET $3
-            "#,
-        )
+            ORDER BY is_favorite DESC, LOWER(s.title) ASC
+            LIMIT $2 OFFSET $3"
+        ))
         .bind(user_id)
         .bind(size)
         .bind(offset)
@@ -207,18 +239,15 @@ impl SetlistRepository for SetlistRepositoryImpl {
             .bind(band_id)
             .fetch_one(&self.db);
 
-        let setlists = sqlx::query_as::<_, Setlist>(
-            r#"
-            SELECT
-                s.id, s.title, s.description, s.user_id, s.band_id, s.share_token, s.created_at, s.updated_at,
-                setlist_total_duration(s.id) AS total_duration,
-                EXISTS(SELECT 1 FROM favorite_setlists f WHERE f.setlist_id = s.id AND f.user_id = $4) AS is_favorite
+        let setlists = sqlx::query_as::<_, Setlist>(concat!(
+            "SELECT ",
+            setlist_columns!(),
+            ", EXISTS(SELECT 1 FROM favorite_setlists f WHERE f.setlist_id = s.id AND f.user_id = $4) AS is_favorite
             FROM setlists s
             WHERE s.band_id = $1
-            ORDER BY is_favorite DESC, s.title ASC
-            LIMIT $2 OFFSET $3
-            "#,
-        )
+            ORDER BY is_favorite DESC, LOWER(s.title) ASC
+            LIMIT $2 OFFSET $3"
+        ))
         .bind(band_id)
         .bind(size)
         .bind(offset)
@@ -230,17 +259,14 @@ impl SetlistRepository for SetlistRepositoryImpl {
     }
 
     async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Setlist>, ApiError> {
-        let setlist = sqlx::query_as::<_, Setlist>(
-            r#"
-            SELECT
-                s.id, s.title, s.description, s.user_id, s.band_id, s.share_token, s.created_at, s.updated_at,
-                setlist_total_duration(s.id) AS total_duration,
-                EXISTS(SELECT 1 FROM favorite_setlists f WHERE f.setlist_id = s.id AND f.user_id = $2) AS is_favorite
+        let setlist = sqlx::query_as::<_, Setlist>(concat!(
+            "SELECT ",
+            setlist_columns!(),
+            ", EXISTS(SELECT 1 FROM favorite_setlists f WHERE f.setlist_id = s.id AND f.user_id = $2) AS is_favorite
             FROM setlists s
             LEFT JOIN band_members bm ON bm.band_id = s.band_id AND bm.user_id = $2
-            WHERE s.id = $1 AND (s.user_id = $2 OR bm.user_id IS NOT NULL)
-            "#,
-        )
+            WHERE s.id = $1 AND ((s.band_id IS NULL AND s.user_id = $2) OR bm.user_id IS NOT NULL)"
+        ))
         .bind(id)
         .bind(user_id)
         .fetch_optional(&self.db)
@@ -274,13 +300,18 @@ impl SetlistRepository for SetlistRepositoryImpl {
         Ok(new_setlist)
     }
 
-    async fn update(&self, id: Uuid, payload: &UpdateSetlistPayload) -> Result<Uuid, ApiError> {
+    async fn update(
+        &self,
+        id: Uuid,
+        payload: &UpdateSetlistPayload,
+        actor_id: Uuid,
+    ) -> Result<Uuid, ApiError> {
         let mut tx = self.db.begin().await?;
         let mut updated = false;
 
         if let Some(title) = &payload.title {
             sqlx::query("UPDATE setlists SET title = $1 WHERE id = $2")
-                .bind(title)
+                .bind(title.trim())
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
@@ -288,6 +319,10 @@ impl SetlistRepository for SetlistRepositoryImpl {
         }
 
         if let Some(description) = &payload.description {
+            let description = description
+                .as_deref()
+                .map(str::trim)
+                .filter(|d| !d.is_empty());
             sqlx::query("UPDATE setlists SET description = $1 WHERE id = $2")
                 .bind(description)
                 .bind(id)
@@ -296,25 +331,89 @@ impl SetlistRepository for SetlistRepositoryImpl {
             updated = true;
         }
 
-        if updated {
-            sqlx::query("UPDATE setlists SET updated_at = $1 WHERE id = $2")
-                .bind(chrono::Utc::now().naive_utc())
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-
-            tx.commit().await?;
-            Ok(id)
-        } else {
-            Err(ApiError::NotModified)
+        if !updated {
+            return Err(ApiError::NotModified);
         }
+
+        sqlx::query("UPDATE setlists SET updated_at = $1, updated_by = $2 WHERE id = $3")
+            .bind(chrono::Utc::now().naive_utc())
+            .bind(actor_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(id)
     }
 
     async fn delete(&self, id: Uuid) -> Result<(), ApiError> {
-        sqlx::query("DELETE FROM setlists WHERE id = $1")
+        let result = sqlx::query("DELETE FROM setlists WHERE id = $1")
             .bind(id)
             .execute(&self.db)
             .await?;
+        if result.rows_affected() == 0 {
+            return Err(ApiError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn touch(&self, id: Uuid, actor_id: Uuid) -> Result<(), ApiError> {
+        sqlx::query("UPDATE setlists SET updated_at = $1, updated_by = $2 WHERE id = $3")
+            .bind(chrono::Utc::now().naive_utc())
+            .bind(actor_id)
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn find_any(&self, id: Uuid) -> Result<Option<Setlist>, ApiError> {
+        let setlist = sqlx::query_as::<_, Setlist>(concat!(
+            "SELECT ",
+            setlist_columns!(),
+            ", false AS is_favorite FROM setlists s WHERE s.id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.db)
+        .await?;
+        Ok(setlist)
+    }
+
+    async fn lock_sharing(
+        &self,
+        id: Uuid,
+        actor_id: Uuid,
+        reason: Option<&str>,
+    ) -> Result<(), ApiError> {
+        let result = sqlx::query(
+            "UPDATE setlists
+             SET share_token = NULL, share_locked_at = $1, share_locked_by = $2, share_lock_reason = $3
+             WHERE id = $4",
+        )
+        .bind(chrono::Utc::now().naive_utc())
+        .bind(actor_id)
+        .bind(reason)
+        .bind(id)
+        .execute(&self.db)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(ApiError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn unlock_sharing(&self, id: Uuid) -> Result<(), ApiError> {
+        let result = sqlx::query(
+            "UPDATE setlists
+             SET share_locked_at = NULL, share_locked_by = NULL, share_lock_reason = NULL
+             WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&self.db)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(ApiError::NotFound);
+        }
         Ok(())
     }
 
@@ -397,7 +496,7 @@ impl SetlistRepository for SetlistRepositoryImpl {
             r#"
             SELECT s.id FROM setlists s
             LEFT JOIN band_members bm ON bm.band_id = s.band_id AND bm.user_id = $2
-            WHERE s.id = $1 AND (s.user_id = $2 OR bm.user_id IS NOT NULL);
+            WHERE s.id = $1 AND ((s.band_id IS NULL AND s.user_id = $2) OR bm.user_id IS NOT NULL);
             "#,
         )
         .bind(id)
@@ -498,17 +597,33 @@ impl SetlistRepository for SetlistRepositoryImpl {
     }
 
     async fn enable_sharing(&self, id: Uuid) -> Result<Setlist, ApiError> {
+        let locked: Option<Option<chrono::NaiveDateTime>> =
+            sqlx::query_scalar("SELECT share_locked_at FROM setlists WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.db)
+                .await?;
+
+        match locked {
+            None => return Err(ApiError::NotFound),
+            Some(Some(_)) => {
+                return Err(ApiError::rule(
+                    axum::http::StatusCode::FORBIDDEN,
+                    crate::errors::api_error::codes::SHARE_LOCKED,
+                    "Public sharing for this setlist was disabled by a moderator.",
+                ));
+            }
+            Some(None) => {}
+        }
+
         let token = crate::utils::share_token::generate_share_token();
 
-        let result = sqlx::query("UPDATE setlists SET share_token = $1 WHERE id = $2")
-            .bind(&token)
-            .bind(id)
-            .execute(&self.db)
-            .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(ApiError::NotFound);
-        }
+        sqlx::query(
+            "UPDATE setlists SET share_token = $1 WHERE id = $2 AND share_locked_at IS NULL",
+        )
+        .bind(&token)
+        .bind(id)
+        .execute(&self.db)
+        .await?;
 
         // Re-fetch through the same query used by the public routes so the
         // returned `total_duration` is computed consistently, rather than
@@ -532,16 +647,13 @@ impl SetlistRepository for SetlistRepositoryImpl {
     }
 
     async fn find_by_share_token(&self, token: &str) -> Result<Option<Setlist>, ApiError> {
-        let setlist = sqlx::query_as::<_, Setlist>(
-            r#"
-            SELECT
-                s.id, s.title, s.description, s.user_id, s.band_id, s.share_token, s.created_at, s.updated_at,
-                setlist_total_duration(s.id) AS total_duration,
-                false AS is_favorite
+        let setlist = sqlx::query_as::<_, Setlist>(concat!(
+            "SELECT ",
+            setlist_columns!(),
+            ", false AS is_favorite
             FROM setlists s
-            WHERE s.share_token = $1
-            "#,
-        )
+            WHERE s.share_token = $1 AND s.share_locked_at IS NULL"
+        ))
         .bind(token)
         .fetch_optional(&self.db)
         .await?;
@@ -621,16 +733,17 @@ impl SetlistRepository for SetlistRepositoryImpl {
             .bind(setlist_id)
             .fetch_one(&self.db);
 
-        let songs = sqlx::query_as::<_, crate::models::song::SongWithArtist>(
-            "SELECT s.id, s.title, s.artist_id, a.name AS artist_name, s.user_id, s.band_id, s.forked_from,
-                    s.tempo, s.lyrics, s.tonality, s.genre, s.duration, s.created_at, s.updated_at
+        let songs = sqlx::query_as::<_, crate::models::song::SongWithArtist>(concat!(
+            "SELECT ",
+            song_columns!(),
+            ", a.name AS artist_name
              FROM songs s
              INNER JOIN setlist_songs ss ON s.id = ss.song_id
              INNER JOIN artists a ON a.id = s.artist_id
              WHERE ss.setlist_id = $1
              ORDER BY ss.position ASC
-             LIMIT $2 OFFSET $3;",
-        )
+             LIMIT $2 OFFSET $3;"
+        ))
         .bind(setlist_id)
         .bind(size)
         .bind(offset)
@@ -781,31 +894,20 @@ impl SetlistRepository for SetlistRepositoryImpl {
         #[derive(sqlx::FromRow)]
         struct SongItemRow {
             position: i32,
-            id: Uuid,
-            title: String,
-            artist_id: Uuid,
-            artist_name: String,
-            user_id: Uuid,
-            band_id: Option<Uuid>,
-            forked_from: Option<Uuid>,
-            tempo: Option<i32>,
-            lyrics: Option<String>,
-            tonality: Option<crate::models::song::Tonality>,
-            genre: Option<crate::models::song::Genre>,
-            duration: Option<i32>,
-            created_at: chrono::NaiveDateTime,
-            updated_at: chrono::NaiveDateTime,
+            #[sqlx(flatten)]
+            song: crate::models::song::SongWithArtist,
         }
 
         let song_rows = async {
-            sqlx::query_as::<_, SongItemRow>(
-                "SELECT ss.position, s.id, s.title, s.artist_id, a.name AS artist_name, s.user_id, s.band_id, s.forked_from,
-                        s.tempo, s.lyrics, s.tonality, s.genre, s.duration, s.created_at, s.updated_at
+            sqlx::query_as::<_, SongItemRow>(concat!(
+                "SELECT ss.position, ",
+                song_columns!(),
+                ", a.name AS artist_name
                  FROM songs s
                  INNER JOIN setlist_songs ss ON s.id = ss.song_id
                  INNER JOIN artists a ON a.id = s.artist_id
-                 WHERE ss.setlist_id = $1",
-            )
+                 WHERE ss.setlist_id = $1"
+            ))
             .bind(setlist_id)
             .fetch_all(&self.db)
             .await
@@ -820,22 +922,7 @@ impl SetlistRepository for SetlistRepositoryImpl {
             .into_iter()
             .map(|r| SetlistItem::Song {
                 position: r.position,
-                song: crate::models::song::SongWithArtist {
-                    id: r.id,
-                    title: r.title,
-                    artist_id: r.artist_id,
-                    artist_name: r.artist_name,
-                    user_id: r.user_id,
-                    band_id: r.band_id,
-                    forked_from: r.forked_from,
-                    tempo: r.tempo,
-                    lyrics: r.lyrics,
-                    tonality: r.tonality,
-                    genre: r.genre,
-                    duration: r.duration,
-                    created_at: r.created_at,
-                    updated_at: r.updated_at,
-                },
+                song: Box::new(r.song),
             })
             .collect();
 

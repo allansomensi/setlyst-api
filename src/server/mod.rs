@@ -2,22 +2,12 @@ use crate::{
     config::Config,
     database::{
         AppState,
-        connection::create_pool,
-        repositories::{
-            artist_repository::ArtistRepositoryImpl, backup_repository::BackupRepositoryImpl,
-            band_invite_repository::BandInviteRepositoryImpl,
-            band_member_repository::BandMemberRepositoryImpl, band_repository::BandRepositoryImpl,
-            gig_repository::GigRepositoryImpl, metrics_repository::MetricsRepositoryImpl,
-            notification_repository::NotificationRepositoryImpl,
-            setlist_repository::SetlistRepositoryImpl, song_repository::SongRepositoryImpl,
-            user_preferences_repository::UserPreferencesRepositoryImpl,
-            user_repository::UserRepositoryImpl,
-        },
+        connection::{create_pool, run_migrations},
     },
     errors::api_error::ApiError,
     routes,
 };
-use std::{net::SocketAddr, sync::Arc};
+use std::net::SocketAddr;
 use tokio::signal;
 use tracing::{error, info};
 
@@ -33,38 +23,19 @@ pub async fn run() -> Result<(), ApiError> {
         }
     };
 
-    let user_repo = Arc::new(UserRepositoryImpl::new(pool.clone()));
-    let artist_repo = Arc::new(ArtistRepositoryImpl::new(pool.clone()));
-    let user_prefs_repo = Arc::new(UserPreferencesRepositoryImpl::new(pool.clone()));
-    let song_repo = Arc::new(SongRepositoryImpl::new(pool.clone()));
-    let setlist_repo = Arc::new(SetlistRepositoryImpl::new(pool.clone()));
-    let gig_repo = Arc::new(GigRepositoryImpl::new(pool.clone()));
-    let metrics_repo = Arc::new(MetricsRepositoryImpl::new(pool.clone()));
-    let backup_repo = Arc::new(BackupRepositoryImpl::new(pool.clone()));
-    let band_repo = Arc::new(BandRepositoryImpl::new(pool.clone()));
-    let band_member_repo = Arc::new(BandMemberRepositoryImpl::new(pool.clone()));
-    let band_invite_repo = Arc::new(BandInviteRepositoryImpl::new(pool.clone()));
-    let notification_repo = Arc::new(NotificationRepositoryImpl::new(pool.clone()));
-
-    let state = AppState {
-        db: pool.clone(),
-        user_repo,
-        user_prefs_repo,
-        artist_repo,
-        song_repo,
-        setlist_repo,
-        gig_repo,
-        metrics_repo,
-        backup_repo,
-        band_repo,
-        band_member_repo,
-        band_invite_repo,
-        notification_repo,
-    };
-
-    let app = routes::create_routes(state);
-
     let config = Config::get();
+
+    if config.run_migrations {
+        match run_migrations(&pool).await {
+            Ok(()) => info!("✅ Database migrations are up to date"),
+            Err(e) => {
+                error!("❌ Failed to apply database migrations: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let app = routes::create_routes(AppState::new(pool));
 
     let listener = match tokio::net::TcpListener::bind(&config.host).await {
         Ok(listener) => {

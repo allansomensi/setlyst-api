@@ -3,23 +3,12 @@ use setlyst_api::{
     config,
     database::{
         AppState,
-        connection::create_pool,
-        repositories::{
-            artist_repository::ArtistRepositoryImpl, backup_repository::BackupRepositoryImpl,
-            band_invite_repository::BandInviteRepositoryImpl,
-            band_member_repository::BandMemberRepositoryImpl, band_repository::BandRepositoryImpl,
-            gig_repository::GigRepositoryImpl, metrics_repository::MetricsRepositoryImpl,
-            notification_repository::NotificationRepositoryImpl,
-            setlist_repository::SetlistRepositoryImpl, song_repository::SongRepositoryImpl,
-            user_preferences_repository::UserPreferencesRepositoryImpl,
-            user_repository::UserRepositoryImpl,
-        },
+        connection::{create_pool, run_migrations},
     },
     models::user::{CreateUserPayload, Role, Status},
+    validations::{password::password_issues, username::validate_username},
 };
 use std::io::{self, Write};
-use std::sync::Arc;
-use tracing::{error, info};
 use validator::Validate;
 
 #[derive(clap::Parser, Debug)]
@@ -30,63 +19,53 @@ pub struct Args {
     username: Option<String>,
 }
 
-fn validate_password_strength(password: &str) -> Result<(), &'static str> {
-    if password.len() < 8 {
-        return Err("Password must be at least 8 characters long.");
+/// Human-readable explanations for the password policy's issue codes.
+fn describe_issue(issue: &str) -> &'static str {
+    match issue {
+        "too_short" => "at least 8 characters",
+        "too_long" => "at most 128 characters",
+        "missing_lowercase" => "a lowercase letter",
+        "missing_uppercase" => "an uppercase letter",
+        "missing_digit" => "a number",
+        "missing_symbol" => "a symbol (e.g. ! @ # -)",
+        "contains_username" => "not containing the username",
+        "too_common" => "not being a commonly used password",
+        _ => "meeting the password policy",
     }
-    if !password.chars().any(|c| c.is_lowercase()) {
-        return Err("Password must contain at least one lowercase letter.");
-    }
-    if !password.chars().any(|c| c.is_uppercase()) {
-        return Err("Password must contain at least one uppercase letter.");
-    }
-    if !password.chars().any(|c| c.is_numeric()) {
-        return Err("Password must contain at least one number.");
-    }
-    if !password.chars().any(|c| !c.is_alphanumeric()) {
-        return Err("Password must contain at least one special character.");
-    }
-    Ok(())
+}
+
+fn prompt(label: &str) -> String {
+    let mut value = String::new();
+    print!("{label}");
+    io::stdout().flush().expect("❌ Error displaying prompt");
+    io::stdin()
+        .read_line(&mut value)
+        .expect("❌ Error reading input");
+    value.trim().to_string()
 }
 
 fn prompt_for_username() -> String {
-    let mut username = String::new();
     loop {
-        username.clear();
-        print!("Enter the username for the new admin: ");
-        io::stdout().flush().expect("❌ Error displaying prompt");
-
-        io::stdin()
-            .read_line(&mut username)
-            .expect("❌ Error reading username");
-
-        let trimmed_username = username.trim();
-
-        if !trimmed_username.is_empty() {
-            return trimmed_username.to_string();
-        } else {
-            println!("❌ Username cannot be empty.\n");
+        let username = prompt("Enter the username for the new admin: ");
+        match validate_username(&username) {
+            Ok(()) => return username,
+            Err(e) => println!(
+                "❌ {}\n",
+                e.message.map(|m| m.to_string()).unwrap_or_default()
+            ),
         }
     }
 }
 
 fn prompt_for_password(username: &str) -> String {
-    let mut password = String::new();
     loop {
-        password.clear();
-        print!("Enter a strong password for user '{username}': ");
-        io::stdout().flush().expect("❌ Error displaying prompt");
-
-        io::stdin()
-            .read_line(&mut password)
-            .expect("❌ Error reading password");
-
-        let trimmed_password = password.trim();
-
-        match validate_password_strength(trimmed_password) {
-            Ok(_) => return trimmed_password.to_string(),
-            Err(e) => println!("❌ Weak password: {e}\n"),
+        let password = prompt(&format!("Enter a strong password for user '{username}': "));
+        let issues = password_issues(&password, Some(username));
+        if issues.is_empty() {
+            return password;
         }
+        let missing: Vec<&str> = issues.iter().map(|i| describe_issue(i)).collect();
+        println!("❌ Weak password — it needs {}.\n", missing.join(", "));
     }
 }
 
@@ -95,7 +74,7 @@ async fn main() {
     let _guard = match config::Config::init() {
         Ok(guard) => guard,
         Err(e) => {
-            tracing::error!("❌ Error loading configurations: {e}");
+            eprintln!("❌ Error loading configurations: {e}");
             std::process::exit(1);
         }
     };
@@ -105,45 +84,36 @@ async fn main() {
     let pool = match create_pool().await {
         Ok(pool) => pool,
         Err(e) => {
-            error!("❌ Error connecting to the database: {e}");
+            eprintln!("❌ Error connecting to the database: {e}");
             std::process::exit(1);
         }
     };
 
-    let user_repo = Arc::new(UserRepositoryImpl::new(pool.clone()));
-    let user_prefs_repo = Arc::new(UserPreferencesRepositoryImpl::new(pool.clone()));
-    let artist_repo = Arc::new(ArtistRepositoryImpl::new(pool.clone()));
-    let song_repo = Arc::new(SongRepositoryImpl::new(pool.clone()));
-    let setlist_repo = Arc::new(SetlistRepositoryImpl::new(pool.clone()));
-    let gig_repo = Arc::new(GigRepositoryImpl::new(pool.clone()));
-    let metrics_repo = Arc::new(MetricsRepositoryImpl::new(pool.clone()));
-    let backup_repo = Arc::new(BackupRepositoryImpl::new(pool.clone()));
-    let band_repo = Arc::new(BandRepositoryImpl::new(pool.clone()));
-    let band_member_repo = Arc::new(BandMemberRepositoryImpl::new(pool.clone()));
-    let band_invite_repo = Arc::new(BandInviteRepositoryImpl::new(pool.clone()));
-    let notification_repo = Arc::new(NotificationRepositoryImpl::new(pool.clone()));
+    if let Err(e) = run_migrations(&pool).await {
+        eprintln!("❌ Failed to apply database migrations: {e}");
+        std::process::exit(1);
+    }
 
-    let state = AppState {
-        db: pool.clone(),
-        user_repo,
-        user_prefs_repo,
-        artist_repo,
-        song_repo,
-        setlist_repo,
-        gig_repo,
-        metrics_repo,
-        backup_repo,
-        band_repo,
-        band_member_repo,
-        band_invite_repo,
-        notification_repo,
-    };
+    let state = AppState::new(pool);
 
-    // Use the argument if provided, otherwise prompt the user
     let username = match args.username {
-        Some(name) => name,
+        Some(name) => match validate_username(&name) {
+            Ok(()) => name,
+            Err(e) => {
+                eprintln!(
+                    "❌ {}",
+                    e.message.map(|m| m.to_string()).unwrap_or_default()
+                );
+                std::process::exit(1);
+            }
+        },
         None => prompt_for_username(),
     };
+
+    if state.user_repo.is_unique(&username, None).await.is_err() {
+        eprintln!("❌ Username '{username}' already exists!");
+        std::process::exit(1);
+    }
 
     let password = prompt_for_password(&username);
 
@@ -155,25 +125,19 @@ async fn main() {
         email: None,
         first_name: None,
         last_name: None,
+        require_password_change: Some(false),
     };
 
-    user.validate().expect("❌ Validation error");
+    if let Err(e) = user.validate() {
+        eprintln!("❌ Validation error: {e}");
+        std::process::exit(1);
+    }
 
-    state
-        .user_repo
-        .is_unique(&user.username, None)
-        .await
-        .expect("❌ Username already exists!");
-
-    match state.user_repo.create(&user).await {
-        Ok(new_user) => {
-            info!("✅ Superuser created! ID: {}", &new_user.id);
-        }
+    match state.user_repo.create(&user, None, false).await {
+        Ok(new_user) => println!("✅ Superuser created! ID: {}", new_user.id),
         Err(e) => {
-            error!(
-                "❌ Error creating superuser with username {}: {e}",
-                user.username
-            );
+            eprintln!("❌ Error creating superuser '{}': {e}", user.username);
+            std::process::exit(1);
         }
     }
 }

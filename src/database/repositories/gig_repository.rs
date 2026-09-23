@@ -1,55 +1,72 @@
 use crate::{
-    errors::api_error::ApiError,
+    errors::api_error::{ApiError, codes},
     models::{
         band::BandRole,
         gig::{CreateGigPayload, Gig, UpdateGigPayload},
     },
 };
+use axum::http::StatusCode;
+use chrono::NaiveDateTime;
 use sqlx::PgPool;
 use tracing::error;
 use uuid::Uuid;
 
+/// Columns selected for a [`Gig`] from `gigs g`.
+macro_rules! gig_columns {
+    () => {
+        "g.id, g.user_id, g.band_id, g.setlist_id, g.venue, g.location, g.scheduled_at, g.status,
+         g.notes, g.share_token, g.share_locked_at, g.share_lock_reason, g.updated_by,
+         (SELECT u.username FROM users u WHERE u.id = g.updated_by) AS updated_by_username,
+         g.created_at, g.updated_at"
+    };
+}
+
 #[async_trait::async_trait]
 pub trait GigRepository: Send + Sync {
-    /// Lists the caller's personal gigs (i.e. `band_id IS NULL`), soonest
-    /// first.
+    /// Lists the caller's personal gigs (i.e. `band_id IS NULL`).
     async fn find_all(
         &self,
         user_id: Uuid,
         page: i64,
         size: i64,
     ) -> Result<(Vec<Gig>, i64), ApiError>;
-    /// Lists every gig that belongs to a band. Callers must check band
-    /// membership themselves before calling this.
+    /// Lists every gig of a band. Callers must check membership first.
     async fn find_all_for_band(
         &self,
         band_id: Uuid,
         page: i64,
         size: i64,
     ) -> Result<(Vec<Gig>, i64), ApiError>;
-    /// Fetches a gig the caller may *view*: either their own personal gig,
-    /// or a gig belonging to any band they are a member of.
+    /// A gig the caller may view: their own personal gig, or any gig of a
+    /// band they belong to.
     async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Gig>, ApiError>;
+    /// Any gig by ID, without an access filter (staff tooling).
+    async fn find_any(&self, id: Uuid) -> Result<Option<Gig>, ApiError>;
     async fn create(&self, payload: &CreateGigPayload, user_id: Uuid) -> Result<Gig, ApiError>;
-    async fn update(&self, id: Uuid, payload: &UpdateGigPayload) -> Result<Uuid, ApiError>;
+    async fn update(
+        &self,
+        id: Uuid,
+        payload: &UpdateGigPayload,
+        actor_id: Uuid,
+    ) -> Result<Uuid, ApiError>;
     async fn delete(&self, id: Uuid) -> Result<(), ApiError>;
-    /// Checks the caller may *view* the gig (see `find_by_id`).
     async fn exists(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
-    /// Checks the caller may *manage* (edit/delete) the gig: its personal
-    /// owner, or a band member whose role clears the band's
-    /// setlist-management bar (`moderator`+, or `member` when the band
-    /// allows it) — the same bar used for the band's setlists.
+    /// Personal owner, or a band member allowed to manage setlists (gigs
+    /// follow the same permission).
     async fn can_manage(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
-    /// Generates a fresh public share token for the gig, replacing any
-    /// existing one (which immediately invalidates previously shared
-    /// links). Returns the updated gig.
+    /// Generates a fresh share token (rotating any previous link). Fails
+    /// with `SHARE_LOCKED` when staff disabled sharing for this gig.
     async fn enable_sharing(&self, id: Uuid) -> Result<Gig, ApiError>;
-    /// Disables public sharing (clears the share token).
     async fn disable_sharing(&self, id: Uuid) -> Result<(), ApiError>;
-    /// Resolves a gig by its public share token. No ownership or
-    /// membership filter — this is the lookup used by the unauthenticated
-    /// `/public/gigs/{token}` routes.
+    /// Public lookup — never resolves a locked share.
     async fn find_by_share_token(&self, token: &str) -> Result<Option<Gig>, ApiError>;
+    async fn lock_sharing(
+        &self,
+        id: Uuid,
+        actor_id: Uuid,
+        reason: Option<&str>,
+    ) -> Result<(), ApiError>;
+    async fn unlock_sharing(&self, id: Uuid) -> Result<(), ApiError>;
 }
 
 pub struct GigRepositoryImpl {
@@ -62,8 +79,6 @@ impl GigRepositoryImpl {
     }
 }
 
-/// Row shape used to decide write permission on a gig without fetching its
-/// full column set. Mirrors `setlist_repository::SetlistAccessRow`.
 #[derive(sqlx::FromRow)]
 struct GigAccessRow {
     owner_id: Uuid,
@@ -87,13 +102,14 @@ impl GigRepository for GigRepositoryImpl {
                 .bind(user_id)
                 .fetch_one(&self.db);
 
-        let gigs = sqlx::query_as::<_, Gig>(
-            "SELECT id, user_id, band_id, setlist_id, venue, location, scheduled_at, status, notes, share_token, created_at, updated_at
-             FROM gigs
-             WHERE user_id = $1 AND band_id IS NULL
-             ORDER BY scheduled_at ASC
+        let gigs = sqlx::query_as::<_, Gig>(concat!(
+            "SELECT ",
+            gig_columns!(),
+            " FROM gigs g
+             WHERE g.user_id = $1 AND g.band_id IS NULL
+             ORDER BY g.scheduled_at ASC
              LIMIT $2 OFFSET $3"
-        )
+        ))
         .bind(user_id)
         .bind(size)
         .bind(offset)
@@ -115,13 +131,14 @@ impl GigRepository for GigRepositoryImpl {
             .bind(band_id)
             .fetch_one(&self.db);
 
-        let gigs = sqlx::query_as::<_, Gig>(
-            "SELECT id, user_id, band_id, setlist_id, venue, location, scheduled_at, status, notes, share_token, created_at, updated_at
-             FROM gigs
-             WHERE band_id = $1
-             ORDER BY scheduled_at ASC
+        let gigs = sqlx::query_as::<_, Gig>(concat!(
+            "SELECT ",
+            gig_columns!(),
+            " FROM gigs g
+             WHERE g.band_id = $1
+             ORDER BY g.scheduled_at ASC
              LIMIT $2 OFFSET $3"
-        )
+        ))
         .bind(band_id)
         .bind(size)
         .bind(offset)
@@ -132,12 +149,13 @@ impl GigRepository for GigRepositoryImpl {
     }
 
     async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Gig>, ApiError> {
-        let gig = sqlx::query_as::<_, Gig>(
-            "SELECT g.id, g.user_id, g.band_id, g.setlist_id, g.venue, g.location, g.scheduled_at, g.status, g.notes, g.share_token, g.created_at, g.updated_at
-             FROM gigs g
+        let gig = sqlx::query_as::<_, Gig>(concat!(
+            "SELECT ",
+            gig_columns!(),
+            " FROM gigs g
              LEFT JOIN band_members bm ON bm.band_id = g.band_id AND bm.user_id = $2
-             WHERE g.id = $1 AND (g.user_id = $2 OR bm.user_id IS NOT NULL)"
-        )
+             WHERE g.id = $1 AND ((g.band_id IS NULL AND g.user_id = $2) OR bm.user_id IS NOT NULL)"
+        ))
         .bind(id)
         .bind(user_id)
         .fetch_optional(&self.db)
@@ -145,8 +163,29 @@ impl GigRepository for GigRepositoryImpl {
         Ok(gig)
     }
 
+    async fn find_any(&self, id: Uuid) -> Result<Option<Gig>, ApiError> {
+        let gig = sqlx::query_as::<_, Gig>(concat!(
+            "SELECT ",
+            gig_columns!(),
+            " FROM gigs g WHERE g.id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.db)
+        .await?;
+        Ok(gig)
+    }
+
     async fn create(&self, payload: &CreateGigPayload, user_id: Uuid) -> Result<Gig, ApiError> {
-        let new_gig = Gig::new(payload.clone(), user_id);
+        let mut new_gig = Gig::new(payload.clone(), user_id);
+        new_gig.venue = new_gig.venue.trim().to_string();
+        new_gig.location = new_gig
+            .location
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty());
+        new_gig.notes = new_gig
+            .notes
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty());
 
         sqlx::query(
             "INSERT INTO gigs (id, user_id, band_id, setlist_id, venue, location, scheduled_at, status, notes, created_at, updated_at)
@@ -169,13 +208,18 @@ impl GigRepository for GigRepositoryImpl {
         Ok(new_gig)
     }
 
-    async fn update(&self, id: Uuid, payload: &UpdateGigPayload) -> Result<Uuid, ApiError> {
+    async fn update(
+        &self,
+        id: Uuid,
+        payload: &UpdateGigPayload,
+        actor_id: Uuid,
+    ) -> Result<Uuid, ApiError> {
         let mut tx = self.db.begin().await?;
         let mut updated = false;
 
         if let Some(venue) = &payload.venue {
             sqlx::query("UPDATE gigs SET venue = $1 WHERE id = $2")
-                .bind(venue)
+                .bind(venue.trim())
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
@@ -183,6 +227,7 @@ impl GigRepository for GigRepositoryImpl {
         }
 
         if let Some(location) = &payload.location {
+            let location = location.as_deref().map(str::trim).filter(|l| !l.is_empty());
             sqlx::query("UPDATE gigs SET location = $1 WHERE id = $2")
                 .bind(location)
                 .bind(id)
@@ -200,7 +245,7 @@ impl GigRepository for GigRepositoryImpl {
             updated = true;
         }
 
-        if let Some(setlist_id) = &payload.setlist_id {
+        if let Some(setlist_id) = payload.setlist_id {
             sqlx::query("UPDATE gigs SET setlist_id = $1 WHERE id = $2")
                 .bind(setlist_id)
                 .bind(id)
@@ -219,6 +264,7 @@ impl GigRepository for GigRepositoryImpl {
         }
 
         if let Some(notes) = &payload.notes {
+            let notes = notes.as_deref().map(str::trim).filter(|n| !n.is_empty());
             sqlx::query("UPDATE gigs SET notes = $1 WHERE id = $2")
                 .bind(notes)
                 .bind(id)
@@ -227,20 +273,18 @@ impl GigRepository for GigRepositoryImpl {
             updated = true;
         }
 
-        if updated {
-            sqlx::query("UPDATE gigs SET updated_at = $1 WHERE id = $2")
-                .bind(chrono::Utc::now().naive_utc())
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-        }
-
-        tx.commit().await?;
-
         if !updated {
             return Err(ApiError::NotModified);
         }
 
+        sqlx::query("UPDATE gigs SET updated_at = $1, updated_by = $2 WHERE id = $3")
+            .bind(chrono::Utc::now().naive_utc())
+            .bind(actor_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
         Ok(id)
     }
 
@@ -262,7 +306,7 @@ impl GigRepository for GigRepositoryImpl {
             r#"
             SELECT g.id FROM gigs g
             LEFT JOIN band_members bm ON bm.band_id = g.band_id AND bm.user_id = $2
-            WHERE g.id = $1 AND (g.user_id = $2 OR bm.user_id IS NOT NULL);
+            WHERE g.id = $1 AND ((g.band_id IS NULL AND g.user_id = $2) OR bm.user_id IS NOT NULL);
             "#,
         )
         .bind(id)
@@ -271,11 +315,10 @@ impl GigRepository for GigRepositoryImpl {
         .await?
         .is_some();
 
-        if !exists {
-            error!("Gig ID not found or unauthorized.");
-            Err(ApiError::NotFound)
-        } else {
+        if exists {
             Ok(())
+        } else {
+            Err(ApiError::NotFound)
         }
     }
 
@@ -311,26 +354,42 @@ impl GigRepository for GigRepositoryImpl {
             },
         };
 
-        if allowed {
-            Ok(())
-        } else {
-            error!(%id, %user_id, "User is not allowed to manage this gig.");
-            Err(ApiError::Forbidden)
+        match (allowed, row.band_id, row.band_role) {
+            (true, _, _) => Ok(()),
+            (false, None, _) | (false, Some(_), None) => Err(ApiError::NotFound),
+            (false, Some(_), Some(_)) => {
+                error!(%id, %user_id, "User is not allowed to manage this gig.");
+                Err(ApiError::Forbidden)
+            }
         }
     }
 
     async fn enable_sharing(&self, id: Uuid) -> Result<Gig, ApiError> {
+        let locked: Option<Option<NaiveDateTime>> =
+            sqlx::query_scalar("SELECT share_locked_at FROM gigs WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.db)
+                .await?;
+
+        match locked {
+            None => return Err(ApiError::NotFound),
+            Some(Some(_)) => {
+                return Err(ApiError::rule(
+                    StatusCode::FORBIDDEN,
+                    codes::SHARE_LOCKED,
+                    "Public sharing for this gig was disabled by a moderator.",
+                ));
+            }
+            Some(None) => {}
+        }
+
         let token = crate::utils::share_token::generate_share_token();
 
-        let result = sqlx::query("UPDATE gigs SET share_token = $1 WHERE id = $2")
+        sqlx::query("UPDATE gigs SET share_token = $1 WHERE id = $2 AND share_locked_at IS NULL")
             .bind(&token)
             .bind(id)
             .execute(&self.db)
             .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(ApiError::NotFound);
-        }
 
         self.find_by_share_token(&token)
             .await?
@@ -351,14 +410,52 @@ impl GigRepository for GigRepositoryImpl {
     }
 
     async fn find_by_share_token(&self, token: &str) -> Result<Option<Gig>, ApiError> {
-        let gig = sqlx::query_as::<_, Gig>(
-            "SELECT id, user_id, band_id, setlist_id, venue, location, scheduled_at, status, notes, share_token, created_at, updated_at
-             FROM gigs WHERE share_token = $1"
-        )
+        let gig = sqlx::query_as::<_, Gig>(concat!(
+            "SELECT ",
+            gig_columns!(),
+            " FROM gigs g WHERE g.share_token = $1 AND g.share_locked_at IS NULL"
+        ))
         .bind(token)
         .fetch_optional(&self.db)
         .await?;
 
         Ok(gig)
+    }
+
+    async fn lock_sharing(
+        &self,
+        id: Uuid,
+        actor_id: Uuid,
+        reason: Option<&str>,
+    ) -> Result<(), ApiError> {
+        let result = sqlx::query(
+            "UPDATE gigs
+             SET share_token = NULL, share_locked_at = $1, share_locked_by = $2, share_lock_reason = $3
+             WHERE id = $4",
+        )
+        .bind(chrono::Utc::now().naive_utc())
+        .bind(actor_id)
+        .bind(reason)
+        .bind(id)
+        .execute(&self.db)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(ApiError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn unlock_sharing(&self, id: Uuid) -> Result<(), ApiError> {
+        let result = sqlx::query(
+            "UPDATE gigs SET share_locked_at = NULL, share_locked_by = NULL, share_lock_reason = NULL
+             WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&self.db)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(ApiError::NotFound);
+        }
+        Ok(())
     }
 }

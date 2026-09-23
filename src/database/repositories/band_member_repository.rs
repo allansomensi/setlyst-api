@@ -53,6 +53,14 @@ pub trait BandMemberRepository: Send + Sync {
     ) -> Result<(), ApiError>;
 }
 
+fn already_member() -> ApiError {
+    ApiError::rule(
+        axum::http::StatusCode::CONFLICT,
+        crate::errors::api_error::codes::ALREADY_MEMBER,
+        "This user is already a member of this band.",
+    )
+}
+
 pub struct BandMemberRepositoryImpl {
     pub db: PgPool,
 }
@@ -90,21 +98,11 @@ impl BandMemberRepository for BandMemberRepositoryImpl {
         user_id: Uuid,
         role: BandRole,
     ) -> Result<(), ApiError> {
-        let already_member =
-            sqlx::query("SELECT id FROM band_members WHERE band_id = $1 AND user_id = $2;")
-                .bind(band_id)
-                .bind(user_id)
-                .fetch_optional(&self.db)
-                .await?
-                .is_some();
-
-        if already_member {
-            error!(%band_id, %user_id, "User is already a member of this band.");
-            return Err(ApiError::AlreadyExists);
-        }
-
-        sqlx::query(
-            "INSERT INTO band_members (id, band_id, user_id, role, joined_at) VALUES ($1, $2, $3, $4, $5)",
+        // Atomic against concurrent joins via the (band_id, user_id)
+        // unique constraint, rather than check-then-insert.
+        let result = sqlx::query(
+            "INSERT INTO band_members (id, band_id, user_id, role, joined_at) VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (band_id, user_id) DO NOTHING",
         )
         .bind(Uuid::new_v4())
         .bind(band_id)
@@ -113,6 +111,11 @@ impl BandMemberRepository for BandMemberRepositoryImpl {
         .bind(chrono::Utc::now().naive_utc())
         .execute(&self.db)
         .await?;
+
+        if result.rows_affected() == 0 {
+            error!(%band_id, %user_id, "User is already a member of this band.");
+            return Err(already_member());
+        }
 
         Ok(())
     }

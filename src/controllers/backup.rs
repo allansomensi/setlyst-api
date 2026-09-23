@@ -112,7 +112,9 @@ pub async fn import_backup(
         "Processing request to import backup"
     );
 
-    match state.backup_repo.import(user_id, payload).await {
+    let limits = state.quota_repo.effective_limits(user_id).await?;
+
+    match state.backup_repo.import(user_id, payload, limits).await {
         Ok(summary) => {
             info!(
                 %user_id,

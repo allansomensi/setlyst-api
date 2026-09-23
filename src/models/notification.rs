@@ -20,6 +20,11 @@ pub enum NotificationType {
     BandMemberRemoved,
     /// The recipient's site-wide role changed (admin/moderator/user).
     PlatformRoleChanged,
+    /// The recipient was added to a band directly by platform staff.
+    BandMemberAdded,
+    /// Staff took down the public link of one of the recipient's setlists
+    /// or gigs.
+    ShareLinkRevoked,
 }
 
 #[derive(ToSchema, Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -100,6 +105,49 @@ impl Notification {
             json!({
                 "old_role": old_role,
                 "new_role": new_role,
+                "actor_id": actor_id,
+            }),
+        )
+    }
+}
+
+impl Notification {
+    pub fn band_member_added(
+        user_id: Uuid,
+        band_id: Uuid,
+        band_name: &str,
+        role: BandRole,
+        actor_id: Uuid,
+    ) -> Self {
+        Self::new(
+            user_id,
+            NotificationType::BandMemberAdded,
+            json!({
+                "band_id": band_id,
+                "band_name": band_name,
+                "role": role,
+                "actor_id": actor_id,
+            }),
+        )
+    }
+
+    /// `kind` is `"setlist"` or `"gig"`.
+    pub fn share_link_revoked(
+        user_id: Uuid,
+        kind: &str,
+        target_id: Uuid,
+        title: &str,
+        reason: Option<&str>,
+        actor_id: Uuid,
+    ) -> Self {
+        Self::new(
+            user_id,
+            NotificationType::ShareLinkRevoked,
+            json!({
+                "kind": kind,
+                "target_id": target_id,
+                "title": title,
+                "reason": reason,
                 "actor_id": actor_id,
             }),
         )

@@ -1,4 +1,6 @@
+pub mod admin_repository;
 pub mod artist_repository;
+pub mod audit_repository;
 pub mod backup_repository;
 pub mod band_invite_repository;
 pub mod band_member_repository;
@@ -6,6 +8,7 @@ pub mod band_repository;
 pub mod gig_repository;
 pub mod metrics_repository;
 pub mod notification_repository;
+pub mod quota_repository;
 pub mod setlist_repository;
 pub mod song_repository;
 pub mod user_preferences_repository;

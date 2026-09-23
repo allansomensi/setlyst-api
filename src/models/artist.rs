@@ -19,6 +19,13 @@ pub struct Artist {
     /// [`crate::models::song::Song::forked_from`]; lets platform-wide
     /// metrics avoid double-counting the same artist once per scope.
     pub forked_from: Option<Uuid>,
+    #[sqlx(default)]
+    pub updated_by: Option<Uuid>,
+    #[sqlx(default)]
+    pub updated_by_username: Option<String>,
+    /// Number of songs by this artist in the same scope (personal list).
+    #[sqlx(default)]
+    pub song_count: i64,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -52,6 +59,9 @@ impl Artist {
             user_id,
             band_id: None,
             forked_from: None,
+            updated_by: None,
+            updated_by_username: None,
+            song_count: 0,
             created_at: now,
             updated_at: now,
         }
@@ -76,6 +86,9 @@ impl Artist {
             user_id: creator_id,
             band_id: Some(band_id),
             forked_from,
+            updated_by: None,
+            updated_by_username: None,
+            song_count: 0,
             created_at: now,
             updated_at: now,
         }
