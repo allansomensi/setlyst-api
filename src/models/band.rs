@@ -83,6 +83,33 @@ pub struct BandWithMembership {
     /// Whether the *caller* has favorited this band — personal, never
     /// affects anyone else's view or any permission.
     pub is_favorite: bool,
+    /// The band's repertoire (see `Setlist::is_repertoire`).
+    #[sqlx(default)]
+    pub repertoire_id: Option<Uuid>,
+    /// Up-votes that accept a song suggestion automatically (`None` =
+    /// never automatic).
+    #[sqlx(default)]
+    pub suggestion_auto_accept_votes: Option<i32>,
+    /// Suggestions still open for voting.
+    #[sqlx(default)]
+    pub open_suggestions: i64,
+    /// Whether the *caller* pinned this band to their home screen.
+    #[sqlx(default)]
+    pub is_pinned: bool,
+    /// What the *caller* may do in this band, computed with the same rules
+    /// the API enforces.
+    #[sqlx(flatten)]
+    pub my_permissions: MyBandPermissions,
+}
+
+/// The caller's effective band permissions: `owner`/`admin` always have
+/// every one; `member`/`moderator` follow the band's permission matrix
+/// (`band_role_permissions`, denied when no row exists).
+#[derive(ToSchema, Debug, Clone, Copy, Default, PartialEq, Eq, FromRow, Serialize, Deserialize)]
+pub struct MyBandPermissions {
+    pub manage_setlists: bool,
+    pub manage_songs: bool,
+    pub export_pdf: bool,
 }
 
 impl Band {
@@ -124,6 +151,15 @@ pub struct UpdateBandPayload {
     #[validate(custom(function = "validate_logo_url"))]
     pub logo_url: Option<Option<String>>,
     pub members_can_manage_setlists: Option<bool>,
+    /// Up-votes that accept a song suggestion automatically (1 to 100);
+    /// `null` turns automatic acceptance off.
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    #[validate(range(
+        min = 1,
+        max = 100,
+        message = "The vote threshold must be between 1 and 100."
+    ))]
+    pub suggestion_auto_accept_votes: Option<Option<i32>>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize, ToSchema)]
@@ -199,7 +235,11 @@ fn validate_configurable_role(role: &BandRole) -> Result<(), validator::Validati
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema, Validate)]
 pub struct UpdateBandRolePermissionsPayload {
-    #[validate(length(min = 1, message = "At least one permission entry is required."))]
+    #[validate(length(
+        min = 1,
+        max = 20,
+        message = "Between 1 and 20 permission entries are required."
+    ))]
     #[validate(nested)]
     pub permissions: Vec<BandRolePermissionEntry>,
 }
@@ -228,7 +268,7 @@ pub struct CreateBandInvitePayload {
     pub role: Option<BandRole>,
     #[validate(range(min = 1, max = 1000, message = "Max uses must be between 1 and 1000."))]
     pub max_uses: Option<i32>,
-    /// Up to one year.
+    /// Up to one year; 7 days when omitted.
     #[validate(range(
         min = 1,
         max = 8760,

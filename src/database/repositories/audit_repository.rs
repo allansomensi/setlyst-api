@@ -70,6 +70,15 @@ impl AuditEvent {
         self
     }
 
+    /// A target known only by a label (e.g. the identifier typed in a
+    /// failed sign-in for an account that doesn't exist).
+    pub fn target_label(mut self, kind: &'static str, label: &str) -> Self {
+        self.target_type = Some(kind);
+        self.target_id = None;
+        self.target_label = Some(label.chars().take(64).collect());
+        self
+    }
+
     pub fn meta(mut self, metadata: Value) -> Self {
         self.metadata = metadata;
         self
@@ -78,6 +87,15 @@ impl AuditEvent {
     pub fn ip(mut self, ip: &Option<String>) -> Self {
         self.ip_address = ip.clone();
         self
+    }
+
+    /// Records the entry in the background, off the request's hot path
+    /// (used where the time taken must not depend on the outcome, such as
+    /// failed sign-ins).
+    pub fn spawn(self, repo: std::sync::Arc<dyn AuditRepository>) {
+        tokio::spawn(async move {
+            self.record(&*repo).await;
+        });
     }
 
     /// Persists the entry. Never fails the surrounding request: an audit

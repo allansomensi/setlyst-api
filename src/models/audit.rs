@@ -36,6 +36,50 @@ pub mod actions {
     pub const SHARE_REVOKED: &str = "share.revoked";
     pub const SHARE_UNLOCKED: &str = "share.unlocked";
     pub const QUOTA_DEFAULTS_UPDATED: &str = "settings.quota_defaults_updated";
+
+    // Accounts (v0.12).
+    pub const USER_SELF_DELETED: &str = "user.self_deleted";
+    pub const USER_EMAIL_CHANGED: &str = "user.email_changed";
+    pub const USER_TWO_FACTOR_ENABLED: &str = "user.two_factor_enabled";
+    pub const USER_TWO_FACTOR_DISABLED: &str = "user.two_factor_disabled";
+    /// A wrong second factor outside sign-in (disabling 2FA, regenerating
+    /// recovery codes); `meta.context` says which.
+    pub const USER_SECOND_FACTOR_FAILED: &str = "user.second_factor_failed";
+    pub const USER_PASSWORD_RECOVERED: &str = "user.password_recovered";
+    pub const USER_LOGIN_LOCKED: &str = "user.login_locked";
+    pub const USER_TERMS_ACCEPTED: &str = "user.terms_accepted";
+    pub const USER_SUBSCRIPTION_GRANTED: &str = "user.subscription_granted";
+    pub const USER_SUBSCRIPTION_REVOKED: &str = "user.subscription_revoked";
+    pub const USER_CREDITS_ADJUSTED: &str = "user.credits_adjusted";
+
+    // Billing.
+    pub const BILLING_SETTINGS_UPDATED: &str = "billing.settings_updated";
+    pub const BILLING_PLAN_UPDATED: &str = "billing.plan_updated";
+    pub const BILLING_TRIALS_GRANTED: &str = "billing.trials_granted";
+    pub const PROMO_CREATED: &str = "promo.created";
+    pub const PROMO_UPDATED: &str = "promo.updated";
+    pub const PROMOTION_CREATED: &str = "promotion.created";
+    pub const PROMOTION_UPDATED: &str = "promotion.updated";
+    pub const PROMOTION_DELETED: &str = "promotion.deleted";
+
+    // Communications.
+    pub const ANNOUNCEMENT_CREATED: &str = "announcement.created";
+    pub const ANNOUNCEMENT_UPDATED: &str = "announcement.updated";
+    pub const ANNOUNCEMENT_PUBLISHED: &str = "announcement.published";
+    pub const ANNOUNCEMENT_ARCHIVED: &str = "announcement.archived";
+    pub const ANNOUNCEMENT_DELETED: &str = "announcement.deleted";
+    pub const RELEASE_NOTE_CREATED: &str = "release_note.created";
+    pub const RELEASE_NOTE_UPDATED: &str = "release_note.updated";
+    pub const RELEASE_NOTE_PUBLISHED: &str = "release_note.published";
+    pub const RELEASE_NOTE_UNPUBLISHED: &str = "release_note.unpublished";
+    pub const RELEASE_NOTE_DELETED: &str = "release_note.deleted";
+
+    // Moderation.
+    pub const MODERATION_DISMISSED: &str = "moderation.dismissed";
+    pub const MODERATION_AVATAR_REMOVED: &str = "moderation.avatar_removed";
+    pub const MODERATION_BAND_LOGO_REMOVED: &str = "moderation.band_logo_removed";
+    pub const MODERATION_USERNAME_RESET: &str = "moderation.username_reset";
+    pub const MODERATION_RESCAN: &str = "moderation.rescan";
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize, ToSchema)]

@@ -14,9 +14,13 @@ use uuid::Uuid;
 /// Columns selected for a [`Gig`] from `gigs g`.
 macro_rules! gig_columns {
     () => {
-        "g.id, g.user_id, g.band_id, g.setlist_id, g.venue, g.location, g.scheduled_at, g.status,
+        "g.id, g.user_id, g.band_id,
+         (SELECT sx.id FROM setlists sx WHERE sx.id = g.setlist_id AND sx.deleted_at IS NULL) AS setlist_id,
+         g.venue, g.location, g.scheduled_at, g.status,
          g.notes, g.share_token, g.share_locked_at, g.share_lock_reason, g.updated_by,
          (SELECT u.username FROM users u WHERE u.id = g.updated_by) AS updated_by_username,
+         (SELECT tx.id FROM tours tx WHERE tx.id = g.tour_id AND tx.deleted_at IS NULL) AS tour_id,
+         (SELECT tx.name FROM tours tx WHERE tx.id = g.tour_id AND tx.deleted_at IS NULL) AS tour_name,
          g.created_at, g.updated_at"
     };
 }
@@ -24,16 +28,20 @@ macro_rules! gig_columns {
 #[async_trait::async_trait]
 pub trait GigRepository: Send + Sync {
     /// Lists the caller's personal gigs (i.e. `band_id IS NULL`).
+    /// Optionally only the gigs of `tour_id`.
     async fn find_all(
         &self,
         user_id: Uuid,
+        tour_id: Option<Uuid>,
         page: i64,
         size: i64,
     ) -> Result<(Vec<Gig>, i64), ApiError>;
-    /// Lists every gig of a band. Callers must check membership first.
+    /// Lists every live gig of a band (optionally of one tour). Callers
+    /// must check membership first.
     async fn find_all_for_band(
         &self,
         band_id: Uuid,
+        tour_id: Option<Uuid>,
         page: i64,
         size: i64,
     ) -> Result<(Vec<Gig>, i64), ApiError>;
@@ -49,7 +57,10 @@ pub trait GigRepository: Send + Sync {
         payload: &UpdateGigPayload,
         actor_id: Uuid,
     ) -> Result<Uuid, ApiError>;
+    /// Permanently deletes a gig (trash purge).
     async fn delete(&self, id: Uuid) -> Result<(), ApiError>;
+    /// Moves a live gig to the trash.
+    async fn trash(&self, id: Uuid, actor_id: Uuid) -> Result<(), ApiError>;
     async fn exists(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
     /// Personal owner, or a band member allowed to manage setlists (gigs
     /// follow the same permission).
@@ -92,27 +103,34 @@ impl GigRepository for GigRepositoryImpl {
     async fn find_all(
         &self,
         user_id: Uuid,
+        tour_id: Option<Uuid>,
         page: i64,
         size: i64,
     ) -> Result<(Vec<Gig>, i64), ApiError> {
         let offset = (page - 1) * size;
 
-        let count =
-            sqlx::query_scalar("SELECT COUNT(*) FROM gigs WHERE user_id = $1 AND band_id IS NULL;")
-                .bind(user_id)
-                .fetch_one(&self.db);
+        let count = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM gigs
+             WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL
+               AND ($2::uuid IS NULL OR tour_id = $2)",
+        )
+        .bind(user_id)
+        .bind(tour_id)
+        .fetch_one(&self.db);
 
         let gigs = sqlx::query_as::<_, Gig>(concat!(
             "SELECT ",
             gig_columns!(),
             " FROM gigs g
-             WHERE g.user_id = $1 AND g.band_id IS NULL
-             ORDER BY g.scheduled_at ASC
+             WHERE g.user_id = $1 AND g.band_id IS NULL AND g.deleted_at IS NULL
+               AND ($4::uuid IS NULL OR g.tour_id = $4)
+             ORDER BY g.scheduled_at ASC, g.id ASC
              LIMIT $2 OFFSET $3"
         ))
         .bind(user_id)
         .bind(size)
         .bind(offset)
+        .bind(tour_id)
         .fetch_all(&self.db);
 
         let (count, gigs) = tokio::try_join!(count, gigs)?;
@@ -122,26 +140,32 @@ impl GigRepository for GigRepositoryImpl {
     async fn find_all_for_band(
         &self,
         band_id: Uuid,
+        tour_id: Option<Uuid>,
         page: i64,
         size: i64,
     ) -> Result<(Vec<Gig>, i64), ApiError> {
         let offset = (page - 1) * size;
 
-        let count = sqlx::query_scalar("SELECT COUNT(*) FROM gigs WHERE band_id = $1;")
-            .bind(band_id)
-            .fetch_one(&self.db);
+        let count = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM gigs
+             WHERE band_id = $1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR tour_id = $2)",
+        )
+        .bind(band_id)
+        .bind(tour_id)
+        .fetch_one(&self.db);
 
         let gigs = sqlx::query_as::<_, Gig>(concat!(
             "SELECT ",
             gig_columns!(),
             " FROM gigs g
-             WHERE g.band_id = $1
-             ORDER BY g.scheduled_at ASC
+             WHERE g.band_id = $1 AND g.deleted_at IS NULL AND ($4::uuid IS NULL OR g.tour_id = $4)
+             ORDER BY g.scheduled_at ASC, g.id ASC
              LIMIT $2 OFFSET $3"
         ))
         .bind(band_id)
         .bind(size)
         .bind(offset)
+        .bind(tour_id)
         .fetch_all(&self.db);
 
         let (count, gigs) = tokio::try_join!(count, gigs)?;
@@ -154,7 +178,8 @@ impl GigRepository for GigRepositoryImpl {
             gig_columns!(),
             " FROM gigs g
              LEFT JOIN band_members bm ON bm.band_id = g.band_id AND bm.user_id = $2
-             WHERE g.id = $1 AND ((g.band_id IS NULL AND g.user_id = $2) OR bm.user_id IS NOT NULL)"
+             WHERE g.id = $1 AND g.deleted_at IS NULL
+               AND ((g.band_id IS NULL AND g.user_id = $2) OR bm.user_id IS NOT NULL)"
         ))
         .bind(id)
         .bind(user_id)
@@ -167,7 +192,7 @@ impl GigRepository for GigRepositoryImpl {
         let gig = sqlx::query_as::<_, Gig>(concat!(
             "SELECT ",
             gig_columns!(),
-            " FROM gigs g WHERE g.id = $1"
+            " FROM gigs g WHERE g.id = $1 AND g.deleted_at IS NULL"
         ))
         .bind(id)
         .fetch_optional(&self.db)
@@ -188,8 +213,8 @@ impl GigRepository for GigRepositoryImpl {
             .filter(|n| !n.is_empty());
 
         sqlx::query(
-            "INSERT INTO gigs (id, user_id, band_id, setlist_id, venue, location, scheduled_at, status, notes, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            "INSERT INTO gigs (id, user_id, band_id, setlist_id, venue, location, scheduled_at, status, notes, tour_id, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(new_gig.id)
         .bind(new_gig.user_id)
@@ -200,6 +225,7 @@ impl GigRepository for GigRepositoryImpl {
         .bind(new_gig.scheduled_at)
         .bind(new_gig.status)
         .bind(&new_gig.notes)
+        .bind(new_gig.tour_id)
         .bind(new_gig.created_at)
         .bind(new_gig.updated_at)
         .execute(&self.db)
@@ -273,6 +299,15 @@ impl GigRepository for GigRepositoryImpl {
             updated = true;
         }
 
+        if let Some(tour_id) = payload.tour_id {
+            sqlx::query("UPDATE gigs SET tour_id = $1 WHERE id = $2")
+                .bind(tour_id)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            updated = true;
+        }
+
         if !updated {
             return Err(ApiError::NotModified);
         }
@@ -301,12 +336,30 @@ impl GigRepository for GigRepositoryImpl {
         Ok(())
     }
 
+    async fn trash(&self, id: Uuid, actor_id: Uuid) -> Result<(), ApiError> {
+        let result = sqlx::query(
+            "UPDATE gigs SET deleted_at = $2, deleted_by = $3, trash_batch = $4
+             WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .bind(chrono::Utc::now().naive_utc())
+        .bind(actor_id)
+        .bind(Uuid::new_v4())
+        .execute(&self.db)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(ApiError::NotFound);
+        }
+        Ok(())
+    }
+
     async fn exists(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
         let exists = sqlx::query(
             r#"
             SELECT g.id FROM gigs g
             LEFT JOIN band_members bm ON bm.band_id = g.band_id AND bm.user_id = $2
-            WHERE g.id = $1 AND ((g.band_id IS NULL AND g.user_id = $2) OR bm.user_id IS NOT NULL);
+            WHERE g.id = $1 AND g.deleted_at IS NULL
+              AND ((g.band_id IS NULL AND g.user_id = $2) OR bm.user_id IS NOT NULL);
             "#,
         )
         .bind(id)
@@ -336,7 +389,7 @@ impl GigRepository for GigRepositoryImpl {
                 ON brp.band_id = g.band_id
                 AND brp.role = bm.role
                 AND brp.permission = 'manage_setlists'
-            WHERE g.id = $1
+            WHERE g.id = $1 AND g.deleted_at IS NULL
             "#,
         )
         .bind(id)
@@ -365,11 +418,12 @@ impl GigRepository for GigRepositoryImpl {
     }
 
     async fn enable_sharing(&self, id: Uuid) -> Result<Gig, ApiError> {
-        let locked: Option<Option<NaiveDateTime>> =
-            sqlx::query_scalar("SELECT share_locked_at FROM gigs WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&self.db)
-                .await?;
+        let locked: Option<Option<NaiveDateTime>> = sqlx::query_scalar(
+            "SELECT share_locked_at FROM gigs WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .fetch_optional(&self.db)
+        .await?;
 
         match locked {
             None => return Err(ApiError::NotFound),
@@ -413,7 +467,7 @@ impl GigRepository for GigRepositoryImpl {
         let gig = sqlx::query_as::<_, Gig>(concat!(
             "SELECT ",
             gig_columns!(),
-            " FROM gigs g WHERE g.share_token = $1 AND g.share_locked_at IS NULL"
+            " FROM gigs g WHERE g.share_token = $1 AND g.share_locked_at IS NULL AND g.deleted_at IS NULL"
         ))
         .bind(token)
         .fetch_optional(&self.db)

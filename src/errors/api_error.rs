@@ -4,7 +4,7 @@ use super::{
 };
 use axum::{
     Json,
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header::RETRY_AFTER},
     response::{IntoResponse, Response},
 };
 use chrono::NaiveDateTime;
@@ -36,6 +36,64 @@ pub mod codes {
     pub const INVITE_INVALID: &str = "INVITE_INVALID";
     pub const ALREADY_MEMBER: &str = "ALREADY_MEMBER";
     pub const PAYLOAD_TOO_LARGE: &str = "PAYLOAD_TOO_LARGE";
+
+    // Accounts and authentication.
+    pub const TOO_MANY_ATTEMPTS: &str = "TOO_MANY_ATTEMPTS";
+    pub const ACCOUNT_LOCKED: &str = "ACCOUNT_LOCKED";
+    pub const INVALID_TWO_FACTOR_CODE: &str = "INVALID_TWO_FACTOR_CODE";
+    pub const TWO_FACTOR_ALREADY_ENABLED: &str = "TWO_FACTOR_ALREADY_ENABLED";
+    pub const TWO_FACTOR_NOT_ENABLED: &str = "TWO_FACTOR_NOT_ENABLED";
+    pub const INVALID_CODE: &str = "INVALID_CODE";
+    pub const CODE_EXPIRED: &str = "CODE_EXPIRED";
+    pub const EMAIL_NOT_VERIFIED: &str = "EMAIL_NOT_VERIFIED";
+    pub const EMAIL_TAKEN: &str = "EMAIL_TAKEN";
+    pub const EMAIL_REQUIRED: &str = "EMAIL_REQUIRED";
+    pub const EMAIL_ALREADY_VERIFIED: &str = "EMAIL_ALREADY_VERIFIED";
+    pub const GOOGLE_SIGNIN_DISABLED: &str = "GOOGLE_SIGNIN_DISABLED";
+    pub const INVALID_GOOGLE_TOKEN: &str = "INVALID_GOOGLE_TOKEN";
+    pub const PASSWORD_NOT_SET: &str = "PASSWORD_NOT_SET";
+    pub const TERMS_NOT_ACCEPTED: &str = "TERMS_NOT_ACCEPTED";
+    pub const INVALID_IMAGE_URL: &str = "INVALID_IMAGE_URL";
+    /// A stored two-factor secret can't be decrypted (the data encryption
+    /// key changed). 500; details are only in the server log.
+    pub const TWO_FACTOR_UNAVAILABLE: &str = "TWO_FACTOR_UNAVAILABLE";
+
+    // Plans, promo codes and credits.
+    pub const FEATURE_NOT_IN_PLAN: &str = "FEATURE_NOT_IN_PLAN";
+    pub const PLAN_NOT_FOUND: &str = "PLAN_NOT_FOUND";
+    pub const PROMO_CODE_INVALID: &str = "PROMO_CODE_INVALID";
+    pub const PROMO_CODE_EXPIRED: &str = "PROMO_CODE_EXPIRED";
+    pub const PROMO_CODE_EXHAUSTED: &str = "PROMO_CODE_EXHAUSTED";
+    pub const PROMO_CODE_ALREADY_REDEEMED: &str = "PROMO_CODE_ALREADY_REDEEMED";
+    pub const PROMO_CODE_NOT_ELIGIBLE: &str = "PROMO_CODE_NOT_ELIGIBLE";
+    pub const INSUFFICIENT_CREDITS: &str = "INSUFFICIENT_CREDITS";
+    pub const REWARD_NOT_FOUND: &str = "REWARD_NOT_FOUND";
+
+    // Content.
+    pub const INVALID_LINK: &str = "INVALID_LINK";
+    pub const REPERTOIRE_PROTECTED: &str = "REPERTOIRE_PROTECTED";
+    pub const SONG_ALREADY_IN_SETLIST: &str = "SONG_ALREADY_IN_SETLIST";
+    pub const SUGGESTION_CLOSED: &str = "SUGGESTION_CLOSED";
+    pub const NOT_IN_TRASH: &str = "NOT_IN_TRASH";
+    pub const RESTORE_CONFLICT: &str = "RESTORE_CONFLICT";
+    pub const CHORDPRO_INVALID: &str = "CHORDPRO_INVALID";
+    pub const CHORDPRO_TOO_LARGE: &str = "CHORDPRO_TOO_LARGE";
+
+    // Moderation.
+    /// The flag was already resolved (actioned or dismissed) by someone else.
+    pub const FLAG_ALREADY_RESOLVED: &str = "FLAG_ALREADY_RESOLVED";
+
+    // Capacity.
+    pub const SERVICE_BUSY: &str = "SERVICE_BUSY";
+
+    // Communications (platform, v0.12).
+    /// An announcement that must stay visible (not dismissible, or waiting
+    /// for an acknowledgement) was dismissed.
+    pub const NOT_DISMISSIBLE: &str = "NOT_DISMISSIBLE";
+    /// A published announcement can't be changed this way (only its text,
+    /// button, end and display flags while active; nothing once ended or
+    /// archived).
+    pub const ANNOUNCEMENT_LOCKED: &str = "ANNOUNCEMENT_LOCKED";
 }
 
 #[derive(Error, Debug)]
@@ -408,8 +466,39 @@ impl IntoResponse for ApiError {
             }
         };
 
-        (status_code, Json(error_response)).into_response()
+        let retry_after = retry_after_seconds(status_code, error_response.meta.as_ref());
+        let mut response = (status_code, Json(error_response)).into_response();
+        if let Some(seconds) = retry_after {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(seconds));
+        }
+        response
     }
+}
+
+/// The `Retry-After` value (in whole seconds, at least 1) for a 429/503
+/// answer whose meta says how long to wait: either
+/// `meta.retry_after_seconds` or, for lockouts, `meta.until` (a UTC
+/// timestamp, counted from now). `None` for any other answer, so clients
+/// only back off when the server actually told them to.
+fn retry_after_seconds(status: StatusCode, meta: Option<&Value>) -> Option<u64> {
+    if status != StatusCode::TOO_MANY_REQUESTS && status != StatusCode::SERVICE_UNAVAILABLE {
+        return None;
+    }
+    let meta = meta?;
+    let seconds = match meta.get("retry_after_seconds") {
+        Some(value) => value
+            .as_i64()
+            .or_else(|| value.as_f64().map(|secs| secs.ceil() as i64))?,
+        None => {
+            let until: NaiveDateTime = serde_json::from_value(meta.get("until")?.clone()).ok()?;
+            let remaining = until - chrono::Utc::now().naive_utc();
+            // Round up so a client never retries a moment too early.
+            remaining.num_seconds() + i64::from(remaining.subsec_nanos() > 0)
+        }
+    };
+    Some(seconds.max(1) as u64)
 }
 
 impl From<std::env::VarError> for ApiError {
@@ -437,6 +526,64 @@ mod tests {
         assert_eq!(body["code"], "QUOTA_EXCEEDED");
         assert_eq!(body["meta"]["resource"], "songs");
         assert_eq!(body["meta"]["limit"], 10);
+    }
+
+    #[tokio::test]
+    async fn waiting_rules_send_retry_after() {
+        let busy = ApiError::rule_with_meta(
+            StatusCode::SERVICE_UNAVAILABLE,
+            codes::SERVICE_BUSY,
+            "Busy.",
+            json!({ "retry_after_seconds": 10 }),
+        )
+        .into_response();
+        assert_eq!(busy.headers()[RETRY_AFTER], "10");
+
+        let attempts = crate::services::account::too_many_attempts(0).into_response();
+        assert_eq!(attempts.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(attempts.headers()[RETRY_AFTER], "1");
+
+        let until = chrono::Utc::now().naive_utc() + chrono::Duration::minutes(15);
+        let locked = crate::services::account::account_locked(until).into_response();
+        let seconds: u64 = locked.headers()[RETRY_AFTER]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((899..=900).contains(&seconds), "{seconds}");
+
+        // A lock that just ended still asks for a (minimal) wait.
+        let past = chrono::Utc::now().naive_utc() - chrono::Duration::minutes(1);
+        let expired = crate::services::account::account_locked(past).into_response();
+        assert_eq!(expired.headers()[RETRY_AFTER], "1");
+    }
+
+    #[tokio::test]
+    async fn other_errors_do_not_send_retry_after() {
+        // Same meta shape, but not a "wait" status.
+        let rule = ApiError::rule_with_meta(
+            StatusCode::BAD_REQUEST,
+            codes::INVALID_CODE,
+            "Nope.",
+            json!({ "retry_after_seconds": 10 }),
+        )
+        .into_response();
+        assert!(rule.headers().get(RETRY_AFTER).is_none());
+
+        let disabled = ApiError::rule(
+            StatusCode::SERVICE_UNAVAILABLE,
+            codes::GOOGLE_SIGNIN_DISABLED,
+            "Off.",
+        )
+        .into_response();
+        assert!(disabled.headers().get(RETRY_AFTER).is_none());
+        assert!(
+            ApiError::NotFound
+                .into_response()
+                .headers()
+                .get(RETRY_AFTER)
+                .is_none()
+        );
     }
 
     #[tokio::test]

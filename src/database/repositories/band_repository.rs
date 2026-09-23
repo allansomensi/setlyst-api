@@ -22,7 +22,8 @@ pub trait BandRepository: Send + Sync {
         user_id: Uuid,
     ) -> Result<Option<BandWithMembership>, ApiError>;
 
-    /// Creates a new band and makes `owner_id` its first member with the `owner` role.
+    /// Creates a new band and makes `owner_id` its first member with the
+    /// `owner` role, together with the band's repertoire (same transaction).
     async fn create(&self, payload: &CreateBandPayload, owner_id: Uuid) -> Result<Band, ApiError>;
 
     async fn update(
@@ -75,6 +76,18 @@ pub trait BandRepository: Send + Sync {
         role: BandRole,
         permission: BandPermission,
     ) -> Result<bool, ApiError>;
+
+    /// The caller's role, when it grants `permission` in the band.
+    /// `NotFound` for non-members, `Forbidden` without the permission.
+    async fn require_permission(
+        &self,
+        band_id: Uuid,
+        user_id: Uuid,
+        permission: BandPermission,
+    ) -> Result<BandRole, ApiError>;
+
+    /// The band's vote threshold for accepting suggestions automatically.
+    async fn suggestion_threshold(&self, band_id: Uuid) -> Result<Option<i32>, ApiError>;
 }
 
 pub struct BandRepositoryImpl {
@@ -126,7 +139,16 @@ impl BandRepository for BandRepositoryImpl {
                 b.created_at, b.updated_at,
                 (SELECT COUNT(*) FROM band_members bm2 WHERE bm2.band_id = b.id) AS member_count,
                 bm.role AS my_role,
-                EXISTS(SELECT 1 FROM favorite_bands f WHERE f.band_id = b.id AND f.user_id = $1) AS is_favorite
+                EXISTS(SELECT 1 FROM favorite_bands f WHERE f.band_id = b.id AND f.user_id = $1) AS is_favorite,
+                (SELECT r.id FROM setlists r WHERE r.band_id = b.id AND r.is_repertoire) AS repertoire_id,
+                b.suggestion_auto_accept_votes,
+                (SELECT COUNT(*) FROM band_song_suggestions bs WHERE bs.band_id = b.id AND bs.status = 'open') AS open_suggestions,
+                (bm.role IN ('admin', 'owner') OR COALESCE((SELECT p.allowed FROM band_role_permissions p
+                    WHERE p.band_id = b.id AND p.role = bm.role AND p.permission = 'manage_setlists'), FALSE)) AS manage_setlists,
+                (bm.role IN ('admin', 'owner') OR COALESCE((SELECT p.allowed FROM band_role_permissions p
+                    WHERE p.band_id = b.id AND p.role = bm.role AND p.permission = 'manage_songs'), FALSE)) AS manage_songs,
+                (bm.role IN ('admin', 'owner') OR COALESCE((SELECT p.allowed FROM band_role_permissions p
+                    WHERE p.band_id = b.id AND p.role = bm.role AND p.permission = 'export_pdf'), FALSE)) AS export_pdf
             FROM bands b
             INNER JOIN band_members bm ON bm.band_id = b.id
             WHERE bm.user_id = $1
@@ -154,7 +176,16 @@ impl BandRepository for BandRepositoryImpl {
                 b.created_at, b.updated_at,
                 (SELECT COUNT(*) FROM band_members bm2 WHERE bm2.band_id = b.id) AS member_count,
                 bm.role AS my_role,
-                EXISTS(SELECT 1 FROM favorite_bands f WHERE f.band_id = b.id AND f.user_id = $2) AS is_favorite
+                EXISTS(SELECT 1 FROM favorite_bands f WHERE f.band_id = b.id AND f.user_id = $2) AS is_favorite,
+                (SELECT r.id FROM setlists r WHERE r.band_id = b.id AND r.is_repertoire) AS repertoire_id,
+                b.suggestion_auto_accept_votes,
+                (SELECT COUNT(*) FROM band_song_suggestions bs WHERE bs.band_id = b.id AND bs.status = 'open') AS open_suggestions,
+                (bm.role IN ('admin', 'owner') OR COALESCE((SELECT p.allowed FROM band_role_permissions p
+                    WHERE p.band_id = b.id AND p.role = bm.role AND p.permission = 'manage_setlists'), FALSE)) AS manage_setlists,
+                (bm.role IN ('admin', 'owner') OR COALESCE((SELECT p.allowed FROM band_role_permissions p
+                    WHERE p.band_id = b.id AND p.role = bm.role AND p.permission = 'manage_songs'), FALSE)) AS manage_songs,
+                (bm.role IN ('admin', 'owner') OR COALESCE((SELECT p.allowed FROM band_role_permissions p
+                    WHERE p.band_id = b.id AND p.role = bm.role AND p.permission = 'export_pdf'), FALSE)) AS export_pdf
             FROM bands b
             INNER JOIN band_members bm ON bm.band_id = b.id
             WHERE b.id = $1 AND bm.user_id = $2;
@@ -212,6 +243,18 @@ impl BandRepository for BandRepositoryImpl {
         // for existing bands: moderators can manage setlists/songs,
         // members can't (until the admin opts them in), and everyone can
         // export PDFs.
+        // Every band has a repertoire from the start.
+        sqlx::query(
+            "INSERT INTO setlists (id, title, description, user_id, band_id, is_repertoire, created_at, updated_at)
+             VALUES ($1, 'Repertoire', NULL, $2, $3, TRUE, $4, $4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(owner_id)
+        .bind(new_band.id)
+        .bind(new_band.created_at)
+        .execute(&mut *tx)
+        .await?;
+
         for (role, permission, allowed) in [
             (BandRole::Moderator, BandPermission::ManageSetlists, true),
             (BandRole::Moderator, BandPermission::ManageSongs, true),
@@ -281,6 +324,15 @@ impl BandRepository for BandRepositoryImpl {
         if let Some(members_can_manage_setlists) = payload.members_can_manage_setlists {
             sqlx::query("UPDATE bands SET members_can_manage_setlists = $1 WHERE id = $2")
                 .bind(members_can_manage_setlists)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            updated = true;
+        }
+
+        if let Some(threshold) = payload.suggestion_auto_accept_votes {
+            sqlx::query("UPDATE bands SET suggestion_auto_accept_votes = $1 WHERE id = $2")
+                .bind(threshold)
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
@@ -451,5 +503,31 @@ impl BandRepository for BandRepositoryImpl {
         .await?;
 
         Ok(allowed.unwrap_or(false))
+    }
+
+    async fn require_permission(
+        &self,
+        band_id: Uuid,
+        user_id: Uuid,
+        permission: BandPermission,
+    ) -> Result<BandRole, ApiError> {
+        let role = self
+            .role_of(band_id, user_id)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        if self.role_has_permission(band_id, role, permission).await? {
+            Ok(role)
+        } else {
+            Err(ApiError::Forbidden)
+        }
+    }
+
+    async fn suggestion_threshold(&self, band_id: Uuid) -> Result<Option<i32>, ApiError> {
+        let threshold: Option<Option<i32>> =
+            sqlx::query_scalar("SELECT suggestion_auto_accept_votes FROM bands WHERE id = $1")
+                .bind(band_id)
+                .fetch_optional(&self.db)
+                .await?;
+        Ok(threshold.flatten())
     }
 }

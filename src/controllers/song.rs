@@ -1,14 +1,29 @@
 use crate::{
+    controllers::pin::{mark_one, mark_pinned},
     database::{AppState, repositories::song_repository::SongFilter},
-    errors::api_error::ApiError,
-    models::{
-        PaginatedResponse,
-        auth::access::AccessControl,
-        quota::QuotaResource,
-        song::{
-            CreateSongPayload, RenameTagPayload, Song, SongListQuery, TagCount, UpdateSongPayload,
+    errors::api_error::{ApiError, codes},
+    export::{
+        chordpro::{chordpro_filename, render_song, render_songs},
+        limiter::render_pdf,
+        pdf::{
+            SongExportQuery, SongPdfOptions, content_disposition, generate_song_pdf, slug_filename,
         },
     },
+    import::chordpro::{ChordProError, ImportWarning, parse as parse_chordpro},
+    models::{
+        PaginatedResponse,
+        artist::CreateArtistPayload,
+        auth::access::AccessControl,
+        band::BandPermission,
+        link::LinkInput,
+        quota::QuotaResource,
+        resolve_page,
+        song::{
+            CreateSongPayload, RenameTagPayload, Song, SongExport, SongListQuery, SongSetlistRef,
+            TagCount, Tonality, UpdateSongPayload,
+        },
+    },
+    services::entitlements::{Feature, ensure_feature, has_feature},
     validations::tag::{normalize_tag, normalize_tags},
 };
 use axum::{
@@ -20,8 +35,10 @@ use axum::{
     },
     response::IntoResponse,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{debug, info};
+use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 use validator::Validate;
 
@@ -30,7 +47,7 @@ use validator::Validate;
     path = "/api/v1/songs",
     tags = ["Songs"],
     summary = "List the caller's songs.",
-    description = "Paginated personal songs, optionally filtered by a search term (title or artist) and by tags (songs must carry *all* given tags).",
+    description = "Paginated personal songs (trashed ones excluded), optionally filtered by a search term (title or artist) and by tags (songs must carry *all* given tags).",
     params(SongListQuery),
     security(("jwt_token" = [])),
     responses((status = 200, description = "Songs retrieved successfully.", body = PaginatedResponse<Song>))
@@ -41,24 +58,24 @@ pub async fn find_all_songs(
     Query(query): Query<SongListQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = access.user_id();
-    let current_page = query.page.unwrap_or(1).max(1);
-    let per_page = query.per_page.unwrap_or(20).clamp(1, 100);
+    let (current_page, per_page) = resolve_page(query.page, query.per_page, 20);
 
     let tags = query
         .tags
         .as_deref()
-        .map(|raw| raw.split(',').filter_map(normalize_tag).collect())
+        .map(|raw| raw.split(',').take(20).filter_map(normalize_tag).collect())
         .unwrap_or_default();
 
     let filter = SongFilter {
-        search: query.q.clone(),
+        search: query.q.clone().map(|q| q.chars().take(100).collect()),
         tags,
     };
 
-    let (songs, total_items) = state
+    let (mut songs, total_items) = state
         .song_repo
         .find_all(user_id, &filter, current_page, per_page)
         .await?;
+    mark_pinned(&state, user_id, &mut songs).await?;
 
     Ok(Json(PaginatedResponse::new(
         songs,
@@ -85,12 +102,41 @@ pub async fn find_song_by_id(
     State(state): State<AppState>,
     access: AccessControl,
 ) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+    let mut song = state
+        .song_repo
+        .find_by_id(id, user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    mark_one(&state, user_id, &mut song).await?;
+    Ok(Json(song))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/songs/{id}/setlists",
+    tags = ["Songs"],
+    summary = "Setlists that contain a song.",
+    description = "Live (not trashed) setlists the caller can see that contain the song: their personal setlists and those of their bands (the repertoire included, `is_repertoire`). Personal setlists first, then by band.",
+    params(("id" = Uuid, Path, description = "The song ID")),
+    security(("jwt_token" = [])),
+    responses(
+        (status = 200, description = "Setlists.", body = [SongSetlistRef]),
+        (status = 404, description = "Song not found.")
+    )
+)]
+pub async fn find_song_setlists(
+    Path(id): Path<Uuid>,
+    State(state): State<AppState>,
+    access: AccessControl,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
     state
         .song_repo
-        .find_by_id(id, access.user_id())
+        .find_by_id(id, user_id)
         .await?
-        .map(Json)
-        .ok_or(ApiError::NotFound)
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(state.song_repo.setlists_of(id, user_id).await?))
 }
 
 #[utoipa::path(
@@ -98,6 +144,7 @@ pub async fn find_song_by_id(
     path = "/api/v1/songs",
     tags = ["Songs"],
     summary = "Create a new song.",
+    description = "`links`: at most 5 `https` links to YouTube, Spotify, Google Drive, Apple Music, Deezer, SoundCloud, Dropbox or OneDrive (`INVALID_LINK` otherwise, `meta.url`).",
     request_body = CreateSongPayload,
     security(("jwt_token" = [])),
     responses(
@@ -117,6 +164,7 @@ pub async fn create_song(
 
     payload.validate()?;
     let tags = normalize_tags(payload.tags.as_deref().unwrap_or_default())?;
+    crate::validations::link::normalize_links(payload.links.as_deref().unwrap_or_default())?;
 
     state.artist_repo.exists(payload.artist_id, user_id).await?;
     state
@@ -146,7 +194,7 @@ pub async fn create_song(
     path = "/api/v1/songs/{id}",
     tags = ["Songs"],
     summary = "Update a song.",
-    description = "Nullable fields can be cleared by sending `null`. `tags`, when present, replaces the whole tag set.",
+    description = "Nullable fields (tempo, lyrics, key, genre, duration, energy, time signature, capo, tuning, performance notes) can be cleared by sending `null`. `tags` and `links`, when present, replace the whole set (`[]` clears).",
     params(("id" = Uuid, Path, description = "The song ID")),
     request_body = UpdateSongPayload,
     security(("jwt_token" = [])),
@@ -221,10 +269,11 @@ pub async fn update_song(
     delete,
     path = "/api/v1/songs/{id}",
     tags = ["Songs"],
-    summary = "Delete a song.",
+    summary = "Move a song to the trash.",
+    description = "The song disappears from every list, setlist and share, and can be restored from the trash (`POST /trash/song/{id}/restore`) until it is purged.",
     params(("id" = Uuid, Path, description = "The song ID")),
     security(("jwt_token" = [])),
-    responses((status = 204, description = "Song deleted successfully"))
+    responses((status = 204, description = "Song moved to the trash."))
 )]
 pub async fn delete_song(
     State(state): State<AppState>,
@@ -234,9 +283,9 @@ pub async fn delete_song(
     let user_id = access.user_id();
 
     state.song_repo.can_manage(id, user_id).await?;
-    state.song_repo.delete(id).await?;
+    state.song_repo.trash(id, user_id).await?;
 
-    info!(%user_id, song_id = %id, "Song deleted successfully");
+    info!(%user_id, song_id = %id, "Song moved to the trash");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -312,11 +361,26 @@ pub async fn delete_song_tag(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// A text download with a safe, RFC 5987 file name.
+fn chordpro_response(filename: &str, body: String) -> axum::response::Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    if let Ok(disposition) = HeaderValue::from_str(&content_disposition(filename)) {
+        headers.insert(header::CONTENT_DISPOSITION, disposition);
+    }
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    (StatusCode::OK, headers, body).into_response()
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/songs/export/chordpro",
     tags = ["Songs"],
     summary = "Export all songs as ChordPro.",
+    description = "Every live personal song, separated by `{new_song}`, each with `{title}`, `{artist}`, `{key}`, `{tempo}`, `{time}`, `{capo}`, `{duration: m:ss}` and `{meta: energy N}` when set.",
     security(("jwt_token" = [])),
     responses((status = 200, description = "ChordPro file.", content_type = "text/plain"))
 )]
@@ -328,55 +392,314 @@ pub async fn export_songs_chordpro(
 
     let songs = state.song_repo.export_all_chordpro(user_id).await?;
     let songs_count = songs.len();
-
-    let mut chordpro_file = String::new();
-
-    for (index, song) in songs.into_iter().enumerate() {
-        if index > 0 {
-            chordpro_file.push_str("\n{new_song}\n\n");
-        }
-
-        chordpro_file.push_str(&format!("{{title: {}}}\n", song.title));
-
-        if let Some(artist) = song.artist_name {
-            chordpro_file.push_str(&format!("{{artist: {artist}}}\n"));
-        }
-
-        if let Some(key) = song.tonality {
-            chordpro_file.push_str(&format!("{{key: {key}}}\n"));
-        }
-
-        if let Some(tempo) = song.tempo {
-            chordpro_file.push_str(&format!("{{tempo: {tempo}}}\n"));
-        }
-
-        chordpro_file.push('\n');
-
-        match song.lyrics {
-            Some(lyrics) => chordpro_file.push_str(&lyrics),
-            None => chordpro_file.push_str("# No lyrics provided."),
-        }
-
-        chordpro_file.push('\n');
-    }
+    let body = render_songs(&songs);
 
     let filename = format!(
         "setlyst-songs-{}.cho",
         chrono::Utc::now().format("%Y%m%d%H%M%S")
     );
 
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
+    info!(%user_id, %songs_count, "Songs exported in ChordPro format");
+    Ok(chordpro_response(&filename, body))
+}
 
-    if let Ok(disposition) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
-    {
-        headers.insert(header::CONTENT_DISPOSITION, disposition);
+/// Loads a song the caller may see and export: its owner, or a member of
+/// its band whose role has the band's `export_pdf` permission.
+async fn exportable_song(
+    state: &AppState,
+    user_id: Uuid,
+    id: Uuid,
+) -> Result<crate::models::song::SongWithArtist, ApiError> {
+    let song = state
+        .song_repo
+        .find_by_id(id, user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if let Some(band_id) = song.band_id {
+        state
+            .band_repo
+            .require_permission(band_id, user_id, BandPermission::ExportPdf)
+            .await?;
+    }
+    state
+        .song_repo
+        .find_with_artist_name(id)
+        .await?
+        .ok_or(ApiError::NotFound)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/songs/{id}/export/chordpro",
+    tags = ["Songs"],
+    summary = "Export one song as ChordPro (`.cho`).",
+    params(("id" = Uuid, Path, description = "The song ID")),
+    security(("jwt_token" = [])),
+    responses(
+        (status = 200, description = "ChordPro file.", content_type = "text/plain"),
+        (status = 403, description = "Band song without the band's export permission."),
+        (status = 404, description = "Song not found.")
+    )
+)]
+pub async fn export_song_chordpro(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let song = exportable_song(&state, access.user_id(), id).await?;
+    let export = SongExport {
+        title: song.title.clone(),
+        artist_name: Some(song.artist_name.clone()),
+        tonality: song.tonality.and_then(|t| {
+            serde_json::to_value(t)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+        }),
+        tempo: song.tempo,
+        lyrics: song.lyrics.clone(),
+        time_signature: song.time_signature.clone(),
+        capo: song.capo,
+        duration: song.duration,
+        energy: song.energy,
+    };
+    Ok(chordpro_response(
+        &chordpro_filename(&song.title),
+        render_song(&export),
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/songs/{id}/export/pdf",
+    tags = ["Songs"],
+    summary = "Export one song as a PDF sheet.",
+    description = "Title, artist, a metadata line (key, capo, BPM, time signature, tuning, each toggleable), optional performance notes and the lyrics with chords (`chord_mode` hide|inline|above).\n\n**Advanced options** (plan feature `advanced_pdf`, `FEATURE_NOT_IN_PLAN` otherwise): `columns=2`, `watermark=false`, `margins` other than `normal`. Everything else is available to every plan.\n\nBand songs require the band's `export_pdf` permission. At most 3 PDFs render at once; when busy for 10 s the answer is `SERVICE_BUSY` (503, `meta.retry_after_seconds`).",
+    params(("id" = Uuid, Path, description = "The song ID"), SongExportQuery),
+    security(("jwt_token" = [])),
+    responses(
+        (status = 200, description = "PDF.", content_type = "application/pdf"),
+        (status = 403, description = "Missing band permission or plan feature."),
+        (status = 404, description = "Song not found."),
+        (status = 503, description = "Too many PDFs being generated.")
+    )
+)]
+pub async fn export_song_pdf(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(id): Path<Uuid>,
+    Query(query): Query<SongExportQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let user_id = access.user_id();
+    let song = exportable_song(&state, user_id, id).await?;
+    let options = SongPdfOptions::from(query);
+    if options.is_advanced() {
+        ensure_feature(&state, user_id, Feature::AdvancedPdf).await?;
     }
 
-    info!(%user_id, %songs_count, "Songs exported in ChordPro format");
+    let filename = slug_filename("song", &song.title, "pdf");
+    let bytes = render_pdf(move || generate_song_pdf(&song, &options)).await?;
+    Ok(crate::controllers::setlist::pdf_response(bytes, &filename))
+}
 
-    Ok((StatusCode::OK, headers, chordpro_file))
+// ---------------------------------------------------------------------
+// ChordPro import
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ImportChordProQuery {
+    /// `true` only parses and returns a preview; nothing is saved.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, ToSchema, Validate)]
+pub struct ImportChordProPayload {
+    /// The file's text (at most 64 KiB, 3000 lines, 500 characters per line).
+    pub content: String,
+    /// An existing personal artist to attach the song to.
+    pub artist_id: Option<Uuid>,
+    /// Artist name (reused if the caller already has it, created
+    /// otherwise). Defaults to the file's `{artist}`/`{subtitle}`.
+    #[validate(length(max = 255, message = "The artist name must be at most 255 characters."))]
+    pub artist_name: Option<String>,
+    /// Overrides the file's `{title}`.
+    #[validate(length(max = 255, message = "The title must be at most 255 characters."))]
+    pub title: Option<String>,
+}
+
+/// Dry-run answer of the ChordPro import.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChordProPreview {
+    pub title: String,
+    pub artist_name: Option<String>,
+    pub tonality: Option<Tonality>,
+    pub tempo: Option<i32>,
+    pub time_signature: Option<String>,
+    pub capo: Option<i16>,
+    /// Seconds.
+    pub duration: Option<i32>,
+    pub lyrics: Option<String>,
+    pub warnings: Vec<ImportWarning>,
+}
+
+fn chordpro_error(error: ChordProError) -> ApiError {
+    match error {
+        ChordProError::TooLarge => ApiError::rule(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            codes::CHORDPRO_TOO_LARGE,
+            "The ChordPro file is larger than 64 KiB.",
+        ),
+        ChordProError::Invalid { reason, line } => {
+            let mut meta = json!({ "reason": reason });
+            if let Some(line) = line {
+                meta["line"] = json!(line);
+            }
+            ApiError::rule_with_meta(
+                StatusCode::BAD_REQUEST,
+                codes::CHORDPRO_INVALID,
+                "The ChordPro file can't be imported.",
+                meta,
+            )
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/songs/import/chordpro",
+    tags = ["Songs"],
+    summary = "Import a song from a ChordPro file.",
+    description = "Plan feature `chordpro_import`. With `dry_run=true` the file is only parsed and a `ChordProPreview` (with `warnings`) is returned. Otherwise the song is created in the caller's library (the artist is reused or created) and returned (201).\n\nErrors: `CHORDPRO_TOO_LARGE` (413); `CHORDPRO_INVALID` (400, `meta: {reason, line?}` with reason `nul_character`, `too_many_lines`, `line_too_long`, `multiple_songs` or `missing_title`); lyrics over the normal song limit fail with `VALIDATION_ERROR`.",
+    params(ImportChordProQuery),
+    request_body = ImportChordProPayload,
+    security(("jwt_token" = [])),
+    responses(
+        (status = 200, description = "Preview (dry run).", body = ChordProPreview),
+        (status = 201, description = "Song created.", body = Song),
+        (status = 400, description = "Invalid file."),
+        (status = 403, description = "Plan feature or quota."),
+        (status = 409, description = "The caller already has this song."),
+        (status = 413, description = "File too large.")
+    )
+)]
+pub async fn import_chordpro(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Query(query): Query<ImportChordProQuery>,
+    Json(payload): Json<ImportChordProPayload>,
+) -> Result<axum::response::Response, ApiError> {
+    let user_id = access.user_id();
+    payload.validate()?;
+    ensure_feature(&state, user_id, Feature::ChordproImport).await?;
+
+    let parsed =
+        parse_chordpro(&payload.content, payload.title.as_deref()).map_err(chordpro_error)?;
+
+    if let Some(lyrics) = &parsed.lyrics {
+        crate::validations::text::validate_lyrics(lyrics).map_err(|e| {
+            let mut errors = validator::ValidationErrors::new();
+            errors.add("content", e);
+            ApiError::from(errors)
+        })?;
+    }
+
+    let artist_name = payload
+        .artist_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .map(str::to_string)
+        .or_else(|| parsed.artist_name.clone());
+
+    if query.dry_run {
+        let preview = ChordProPreview {
+            title: parsed.title,
+            artist_name,
+            tonality: parsed.tonality,
+            tempo: parsed.tempo,
+            time_signature: parsed.time_signature,
+            capo: parsed.capo,
+            duration: parsed.duration,
+            lyrics: parsed.lyrics,
+            warnings: parsed.warnings,
+        };
+        return Ok((StatusCode::OK, Json(preview)).into_response());
+    }
+
+    let artist_id = match payload.artist_id {
+        Some(artist_id) => {
+            state.artist_repo.exists(artist_id, user_id).await?;
+            artist_id
+        }
+        None => {
+            let Some(name) = artist_name else {
+                let mut error = validator::ValidationError::new("artist_required");
+                error.message = Some(std::borrow::Cow::from(
+                    "Choose an artist: the file doesn't name one.",
+                ));
+                let mut errors = validator::ValidationErrors::new();
+                errors.add("artist_name", error);
+                return Err(ApiError::from(errors));
+            };
+            let name: String = name.chars().take(255).collect();
+            match state
+                .artist_repo
+                .find_personal_by_name(user_id, &name)
+                .await?
+            {
+                Some(id) => id,
+                None => {
+                    let payload = CreateArtistPayload { name };
+                    payload.validate()?;
+                    state
+                        .quota_repo
+                        .ensure_user(user_id, QuotaResource::Artists, 1)
+                        .await?;
+                    state.artist_repo.create(&payload, user_id).await?.id
+                }
+            }
+        }
+    };
+
+    let create = CreateSongPayload {
+        title: parsed.title,
+        artist_id,
+        tempo: parsed.tempo,
+        lyrics: parsed.lyrics,
+        tonality: parsed.tonality,
+        genre: None,
+        duration: parsed.duration,
+        tags: None,
+        energy: None,
+        time_signature: parsed.time_signature,
+        capo: parsed.capo,
+        tuning: None,
+        performance_notes: None,
+        links: None::<Vec<LinkInput>>,
+    };
+    create.validate()?;
+    state
+        .song_repo
+        .is_unique(&create.title, artist_id, user_id, None)
+        .await?;
+    state
+        .quota_repo
+        .ensure_user(user_id, QuotaResource::Songs, 1)
+        .await?;
+
+    let song = state.song_repo.create(&create, &[], user_id).await?;
+    info!(%user_id, song_id = %song.id, "Song imported from ChordPro");
+
+    let mut headers = HeaderMap::new();
+    if let Ok(location) = HeaderValue::from_str(&format!("/api/v1/songs/{}", song.id)) {
+        headers.insert(LOCATION, location);
+    }
+    Ok((StatusCode::CREATED, headers, Json(song)).into_response())
+}
+
+/// Whether the caller's plan allows advanced PDF options (used by the
+/// setlist export to decide between refusing and downgrading).
+pub async fn allows_advanced_pdf(state: &AppState, user_id: Uuid) -> Result<bool, ApiError> {
+    has_feature(state, user_id, Feature::AdvancedPdf).await
 }

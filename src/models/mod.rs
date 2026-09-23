@@ -2,19 +2,31 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
 pub mod admin;
+pub mod announcement;
 pub mod artist;
 pub mod audit;
 pub mod auth;
 pub mod backup;
 pub mod band;
+pub mod band_note;
+pub mod billing;
+pub mod communication;
 pub mod gig;
+pub mod link;
 pub mod metrics;
+pub mod moderation;
 pub mod notification;
 pub mod patch;
+pub mod pin;
 pub mod quota;
+pub mod release_note;
+pub mod security;
 pub mod setlist;
 pub mod song;
 pub mod status;
+pub mod suggestion;
+pub mod tour;
+pub mod trash;
 pub mod user;
 pub mod user_preferences;
 
@@ -41,13 +53,30 @@ pub struct PaginationQuery {
 
 impl PaginationQuery {
     /// The requested page and page size, clamped to sane bounds
-    /// (`page >= 1`, `1 <= per_page <= 100`, default 20).
+    /// (`1 <= page <= 100_000`, `1 <= per_page <= 100`, default 20). The
+    /// page cap keeps `(page - 1) * per_page` far from overflowing.
     pub fn resolve(&self) -> (i64, i64) {
         (
-            self.page.unwrap_or(1).max(1),
+            clamp_page(self.page),
             self.per_page.unwrap_or(20).clamp(1, 100),
         )
     }
+}
+
+/// Highest page number accepted anywhere.
+pub const MAX_PAGE: i64 = 100_000;
+
+/// A requested page number clamped to `1..=MAX_PAGE` (default 1).
+pub fn clamp_page(page: Option<i64>) -> i64 {
+    page.unwrap_or(1).clamp(1, MAX_PAGE)
+}
+
+/// `(page, per_page)` with the given default page size, both clamped.
+pub fn resolve_page(page: Option<i64>, per_page: Option<i64>, default_per_page: i64) -> (i64, i64) {
+    (
+        clamp_page(page),
+        per_page.unwrap_or(default_per_page).clamp(1, 100),
+    )
 }
 
 impl<T> PaginatedResponse<T> {
@@ -75,4 +104,24 @@ pub struct PaginationMeta {
     pub current_page: i64,
     pub per_page: i64,
     pub total_pages: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pagination_is_clamped() {
+        let q = PaginationQuery {
+            page: Some(i64::MAX),
+            per_page: Some(i64::MAX),
+        };
+        assert_eq!(q.resolve(), (MAX_PAGE, 100));
+        let q = PaginationQuery {
+            page: Some(-5),
+            per_page: Some(0),
+        };
+        assert_eq!(q.resolve(), (1, 1));
+        assert_eq!(resolve_page(None, None, 25), (1, 25));
+    }
 }

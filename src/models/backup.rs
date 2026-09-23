@@ -1,13 +1,22 @@
 use crate::models::gig::GigStatus;
-use crate::models::song::{Genre, Tonality};
-use chrono::NaiveDateTime;
+use crate::models::link::LinkInput;
+use crate::models::song::{
+    Genre, Tonality, validate_performance_notes, validate_time_signature, validate_tuning,
+};
+use crate::validations::link::MAX_LINKS;
+use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// Current version of the backup format.
 /// Increment this constant if breaking schema changes are made.
-pub const BACKUP_FORMAT_VERSION: u32 = 1;
+///
+/// - 1: artists, songs (with tags), setlists, personal gigs.
+/// - 2: song energy, time signature, capo, tuning, performance notes and
+///   links; setlist links; tours and each gig's tour and location. Every
+///   new field is optional, so version 1 files still import.
+pub const BACKUP_FORMAT_VERSION: u32 = 2;
 
 /// A fully self-contained, portable snapshot of a user's data.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -19,6 +28,19 @@ pub struct BackupFile {
     pub setlists: Vec<BackupSetlist>,
     #[serde(default)]
     pub gigs: Vec<BackupGig>,
+    /// Since version 2.
+    #[serde(default)]
+    pub tours: Vec<BackupTour>,
+}
+
+/// Tour entry inside a backup file (personal tours only).
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BackupTour {
+    pub id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub start_date: NaiveDate,
+    pub end_date: NaiveDate,
 }
 
 /// Artist entry inside a backup file.
@@ -42,6 +64,19 @@ pub struct BackupSong {
     /// Added after the first release — absent in older backups.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Since version 2.
+    #[serde(default)]
+    pub energy: Option<i16>,
+    #[serde(default)]
+    pub time_signature: Option<String>,
+    #[serde(default)]
+    pub capo: Option<i16>,
+    #[serde(default)]
+    pub tuning: Option<String>,
+    #[serde(default)]
+    pub performance_notes: Option<String>,
+    #[serde(default)]
+    pub links: Vec<LinkInput>,
 }
 
 /// Setlist entry inside a backup file.
@@ -51,6 +86,9 @@ pub struct BackupSetlist {
     pub title: String,
     pub description: Option<String>,
     pub songs: Vec<BackupSetlistSong>,
+    /// Since version 2.
+    #[serde(default)]
+    pub links: Vec<LinkInput>,
 }
 
 /// A song reference within a setlist, preserving its display position.
@@ -74,6 +112,12 @@ pub struct BackupGig {
     pub setlist_id: Option<Uuid>,
     pub status: GigStatus,
     pub notes: Option<String>,
+    /// Since version 2.
+    #[serde(default)]
+    pub location: Option<String>,
+    /// References a [`BackupTour::id`] in the same file (since version 2).
+    #[serde(default)]
+    pub tour_id: Option<Uuid>,
 }
 
 /// Summary returned to the caller after a successful import.
@@ -84,6 +128,8 @@ pub struct ImportSummary {
     pub setlists_imported: usize,
     #[serde(default)]
     pub gigs_imported: usize,
+    #[serde(default)]
+    pub tours_imported: usize,
 }
 
 /// Largest number of records of each kind a single backup may carry.
@@ -108,6 +154,7 @@ impl BackupFile {
             ("songs", self.songs.len()),
             ("setlists", self.setlists.len()),
             ("gigs", self.gigs.len()),
+            ("tours", self.tours.len()),
         ] {
             if len > MAX_BACKUP_RECORDS {
                 return Err(format!("The backup has too many {label} ({len})."));
@@ -141,6 +188,39 @@ impl BackupFile {
             if song.duration.is_some_and(|d| !(1..=7_200).contains(&d)) {
                 return Err(format!("\"{}\" has an invalid duration.", song.title));
             }
+            if song.energy.is_some_and(|e| !(1..=5).contains(&e)) {
+                return Err(format!("\"{}\" has an invalid energy.", song.title));
+            }
+            if song.capo.is_some_and(|c| !(0..=11).contains(&c)) {
+                return Err(format!("\"{}\" has an invalid capo.", song.title));
+            }
+            if song
+                .time_signature
+                .as_deref()
+                .is_some_and(|t| validate_time_signature(t).is_err())
+            {
+                return Err(format!("\"{}\" has an invalid time signature.", song.title));
+            }
+            if song
+                .tuning
+                .as_deref()
+                .is_some_and(|t| validate_tuning(t).is_err())
+            {
+                return Err(format!("\"{}\" has an invalid tuning.", song.title));
+            }
+            if song
+                .performance_notes
+                .as_deref()
+                .is_some_and(|n| validate_performance_notes(n).is_err())
+            {
+                return Err(format!(
+                    "The performance notes of \"{}\" are too long.",
+                    song.title
+                ));
+            }
+            if song.links.len() > MAX_LINKS {
+                return Err(format!("\"{}\" has too many links.", song.title));
+            }
         }
         for setlist in &self.setlists {
             if !bounded(&setlist.title, 255) {
@@ -156,6 +236,12 @@ impl BackupFile {
                     setlist.title
                 ));
             }
+            if setlist.links.len() > MAX_LINKS {
+                return Err(format!("\"{}\" has too many links.", setlist.title));
+            }
+            if setlist.songs.len() > MAX_BACKUP_RECORDS {
+                return Err(format!("\"{}\" has too many songs.", setlist.title));
+            }
         }
         for gig in &self.gigs {
             if !bounded(&gig.venue, 255) {
@@ -170,6 +256,34 @@ impl BackupFile {
                     "The notes of the gig at \"{}\" are too long.",
                     gig.venue
                 ));
+            }
+            if gig
+                .location
+                .as_deref()
+                .is_some_and(|l| l.chars().count() > 500)
+            {
+                return Err(format!(
+                    "The location of the gig at \"{}\" is too long.",
+                    gig.venue
+                ));
+            }
+        }
+        for tour in &self.tours {
+            if !bounded(&tour.name, 120) || tour.name.chars().any(char::is_control) {
+                return Err("A tour has an empty or too long name.".to_string());
+            }
+            if tour
+                .description
+                .as_deref()
+                .is_some_and(|d| d.chars().count() > MAX_DESCRIPTION_LENGTH)
+            {
+                return Err(format!(
+                    "The description of the tour \"{}\" is too long.",
+                    tour.name
+                ));
+            }
+            if tour.end_date < tour.start_date {
+                return Err(format!("The tour \"{}\" ends before it starts.", tour.name));
             }
         }
         Ok(())

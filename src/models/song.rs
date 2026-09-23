@@ -6,6 +6,8 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 use validator::Validate;
 
+use super::link::{LinkInput, Links};
+
 #[derive(ToSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[sqlx(type_name = "song_tonality")]
 pub enum Tonality {
@@ -438,6 +440,10 @@ pub struct Song {
     pub id: Uuid,
     pub title: String,
     pub artist_id: Uuid,
+    /// The artist's name, resolved with a join (so band members see it
+    /// even for an artist they can't list). Always set in API responses.
+    #[sqlx(default)]
+    pub artist_name: Option<String>,
     pub user_id: Uuid,
     /// The band that owns this song as an independent, shared copy, or
     /// `None` for a personal song. Set only via [`Song::fork_for_band`],
@@ -455,6 +461,24 @@ pub struct Song {
     pub tonality: Option<Tonality>,
     pub genre: Option<Genre>,
     pub duration: Option<i32>,
+    /// Perceived energy, 1 (very low) to 5 (very high).
+    #[sqlx(default)]
+    pub energy: Option<i16>,
+    /// One of [`TIME_SIGNATURES`].
+    #[sqlx(default)]
+    pub time_signature: Option<String>,
+    /// Capo fret, 0 to 11.
+    #[sqlx(default)]
+    pub capo: Option<i16>,
+    /// Free-text tuning ("Drop D", "Eb standard"...).
+    #[sqlx(default)]
+    pub tuning: Option<String>,
+    /// Notes for the stage (cues, arrangement reminders).
+    #[sqlx(default)]
+    pub performance_notes: Option<String>,
+    /// Reference links (recordings, backing tracks, charts).
+    #[sqlx(json, default)]
+    pub links: Links,
     /// Normalized (lowercase) tags, alphabetically sorted.
     #[sqlx(default)]
     pub tags: Vec<String>,
@@ -464,8 +488,77 @@ pub struct Song {
     pub updated_by: Option<Uuid>,
     #[sqlx(default)]
     pub updated_by_username: Option<String>,
+    /// Whether the *caller* pinned this song to their home screen.
+    #[sqlx(default)]
+    pub is_pinned: bool,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
+}
+
+/// `GET /songs/{id}/setlists`: a live setlist the caller can see that
+/// contains the song.
+#[derive(ToSchema, Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct SongSetlistRef {
+    pub id: Uuid,
+    pub title: String,
+    /// `true` for a band's repertoire (show a translated name instead of
+    /// the stored `title`).
+    pub is_repertoire: bool,
+    pub band_id: Option<Uuid>,
+    pub band_name: Option<String>,
+    /// The song's position in that setlist.
+    pub position: i32,
+}
+
+/// Accepted time signatures.
+pub const TIME_SIGNATURES: [&str; 8] = ["2/4", "3/4", "4/4", "5/4", "6/8", "7/8", "9/8", "12/8"];
+
+/// Longest tuning description, in characters.
+pub const MAX_TUNING_LENGTH: usize = 40;
+/// Longest performance notes, in characters.
+pub const MAX_PERFORMANCE_NOTES_LENGTH: usize = 2_000;
+
+pub fn validate_time_signature(value: &str) -> Result<(), validator::ValidationError> {
+    if TIME_SIGNATURES.contains(&value.trim()) {
+        Ok(())
+    } else {
+        let mut error = validator::ValidationError::new("invalid_time_signature");
+        error.message = Some(std::borrow::Cow::from(format!(
+            "Time signature must be one of {}.",
+            TIME_SIGNATURES.join(", ")
+        )));
+        Err(error)
+    }
+}
+
+pub fn validate_tuning(value: &str) -> Result<(), validator::ValidationError> {
+    if value.trim().chars().count() > MAX_TUNING_LENGTH || value.chars().any(|c| c.is_control()) {
+        let mut error = validator::ValidationError::new("invalid_tuning");
+        error.message = Some(std::borrow::Cow::from(format!(
+            "Tuning must be at most {MAX_TUNING_LENGTH} characters, on one line."
+        )));
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn validate_performance_notes(value: &str) -> Result<(), validator::ValidationError> {
+    if value.chars().count() > MAX_PERFORMANCE_NOTES_LENGTH {
+        let mut error = validator::ValidationError::new("performance_notes_too_long");
+        error.message = Some(std::borrow::Cow::from(format!(
+            "Performance notes must be at most {MAX_PERFORMANCE_NOTES_LENGTH} characters."
+        )));
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Trims an optional free-text value; blank becomes `None`.
+pub fn clean_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 /// Longest song duration accepted, in seconds (2 hours).
@@ -490,6 +583,19 @@ pub struct CreateSongPayload {
     pub duration: Option<i32>,
     /// Free-form tags; normalized server-side (see `validations::tag`).
     pub tags: Option<Vec<String>>,
+    #[validate(range(min = 1, max = 5, message = "Energy must be between 1 and 5."))]
+    pub energy: Option<i16>,
+    #[validate(custom(function = "validate_time_signature"))]
+    pub time_signature: Option<String>,
+    #[validate(range(min = 0, max = 11, message = "Capo must be between 0 and 11."))]
+    pub capo: Option<i16>,
+    #[validate(custom(function = "validate_tuning"))]
+    pub tuning: Option<String>,
+    #[validate(custom(function = "validate_performance_notes"))]
+    pub performance_notes: Option<String>,
+    /// At most 5 links to supported providers (see `LinkInput`).
+    #[validate(length(max = 5, message = "At most 5 links are allowed."))]
+    pub links: Option<Vec<LinkInput>>,
 }
 
 /// Every nullable field uses `Option<Option<T>>`: absent leaves it
@@ -518,6 +624,24 @@ pub struct UpdateSongPayload {
     pub duration: Option<Option<i32>>,
     /// Replaces the song's whole tag set when present.
     pub tags: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    #[validate(range(min = 1, max = 5, message = "Energy must be between 1 and 5."))]
+    pub energy: Option<Option<i16>>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    #[validate(custom(function = "validate_time_signature"))]
+    pub time_signature: Option<Option<String>>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    #[validate(range(min = 0, max = 11, message = "Capo must be between 0 and 11."))]
+    pub capo: Option<Option<i16>>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    #[validate(custom(function = "validate_tuning"))]
+    pub tuning: Option<Option<String>>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    #[validate(custom(function = "validate_performance_notes"))]
+    pub performance_notes: Option<Option<String>>,
+    /// Absent = unchanged, `[]` = remove every link.
+    #[validate(length(max = 5, message = "At most 5 links are allowed."))]
+    pub links: Option<Vec<LinkInput>>,
 }
 
 impl Song {
@@ -527,6 +651,7 @@ impl Song {
             id: Uuid::new_v4(),
             title: payload.title.clone(),
             artist_id: payload.artist_id,
+            artist_name: None,
             user_id,
             band_id: None,
             forked_from: None,
@@ -535,9 +660,16 @@ impl Song {
             tonality: payload.tonality,
             genre: payload.genre,
             duration: payload.duration,
+            energy: payload.energy,
+            time_signature: clean_text(payload.time_signature.as_deref()),
+            capo: payload.capo,
+            tuning: clean_text(payload.tuning.as_deref()),
+            performance_notes: clean_text(payload.performance_notes.as_deref()),
+            links: Links::default(),
             tags: Vec::new(),
             updated_by: None,
             updated_by_username: None,
+            is_pinned: false,
             created_at: now,
             updated_at: now,
         }
@@ -557,6 +689,7 @@ impl Song {
             id: Uuid::new_v4(),
             title: source.title.clone(),
             artist_id,
+            artist_name: Some(source.artist_name.clone()),
             user_id: creator_id,
             band_id: Some(band_id),
             forked_from: Some(source.id),
@@ -565,22 +698,47 @@ impl Song {
             tonality: source.tonality,
             genre: source.genre,
             duration: source.duration,
+            energy: source.energy,
+            time_signature: source.time_signature.clone(),
+            capo: source.capo,
+            tuning: source.tuning.clone(),
+            performance_notes: source.performance_notes.clone(),
+            links: source.links.clone(),
             tags: source.tags.clone(),
             updated_by: None,
             updated_by_username: None,
+            is_pinned: false,
             created_at: now,
             updated_at: now,
         }
     }
+
+    /// Creates a personal copy of a band song for `user_id` (used when a
+    /// band setlist is duplicated into a personal one, so the copy never
+    /// references the band's songs).
+    pub fn fork_for_user(source: &SongWithArtist, artist_id: Uuid, user_id: Uuid) -> Self {
+        let mut song = Self::fork_for_band(source, Uuid::nil(), artist_id, user_id);
+        song.band_id = None;
+        song.forked_from = None;
+        song
+    }
 }
 
-#[derive(Debug, Serialize, ToSchema, FromRow)]
+#[derive(Debug, Clone, Serialize, ToSchema, FromRow)]
 pub struct SongExport {
     pub title: String,
     pub artist_name: Option<String>,
     pub tonality: Option<String>,
     pub tempo: Option<i32>,
     pub lyrics: Option<String>,
+    #[sqlx(default)]
+    pub time_signature: Option<String>,
+    #[sqlx(default)]
+    pub capo: Option<i16>,
+    #[sqlx(default)]
+    pub duration: Option<i32>,
+    #[sqlx(default)]
+    pub energy: Option<i16>,
 }
 
 /// A [`Song`] with its artist's name resolved via a join, so callers don't
@@ -602,6 +760,18 @@ pub struct SongWithArtist {
     pub genre: Option<Genre>,
     pub duration: Option<i32>,
     #[sqlx(default)]
+    pub energy: Option<i16>,
+    #[sqlx(default)]
+    pub time_signature: Option<String>,
+    #[sqlx(default)]
+    pub capo: Option<i16>,
+    #[sqlx(default)]
+    pub tuning: Option<String>,
+    #[sqlx(default)]
+    pub performance_notes: Option<String>,
+    #[sqlx(json, default)]
+    pub links: Links,
+    #[sqlx(default)]
     pub tags: Vec<String>,
     #[sqlx(default)]
     pub updated_by: Option<Uuid>,
@@ -609,6 +779,43 @@ pub struct SongWithArtist {
     pub updated_by_username: Option<String>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
+}
+
+/// The read-only shape of a song on the public (unauthenticated) share
+/// endpoints: what a performer needs, nothing that identifies accounts,
+/// bands or internal records.
+#[derive(ToSchema, Debug, Clone, Serialize)]
+pub struct PublicSong {
+    /// Position in the running order (merge with the markers by it).
+    pub position: i32,
+    pub title: String,
+    pub artist_name: String,
+    pub tempo: Option<i32>,
+    pub tonality: Option<Tonality>,
+    pub duration: Option<i32>,
+    pub energy: Option<i16>,
+    pub time_signature: Option<String>,
+    pub capo: Option<i16>,
+    pub lyrics: Option<String>,
+    pub links: Links,
+}
+
+impl PublicSong {
+    pub fn from_song(position: i32, song: SongWithArtist) -> Self {
+        Self {
+            position,
+            title: song.title,
+            artist_name: song.artist_name,
+            tempo: song.tempo,
+            tonality: song.tonality,
+            duration: song.duration,
+            energy: song.energy,
+            time_signature: song.time_signature,
+            capo: song.capo,
+            lyrics: song.lyrics,
+            links: song.links,
+        }
+    }
 }
 
 /// One tag in the caller's vocabulary, with how many songs use it.

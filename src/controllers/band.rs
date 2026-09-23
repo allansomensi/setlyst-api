@@ -1,5 +1,6 @@
 use crate::{
-    database::AppState,
+    controllers::pin::{mark_one, mark_pinned},
+    database::{AppState, repositories::band_invite_repository::InviteLimits},
     errors::api_error::ApiError,
     models::{
         auth::access::AccessControl,
@@ -11,6 +12,11 @@ use crate::{
         notification::Notification,
         quota::QuotaResource,
     },
+    services::{
+        entitlements::{Feature, ensure_feature},
+        notifier::notify,
+    },
+    utils::share_token::token_fingerprint,
 };
 use axum::{
     Json,
@@ -41,7 +47,8 @@ pub async fn find_all_bands(
     let user_id = access.user_id();
     debug!(%user_id, "Processing request to list the current user's bands");
 
-    let bands = state.band_repo.find_all_for_user(user_id).await?;
+    let mut bands = state.band_repo.find_all_for_user(user_id).await?;
+    mark_pinned(&state, user_id, &mut bands).await?;
 
     info!(%user_id, count = bands.len(), "Bands retrieved successfully");
     Ok(Json(bands))
@@ -69,7 +76,10 @@ pub async fn find_band_by_id(
     debug!(%user_id, band_id = %id, "Processing request to retrieve band by ID");
 
     match state.band_repo.find_by_id(id, user_id).await? {
-        Some(band) => Ok(Json(band)),
+        Some(mut band) => {
+            mark_one(&state, user_id, &mut band).await?;
+            Ok(Json(band))
+        }
         None => Err(ApiError::NotFound),
     }
 }
@@ -79,7 +89,7 @@ pub async fn find_band_by_id(
     path = "/api/v1/bands",
     tags = ["Bands"],
     summary = "Create a new band.",
-    description = "The creator automatically becomes the band's owner.",
+    description = "The creator automatically becomes the band's owner. The band's repertoire is created with it. Requires the plan feature `create_bands`.",
     request_body = CreateBandPayload,
     security((), ("jwt_token" = [])),
     responses(
@@ -96,6 +106,7 @@ pub async fn create_band(
     debug!(%user_id, band_name = %payload.name, "Processing request to create a new band");
 
     payload.validate()?;
+    ensure_feature(&state, user_id, Feature::CreateBands).await?;
 
     state
         .quota_repo
@@ -124,7 +135,7 @@ pub async fn create_band(
     path = "/api/v1/bands/{id}",
     tags = ["Bands"],
     summary = "Update a band's details.",
-    description = "Requires the `admin` band role or higher.",
+    description = "Requires the `admin` band role or higher. A new `logo_url` must be a public `https` image link (`INVALID_IMAGE_URL`) and is reviewed by the automatic moderation in the background. `suggestion_auto_accept_votes` (1..100, `null` = off) sets how many up-votes accept a song suggestion automatically.",
     params(("id" = Uuid, Path, description = "The ID of the band")),
     request_body = UpdateBandPayload,
     security((), ("jwt_token" = [])),
@@ -150,7 +161,21 @@ pub async fn update_band(
         .require_role(id, user_id, BandRole::Admin)
         .await?;
 
+    let mut payload = payload;
+    let new_logo = match &payload.logo_url {
+        Some(Some(url)) if !url.trim().is_empty() => {
+            let url = crate::validations::image_url::validate_image_url(url)?;
+            payload.logo_url = Some(Some(url.clone()));
+            Some(url)
+        }
+        _ => None,
+    };
+
     let band_id = state.band_repo.update(id, &payload, user_id).await?;
+
+    if let Some(url) = new_logo {
+        crate::moderation::spawn_band_logo_review(&state, band_id, &url);
+    }
 
     info!(%user_id, band_id = %band_id, "Band updated successfully");
     Ok(Json(band_id))
@@ -327,7 +352,7 @@ pub async fn list_band_members(
     path = "/api/v1/bands/{id}/members/{user_id}",
     tags = ["Bands"],
     summary = "Change a band member's role.",
-    description = "Requires `admin` or higher, and callers may only manage members below their own role. Use the dedicated transfer-ownership endpoint to hand off `owner`.",
+    description = "Requires `admin` or higher, and callers may only manage members below their own role. Only the owner may grant a role equal to or above their own (i.e. `admin`); an admin can promote up to `moderator`. Use the dedicated transfer-ownership endpoint to hand off `owner`.",
     params(
         ("id" = Uuid, Path, description = "The ID of the band"),
         ("user_id" = Uuid, Path, description = "The ID of the member to update")
@@ -377,23 +402,30 @@ pub async fn update_band_member_role(
         return Err(ApiError::Forbidden);
     }
 
+    // Nobody but the owner can hand out a role as high as their own.
+    if payload.role >= caller_role && caller_role != BandRole::Owner {
+        error!(%user_id, %target_user_id, "Cannot grant a role equal to or higher than the caller's own.");
+        return Err(ApiError::Forbidden);
+    }
+
     state
         .band_member_repo
         .update_role(band_id, target_user_id, payload.role)
         .await?;
 
     if let Some(band) = state.band_repo.find_by_id(band_id, user_id).await? {
-        let notification = Notification::band_role_changed(
-            target_user_id,
-            band_id,
-            &band.name,
-            target_role,
-            payload.role,
-            user_id,
-        );
-        if let Err(e) = state.notification_repo.create(&notification).await {
-            error!(%band_id, %target_user_id, error = %e, "Failed to create band role change notification");
-        }
+        notify(
+            &state,
+            Notification::band_role_changed(
+                target_user_id,
+                band_id,
+                &band.name,
+                target_role,
+                payload.role,
+                user_id,
+            ),
+        )
+        .await;
     }
 
     info!(%user_id, %band_id, %target_user_id, new_role = %payload.role, "Band member role updated successfully");
@@ -516,11 +548,11 @@ pub async fn remove_band_member(
     if target_user_id != user_id
         && let Some(band) = state.band_repo.find_by_id(band_id, user_id).await?
     {
-        let notification =
-            Notification::band_member_removed(target_user_id, band_id, &band.name, user_id);
-        if let Err(e) = state.notification_repo.create(&notification).await {
-            error!(%band_id, %target_user_id, error = %e, "Failed to create band member removed notification");
-        }
+        notify(
+            &state,
+            Notification::band_member_removed(target_user_id, band_id, &band.name, user_id),
+        )
+        .await;
     }
 
     info!(%user_id, %band_id, %target_user_id, "Band member removed successfully");
@@ -536,7 +568,7 @@ pub async fn remove_band_member(
     path = "/api/v1/bands/{id}/invites",
     tags = ["Bands"],
     summary = "Create an invite link for a band.",
-    description = "Requires `admin` or higher.",
+    description = "Requires `admin` or higher. Codes are 16 characters long; invites expire after 7 days unless `expires_in_hours` says otherwise (up to one year).",
     params(("id" = Uuid, Path, description = "The ID of the band")),
     request_body = CreateBandInvitePayload,
     security((), ("jwt_token" = [])),
@@ -571,7 +603,7 @@ pub async fn create_band_invite(
 
     let invite = state.band_invite_repo.create(id, user_id, &payload).await?;
 
-    info!(%user_id, band_id = %id, invite_code = %invite.code, "Band invite created successfully");
+    info!(%user_id, band_id = %id, invite = %token_fingerprint(&invite.code), "Band invite created successfully");
     Ok((StatusCode::CREATED, Json(invite)))
 }
 
@@ -718,6 +750,7 @@ pub async fn update_band_role_permissions(
     path = "/api/v1/invites/{code}/accept",
     tags = ["Bands"],
     summary = "Accept a band invite and join the band.",
+    description = "Rate limited per client IP (one every 2 seconds, bursts of 10). The band's member limit and the caller's band limit are checked atomically with the join (`QUOTA_EXCEEDED`).",
     params(("code" = String, Path, description = "The invite code")),
     security((), ("jwt_token" = [])),
     responses(
@@ -732,26 +765,52 @@ pub async fn accept_band_invite(
     Path(code): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = access.user_id();
-    debug!(%user_id, invite_code = %code, "Processing request to accept a band invite");
+    debug!(%user_id, invite = %token_fingerprint(&code), "Processing request to accept a band invite");
+
+    if code.len() > 32 {
+        return Err(ApiError::rule(
+            StatusCode::NOT_FOUND,
+            crate::errors::api_error::codes::INVITE_INVALID,
+            "This invite link is invalid, expired or has already been used.",
+        ));
+    }
 
     // Peek at the invite only to know which band's limits apply; the
-    // actual validation and redemption happen atomically in `redeem`.
+    // actual validation, the limit checks and the redemption happen
+    // atomically in `redeem`.
+    let mut limits = InviteLimits {
+        band_members: None,
+        band_memberships: state
+            .quota_repo
+            .effective_limits(user_id)
+            .await?
+            .map(|l| l.band_memberships),
+    };
     if let Some(invite) = state
         .band_invite_repo
         .find_by_code(&code.trim().to_uppercase())
         .await?
     {
-        state
-            .quota_repo
-            .ensure_band(invite.band_id, QuotaResource::BandMembers, 1)
-            .await?;
-        state
-            .quota_repo
-            .ensure_user(user_id, QuotaResource::BandMemberships, 1)
-            .await?;
+        let owner: Option<Uuid> = sqlx::query_scalar(
+            "SELECT user_id FROM band_members WHERE band_id = $1 AND role = 'owner' LIMIT 1",
+        )
+        .bind(invite.band_id)
+        .fetch_optional(&state.db)
+        .await?;
+        limits.band_members = match owner {
+            Some(owner) => state
+                .quota_repo
+                .effective_limits(owner)
+                .await?
+                .map(|l| l.band_members),
+            None => Some(state.quota_repo.get_defaults().await?.band_members),
+        };
     }
 
-    let (band_id, _role) = state.band_invite_repo.redeem(&code, user_id).await?;
+    let (band_id, _role) = state
+        .band_invite_repo
+        .redeem(&code, user_id, limits)
+        .await?;
 
     let band = state
         .band_repo

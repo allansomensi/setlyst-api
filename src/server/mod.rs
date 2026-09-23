@@ -35,7 +35,27 @@ pub async fn run() -> Result<(), ApiError> {
         }
     }
 
-    let app = routes::create_routes(AppState::new(pool));
+    let missing = crate::export::pdf::missing_fonts();
+    if missing.is_empty() {
+        info!(
+            "✅ PDF fonts found in {}",
+            crate::export::pdf::fonts_dir().display()
+        );
+    } else {
+        // Not fatal: everything but PDF export still works.
+        error!(
+            "❌ PDF export will fail: font files missing ({}). Set ASSETS_DIR to the directory that contains `fonts/` (the repository's `assets`).",
+            missing
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    let state = AppState::new(pool);
+    crate::jobs::spawn_all(state.clone());
+    let app = routes::create_routes(state);
 
     let listener = match tokio::net::TcpListener::bind(&config.host).await {
         Ok(listener) => {

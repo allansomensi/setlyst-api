@@ -57,15 +57,32 @@ fn prompt_for_username() -> String {
     }
 }
 
+/// Reads a password from the terminal without echoing it (it must never
+/// end up in the scrollback or a screen recording).
+fn read_secret(label: &str) -> String {
+    match rpassword::prompt_password(label) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("❌ Error reading the password: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn prompt_for_password(username: &str) -> String {
     loop {
-        let password = prompt(&format!("Enter a strong password for user '{username}': "));
+        let password = read_secret(&format!("Enter a strong password for user '{username}': "));
         let issues = password_issues(&password, Some(username));
-        if issues.is_empty() {
+        if !issues.is_empty() {
+            let missing: Vec<&str> = issues.iter().map(|i| describe_issue(i)).collect();
+            println!("❌ Weak password: it needs {}.\n", missing.join(", "));
+            continue;
+        }
+        let confirmation = read_secret("Repeat the password: ");
+        if confirmation == password {
             return password;
         }
-        let missing: Vec<&str> = issues.iter().map(|i| describe_issue(i)).collect();
-        println!("❌ Weak password — it needs {}.\n", missing.join(", "));
+        println!("❌ The passwords don't match.\n");
     }
 }
 

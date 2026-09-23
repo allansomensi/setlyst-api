@@ -30,10 +30,30 @@ pub trait BandInviteRepository: Send + Sync {
 
     /// Redeems an invite for `user_id` atomically: the invite row is
     /// locked, re-validated (not revoked, expired or exhausted), the
-    /// membership is created and the use counted in one transaction — so
-    /// two people racing for the last use of a single-use invite can't
-    /// both get in. Returns `(band_id, role)`.
-    async fn redeem(&self, code: &str, user_id: Uuid) -> Result<(Uuid, BandRole), ApiError>;
+    /// band's member count and the user's membership count are checked
+    /// against `limits` (under locks on the band and the user, so
+    /// concurrent joins can't overshoot them), the membership is created
+    /// and the use counted in one transaction — so two people racing for
+    /// the last use of a single-use invite can't both get in. Returns
+    /// `(band_id, role)`.
+    async fn redeem(
+        &self,
+        code: &str,
+        user_id: Uuid,
+        limits: InviteLimits,
+    ) -> Result<(Uuid, BandRole), ApiError>;
+}
+
+/// Invites expire after this many hours unless the creator chose otherwise.
+pub const DEFAULT_INVITE_EXPIRY_HOURS: i64 = 7 * 24;
+
+/// Limits enforced while redeeming an invite (`None` = unlimited).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InviteLimits {
+    /// The band's member limit (from its owner's quota).
+    pub band_members: Option<i64>,
+    /// How many bands the joining user may belong to.
+    pub band_memberships: Option<i64>,
 }
 
 pub struct BandInviteRepositoryImpl {
@@ -55,9 +75,13 @@ impl BandInviteRepository for BandInviteRepositoryImpl {
         payload: &CreateBandInvitePayload,
     ) -> Result<BandInvite, ApiError> {
         let role = payload.role.unwrap_or(BandRole::Member);
-        let expires_at: Option<NaiveDateTime> = payload
+        // Invites expire after a week unless asked otherwise, so a link
+        // pasted somewhere public doesn't stay usable forever.
+        let hours = payload
             .expires_in_hours
-            .map(|hours| Utc::now().naive_utc() + chrono::Duration::hours(hours));
+            .unwrap_or(DEFAULT_INVITE_EXPIRY_HOURS);
+        let expires_at: Option<NaiveDateTime> =
+            Some(Utc::now().naive_utc() + chrono::Duration::hours(hours));
 
         let mut code = generate_invite_code();
         for attempt in 0..5 {
@@ -147,7 +171,12 @@ impl BandInviteRepository for BandInviteRepositoryImpl {
         Ok(())
     }
 
-    async fn redeem(&self, code: &str, user_id: Uuid) -> Result<(Uuid, BandRole), ApiError> {
+    async fn redeem(
+        &self,
+        code: &str,
+        user_id: Uuid,
+        limits: InviteLimits,
+    ) -> Result<(Uuid, BandRole), ApiError> {
         let invalid = || {
             ApiError::rule(
                 axum::http::StatusCode::NOT_FOUND,
@@ -171,6 +200,33 @@ impl BandInviteRepository for BandInviteRepositoryImpl {
         let exhausted = invite.max_uses.is_some_and(|max| invite.uses_count >= max);
         if invite.revoked_at.is_some() || expired || exhausted {
             return Err(invalid());
+        }
+
+        sqlx::query("SELECT id FROM bands WHERE id = $1 FOR UPDATE")
+            .bind(invite.band_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 11))")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        let (band_members, memberships): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM band_members WHERE band_id = $1),
+                    (SELECT COUNT(*) FROM band_members WHERE user_id = $2)",
+        )
+        .bind(invite.band_id)
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if let Some(limit) = limits.band_members
+            && band_members + 1 > limit
+        {
+            return Err(ApiError::quota_exceeded("band_members", limit));
+        }
+        if let Some(limit) = limits.band_memberships
+            && memberships + 1 > limit
+        {
+            return Err(ApiError::quota_exceeded("band_memberships", limit));
         }
 
         let inserted = sqlx::query(

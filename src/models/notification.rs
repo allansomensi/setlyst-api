@@ -1,4 +1,4 @@
-use crate::models::{band::BandRole, user::Role};
+use crate::models::{band::BandRole, communication::Category, user::Role};
 use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -25,6 +25,68 @@ pub enum NotificationType {
     /// Staff took down the public link of one of the recipient's setlists
     /// or gigs.
     ShareLinkRevoked,
+    /// A platform announcement targeted at the recipient.
+    Announcement,
+    /// New release notes were published.
+    ReleasePublished,
+    /// A band member suggested a song for one of the recipient's bands.
+    BandSuggestionCreated,
+    /// A song suggestion made by the recipient was accepted, rejected or
+    /// withdrawn.
+    BandSuggestionResolved,
+    /// Staff acted on the recipient's profile (avatar removed, username
+    /// reset...).
+    ModerationAction,
+    /// The recipient's plan or subscription status changed.
+    SubscriptionChanged,
+    /// The recipient's trial ends in a few days.
+    TrialEnding,
+    /// Credits were added to the recipient's balance.
+    CreditsGranted,
+    /// A security-relevant change on the account (2FA, e-mail, password).
+    SecurityAlert,
+}
+
+impl NotificationType {
+    /// The communication category that governs how this notification is
+    /// delivered (see `models::communication`).
+    pub fn category(&self) -> Category {
+        match self {
+            NotificationType::BandRoleChanged
+            | NotificationType::BandMemberRemoved
+            | NotificationType::BandMemberAdded
+            | NotificationType::BandSuggestionCreated
+            | NotificationType::BandSuggestionResolved => Category::Bands,
+            NotificationType::PlatformRoleChanged
+            | NotificationType::ShareLinkRevoked
+            | NotificationType::ModerationAction
+            | NotificationType::SubscriptionChanged
+            | NotificationType::TrialEnding
+            | NotificationType::CreditsGranted => Category::Account,
+            NotificationType::Announcement => Category::Announcements,
+            NotificationType::ReleasePublished => Category::ProductUpdates,
+            NotificationType::SecurityAlert => Category::Security,
+        }
+    }
+
+    pub fn key(&self) -> &'static str {
+        match self {
+            NotificationType::BandRoleChanged => "band_role_changed",
+            NotificationType::BandMemberRemoved => "band_member_removed",
+            NotificationType::PlatformRoleChanged => "platform_role_changed",
+            NotificationType::BandMemberAdded => "band_member_added",
+            NotificationType::ShareLinkRevoked => "share_link_revoked",
+            NotificationType::Announcement => "announcement",
+            NotificationType::ReleasePublished => "release_published",
+            NotificationType::BandSuggestionCreated => "band_suggestion_created",
+            NotificationType::BandSuggestionResolved => "band_suggestion_resolved",
+            NotificationType::ModerationAction => "moderation_action",
+            NotificationType::SubscriptionChanged => "subscription_changed",
+            NotificationType::TrialEnding => "trial_ending",
+            NotificationType::CreditsGranted => "credits_granted",
+            NotificationType::SecurityAlert => "security_alert",
+        }
+    }
 }
 
 #[derive(ToSchema, Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -44,7 +106,7 @@ pub struct Notification {
 }
 
 impl Notification {
-    fn new(user_id: Uuid, notification_type: NotificationType, data: Value) -> Self {
+    pub fn new(user_id: Uuid, notification_type: NotificationType, data: Value) -> Self {
         Self {
             id: Uuid::new_v4(),
             user_id,
@@ -154,8 +216,134 @@ impl Notification {
     }
 }
 
+impl Notification {
+    /// Staff acted on the recipient's profile. `action` is the resolution
+    /// (`avatar_removed`, `band_logo_removed`, `username_reset`).
+    pub fn moderation_action(
+        user_id: Uuid,
+        action: &str,
+        note: Option<&str>,
+        band: Option<(Uuid, &str)>,
+    ) -> Self {
+        Self::new(
+            user_id,
+            NotificationType::ModerationAction,
+            json!({
+                "action": action,
+                "note": note,
+                "band_id": band.map(|(id, _)| id),
+                "band_name": band.map(|(_, name)| name),
+            }),
+        )
+    }
+
+    /// `kind` is what happened (`plan_granted`, `trial_started`,
+    /// `expired`, `revoked`...).
+    pub fn subscription_changed(
+        user_id: Uuid,
+        kind: &str,
+        plan_code: Option<&str>,
+        status: Option<&str>,
+        current_period_end: Option<NaiveDateTime>,
+    ) -> Self {
+        Self::new(
+            user_id,
+            NotificationType::SubscriptionChanged,
+            json!({
+                "kind": kind,
+                "plan_code": plan_code,
+                "status": status,
+                "current_period_end": current_period_end,
+            }),
+        )
+    }
+
+    pub fn trial_ending(user_id: Uuid, plan_code: &str, ends_at: NaiveDateTime) -> Self {
+        Self::new(
+            user_id,
+            NotificationType::TrialEnding,
+            json!({ "plan_code": plan_code, "ends_at": ends_at }),
+        )
+    }
+
+    /// `reason` is the ledger reason (`referral_referrer`, `promo_code`...).
+    pub fn credits_granted(user_id: Uuid, amount: i32, reason: &str) -> Self {
+        Self::new(
+            user_id,
+            NotificationType::CreditsGranted,
+            json!({ "amount": amount, "reason": reason }),
+        )
+    }
+
+    /// `event` is `two_factor_enabled`, `two_factor_disabled`,
+    /// `email_changed`, `password_changed` or `recovery_codes_regenerated`.
+    pub fn security_alert(user_id: Uuid, event: &str) -> Self {
+        Self::new(
+            user_id,
+            NotificationType::SecurityAlert,
+            json!({ "event": event }),
+        )
+    }
+
+    pub fn release_published(user_id: Uuid, version: &str, release_id: Uuid) -> Self {
+        Self::new(
+            user_id,
+            NotificationType::ReleasePublished,
+            json!({ "version": version, "release_id": release_id }),
+        )
+    }
+}
+
 /// Response for `GET /notifications/unread-count`.
 #[derive(ToSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct UnreadCountResponse {
     pub unread_count: i64,
+}
+
+impl Notification {
+    /// A band member suggested a song (sent to the other members).
+    /// `suggested_by` is the suggester's username.
+    pub fn band_suggestion_created(
+        user_id: Uuid,
+        band_id: Uuid,
+        band_name: &str,
+        suggestion_id: Uuid,
+        song_title: &str,
+        suggested_by: &str,
+    ) -> Self {
+        Self::new(
+            user_id,
+            NotificationType::BandSuggestionCreated,
+            json!({
+                "band_id": band_id,
+                "band_name": band_name,
+                "suggestion_id": suggestion_id,
+                "song_title": song_title,
+                "suggested_by": suggested_by,
+            }),
+        )
+    }
+
+    /// The recipient's suggestion was closed. `status` is `accepted`,
+    /// `rejected` or `withdrawn`.
+    pub fn band_suggestion_resolved(
+        user_id: Uuid,
+        band_id: Uuid,
+        band_name: &str,
+        suggestion_id: Uuid,
+        song_title: &str,
+        status: &str,
+    ) -> Self {
+        Self::new(
+            user_id,
+            NotificationType::BandSuggestionResolved,
+            json!({
+                "band_id": band_id,
+                "band_name": band_name,
+                "suggestion_id": suggestion_id,
+                "song_title": song_title,
+                "status": status,
+            }),
+        )
+    }
 }

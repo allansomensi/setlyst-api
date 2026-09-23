@@ -2,8 +2,13 @@ use crate::{
     errors::api_error::ApiError,
     models::{
         band::BandRole,
-        song::{CreateSongPayload, Song, SongExport, SongWithArtist, TagCount, UpdateSongPayload},
+        link::Links,
+        song::{
+            CreateSongPayload, Song, SongExport, SongSetlistRef, SongWithArtist, TagCount,
+            UpdateSongPayload, clean_text,
+        },
     },
+    validations::link::normalize_links,
 };
 use sqlx::{PgPool, Postgres, Transaction};
 use tracing::error;
@@ -15,7 +20,8 @@ use uuid::Uuid;
 macro_rules! song_columns {
     () => {
         "s.id, s.title, s.artist_id, s.user_id, s.band_id, s.forked_from, s.tempo, s.lyrics,
-         s.tonality, s.genre, s.duration,
+         s.tonality, s.genre, s.duration, s.energy, s.time_signature, s.capo, s.tuning,
+         s.performance_notes, s.links,
          COALESCE((SELECT array_agg(st.tag ORDER BY st.tag) FROM song_tags st WHERE st.song_id = s.id), '{}') AS tags,
          s.updated_by,
          (SELECT u.username FROM users u WHERE u.id = s.updated_by) AS updated_by_username,
@@ -46,6 +52,10 @@ pub trait SongRepository: Send + Sync {
     async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Song>, ApiError>;
     /// Any song by ID, without an ownership filter (staff tooling).
     async fn find_any(&self, id: Uuid) -> Result<Option<Song>, ApiError>;
+    /// Live setlists `user_id` can see (personal ones, and those of
+    /// their bands) in which the song counts: personal setlists first,
+    /// then by band with the repertoire first, then by title.
+    async fn setlists_of(&self, id: Uuid, user_id: Uuid) -> Result<Vec<SongSetlistRef>, ApiError>;
     async fn create(
         &self,
         payload: &CreateSongPayload,
@@ -59,7 +69,10 @@ pub trait SongRepository: Send + Sync {
         tags: Option<&[String]>,
         actor_id: Uuid,
     ) -> Result<Uuid, ApiError>;
+    /// Permanently deletes a song (staff tooling and the trash).
     async fn delete(&self, id: Uuid) -> Result<(), ApiError>;
+    /// Moves a live song to the trash.
+    async fn trash(&self, id: Uuid, actor_id: Uuid) -> Result<(), ApiError>;
     /// Checks title uniqueness among the caller's *personal* songs for that artist.
     async fn is_unique(
         &self,
@@ -88,6 +101,12 @@ pub trait SongRepository: Send + Sync {
     ) -> Result<Song, ApiError>;
     /// Whether `band_id` already holds a copy forked from `source_id`.
     async fn has_band_fork(&self, band_id: Uuid, source_id: Uuid) -> Result<bool, ApiError>;
+    /// The live copy of `source_id` held by `band_id`, if any.
+    async fn find_band_fork(
+        &self,
+        band_id: Uuid,
+        source_id: Uuid,
+    ) -> Result<Option<Uuid>, ApiError>;
     /// The caller's personal tag vocabulary with usage counts.
     async fn list_tags(&self, user_id: Uuid) -> Result<Vec<TagCount>, ApiError>;
     /// Renames (or merges into an existing) tag across the caller's
@@ -142,7 +161,8 @@ async fn replace_tags(
     Ok(())
 }
 
-fn like_pattern(search: &str) -> String {
+/// `%search%` for `ILIKE`, with the pattern's own wildcards escaped.
+pub(crate) fn like_pattern(search: &str) -> String {
     format!(
         "%{}%",
         search
@@ -175,7 +195,7 @@ impl SongRepository for SongRepositoryImpl {
         let count = sqlx::query_scalar(
             "SELECT COUNT(*) FROM songs s
              INNER JOIN artists a ON a.id = s.artist_id
-             WHERE s.user_id = $1 AND s.band_id IS NULL
+             WHERE s.user_id = $1 AND s.band_id IS NULL AND s.deleted_at IS NULL
                AND ($2::text IS NULL OR s.title ILIKE $2 OR a.name ILIKE $2)
                AND (cardinality($3::text[]) = 0 OR (
                     SELECT COUNT(DISTINCT st.tag) FROM song_tags st
@@ -190,9 +210,10 @@ impl SongRepository for SongRepositoryImpl {
         let songs = sqlx::query_as::<_, Song>(concat!(
             "SELECT ",
             song_columns!(),
-            " FROM songs s
+            ", a.name AS artist_name
+             FROM songs s
              INNER JOIN artists a ON a.id = s.artist_id
-             WHERE s.user_id = $1 AND s.band_id IS NULL
+             WHERE s.user_id = $1 AND s.band_id IS NULL AND s.deleted_at IS NULL
                AND ($2::text IS NULL OR s.title ILIKE $2 OR a.name ILIKE $2)
                AND (cardinality($3::text[]) = 0 OR (
                     SELECT COUNT(DISTINCT st.tag) FROM song_tags st
@@ -219,9 +240,10 @@ impl SongRepository for SongRepositoryImpl {
         let song = sqlx::query_as::<_, Song>(concat!(
             "SELECT ",
             song_columns!(),
-            " FROM songs s
+            ", (SELECT a.name FROM artists a WHERE a.id = s.artist_id) AS artist_name
+             FROM songs s
              LEFT JOIN band_members bm ON bm.band_id = s.band_id AND bm.user_id = $2
-             WHERE s.id = $1 AND (
+             WHERE s.id = $1 AND s.deleted_at IS NULL AND (
                 (s.band_id IS NULL AND s.user_id = $2)
                 OR (s.band_id IS NOT NULL AND bm.user_id IS NOT NULL)
              )"
@@ -233,11 +255,38 @@ impl SongRepository for SongRepositoryImpl {
         Ok(song)
     }
 
+    async fn setlists_of(&self, id: Uuid, user_id: Uuid) -> Result<Vec<SongSetlistRef>, ApiError> {
+        // Same scope rule as a setlist's own song list: a personal setlist
+        // only counts its owner's personal songs, a band setlist only the
+        // band's songs.
+        let setlists = sqlx::query_as::<_, SongSetlistRef>(
+            "SELECT st.id, st.title, st.is_repertoire, st.band_id, b.name AS band_name, ss.position
+             FROM setlist_songs ss
+             INNER JOIN setlists st ON st.id = ss.setlist_id
+             INNER JOIN songs s ON s.id = ss.song_id
+             LEFT JOIN bands b ON b.id = st.band_id
+             WHERE ss.song_id = $1 AND st.deleted_at IS NULL AND s.deleted_at IS NULL
+               AND ((st.band_id IS NULL AND s.band_id IS NULL AND s.user_id = st.user_id)
+                    OR s.band_id = st.band_id)
+               AND ((st.band_id IS NULL AND st.user_id = $2)
+                    OR EXISTS (SELECT 1 FROM band_members bm
+                               WHERE bm.band_id = st.band_id AND bm.user_id = $2))
+             ORDER BY st.band_id IS NOT NULL, LOWER(b.name), st.band_id,
+                      st.is_repertoire DESC, LOWER(st.title), st.id",
+        )
+        .bind(id)
+        .bind(user_id)
+        .fetch_all(&self.db)
+        .await?;
+        Ok(setlists)
+    }
+
     async fn find_any(&self, id: Uuid) -> Result<Option<Song>, ApiError> {
         let song = sqlx::query_as::<_, Song>(concat!(
             "SELECT ",
             song_columns!(),
-            " FROM songs s WHERE s.id = $1"
+            ", (SELECT a.name FROM artists a WHERE a.id = s.artist_id) AS artist_name
+             FROM songs s WHERE s.id = $1"
         ))
         .bind(id)
         .fetch_optional(&self.db)
@@ -251,15 +300,19 @@ impl SongRepository for SongRepositoryImpl {
         tags: &[String],
         user_id: Uuid,
     ) -> Result<Song, ApiError> {
+        let links = normalize_links(payload.links.as_deref().unwrap_or_default())?;
         let mut new_song = Song::new(payload, user_id);
         new_song.title = new_song.title.trim().to_string();
+        new_song.lyrics = new_song.lyrics.filter(|l| !l.trim().is_empty());
         new_song.tags = tags.to_vec();
+        new_song.links = Links::from_stored(links.clone());
 
         let mut tx = self.db.begin().await?;
 
         sqlx::query(
-            "INSERT INTO songs (id, title, artist_id, user_id, band_id, forked_from, tempo, lyrics, tonality, genre, duration, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+            "INSERT INTO songs (id, title, artist_id, user_id, band_id, forked_from, tempo, lyrics, tonality, genre, duration,
+                                energy, time_signature, capo, tuning, performance_notes, links, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
         )
         .bind(new_song.id)
         .bind(&new_song.title)
@@ -272,12 +325,22 @@ impl SongRepository for SongRepositoryImpl {
         .bind(new_song.tonality)
         .bind(new_song.genre)
         .bind(new_song.duration)
+        .bind(new_song.energy)
+        .bind(&new_song.time_signature)
+        .bind(new_song.capo)
+        .bind(&new_song.tuning)
+        .bind(&new_song.performance_notes)
+        .bind(sqlx::types::Json(&links))
         .bind(new_song.created_at)
         .bind(new_song.updated_at)
         .execute(&mut *tx)
         .await?;
 
         replace_tags(&mut tx, new_song.id, tags).await?;
+        new_song.artist_name = sqlx::query_scalar("SELECT name FROM artists WHERE id = $1")
+            .bind(new_song.artist_id)
+            .fetch_optional(&mut *tx)
+            .await?;
         tx.commit().await?;
 
         Ok(new_song)
@@ -358,6 +421,61 @@ impl SongRepository for SongRepositoryImpl {
             updated = true;
         }
 
+        if let Some(energy) = payload.energy {
+            sqlx::query("UPDATE songs SET energy = $1 WHERE id = $2")
+                .bind(energy)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            updated = true;
+        }
+
+        if let Some(time_signature) = &payload.time_signature {
+            sqlx::query("UPDATE songs SET time_signature = $1 WHERE id = $2")
+                .bind(clean_text(time_signature.as_deref()))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            updated = true;
+        }
+
+        if let Some(capo) = payload.capo {
+            sqlx::query("UPDATE songs SET capo = $1 WHERE id = $2")
+                .bind(capo)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            updated = true;
+        }
+
+        if let Some(tuning) = &payload.tuning {
+            sqlx::query("UPDATE songs SET tuning = $1 WHERE id = $2")
+                .bind(clean_text(tuning.as_deref()))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            updated = true;
+        }
+
+        if let Some(notes) = &payload.performance_notes {
+            sqlx::query("UPDATE songs SET performance_notes = $1 WHERE id = $2")
+                .bind(clean_text(notes.as_deref()))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            updated = true;
+        }
+
+        if let Some(links) = &payload.links {
+            let links = normalize_links(links)?;
+            sqlx::query("UPDATE songs SET links = $1 WHERE id = $2")
+                .bind(sqlx::types::Json(&links))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            updated = true;
+        }
+
         if let Some(tags) = tags {
             replace_tags(&mut tx, id, tags).await?;
             updated = true;
@@ -388,6 +506,23 @@ impl SongRepository for SongRepositoryImpl {
         Ok(())
     }
 
+    async fn trash(&self, id: Uuid, actor_id: Uuid) -> Result<(), ApiError> {
+        let result = sqlx::query(
+            "UPDATE songs SET deleted_at = $2, deleted_by = $3, trash_batch = $4
+             WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .bind(chrono::Utc::now().naive_utc())
+        .bind(actor_id)
+        .bind(Uuid::new_v4())
+        .execute(&self.db)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(ApiError::NotFound);
+        }
+        Ok(())
+    }
+
     async fn is_unique(
         &self,
         title: &str,
@@ -400,7 +535,7 @@ impl SongRepository for SongRepositoryImpl {
         let exists = sqlx::query(
             "SELECT id FROM songs
              WHERE LOWER(TRIM(title)) = LOWER(TRIM($1)) AND artist_id = $2 AND user_id = $3
-               AND band_id IS NULL AND ($4::uuid IS NULL OR id != $4)",
+               AND band_id IS NULL AND deleted_at IS NULL AND ($4::uuid IS NULL OR id != $4)",
         )
         .bind(title)
         .bind(artist_id)
@@ -419,7 +554,7 @@ impl SongRepository for SongRepositoryImpl {
 
     async fn exists(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
         let exists =
-            sqlx::query("SELECT id FROM songs WHERE id = $1 AND user_id = $2 AND band_id IS NULL;")
+            sqlx::query("SELECT id FROM songs WHERE id = $1 AND user_id = $2 AND band_id IS NULL AND deleted_at IS NULL;")
                 .bind(id)
                 .bind(user_id)
                 .fetch_optional(&self.db)
@@ -447,7 +582,7 @@ impl SongRepository for SongRepositoryImpl {
                 ON brp.band_id = s.band_id
                 AND brp.role = bm.role
                 AND brp.permission = 'manage_songs'
-            WHERE s.id = $1
+            WHERE s.id = $1 AND s.deleted_at IS NULL
             "#,
         )
         .bind(id)
@@ -485,10 +620,14 @@ impl SongRepository for SongRepositoryImpl {
                 a.name AS artist_name,
                 s.tonality::text AS tonality,
                 s.tempo,
-                s.lyrics
+                s.lyrics,
+                s.time_signature,
+                s.capo,
+                s.duration,
+                s.energy
             FROM songs s
             LEFT JOIN artists a ON s.artist_id = a.id
-            WHERE s.user_id = $1 AND s.band_id IS NULL
+            WHERE s.user_id = $1 AND s.band_id IS NULL AND s.deleted_at IS NULL
             ORDER BY a.name ASC, s.title ASC
             "#,
         )
@@ -506,7 +645,7 @@ impl SongRepository for SongRepositoryImpl {
             ", a.name AS artist_name
              FROM songs s
              INNER JOIN artists a ON a.id = s.artist_id
-             WHERE s.id = $1"
+             WHERE s.id = $1 AND s.deleted_at IS NULL"
         ))
         .bind(id)
         .fetch_optional(&self.db)
@@ -528,9 +667,11 @@ impl SongRepository for SongRepositoryImpl {
         // reuse that copy instead of creating a duplicate — atomically, via
         // the partial unique index on (band_id, forked_from).
         let (song_id, inserted): (Uuid, bool) = sqlx::query_as(
-            "INSERT INTO songs (id, title, artist_id, user_id, band_id, forked_from, tempo, lyrics, tonality, genre, duration, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-             ON CONFLICT (band_id, forked_from) WHERE band_id IS NOT NULL AND forked_from IS NOT NULL
+            "INSERT INTO songs (id, title, artist_id, user_id, band_id, forked_from, tempo, lyrics, tonality, genre, duration,
+                                energy, time_signature, capo, tuning, performance_notes, links, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+             ON CONFLICT (band_id, forked_from)
+                WHERE band_id IS NOT NULL AND forked_from IS NOT NULL AND deleted_at IS NULL
              DO UPDATE SET updated_at = songs.updated_at
              RETURNING id, (xmax = 0) AS inserted",
         )
@@ -545,6 +686,12 @@ impl SongRepository for SongRepositoryImpl {
         .bind(new_song.tonality)
         .bind(new_song.genre)
         .bind(new_song.duration)
+        .bind(new_song.energy)
+        .bind(&new_song.time_signature)
+        .bind(new_song.capo)
+        .bind(&new_song.tuning)
+        .bind(&new_song.performance_notes)
+        .bind(sqlx::types::Json(new_song.links.to_stored()))
         .bind(new_song.created_at)
         .bind(new_song.updated_at)
         .fetch_one(&mut *tx)
@@ -560,13 +707,22 @@ impl SongRepository for SongRepositoryImpl {
     }
 
     async fn has_band_fork(&self, band_id: Uuid, source_id: Uuid) -> Result<bool, ApiError> {
-        let exists = sqlx::query("SELECT 1 FROM songs WHERE band_id = $1 AND forked_from = $2")
-            .bind(band_id)
-            .bind(source_id)
-            .fetch_optional(&self.db)
-            .await?
-            .is_some();
-        Ok(exists)
+        Ok(self.find_band_fork(band_id, source_id).await?.is_some())
+    }
+
+    async fn find_band_fork(
+        &self,
+        band_id: Uuid,
+        source_id: Uuid,
+    ) -> Result<Option<Uuid>, ApiError> {
+        let id = sqlx::query_scalar(
+            "SELECT id FROM songs WHERE band_id = $1 AND forked_from = $2 AND deleted_at IS NULL",
+        )
+        .bind(band_id)
+        .bind(source_id)
+        .fetch_optional(&self.db)
+        .await?;
+        Ok(id)
     }
 
     async fn list_tags(&self, user_id: Uuid) -> Result<Vec<TagCount>, ApiError> {
@@ -574,7 +730,7 @@ impl SongRepository for SongRepositoryImpl {
             "SELECT st.tag, COUNT(*) AS song_count
              FROM song_tags st
              INNER JOIN songs s ON s.id = st.song_id
-             WHERE s.user_id = $1 AND s.band_id IS NULL
+             WHERE s.user_id = $1 AND s.band_id IS NULL AND s.deleted_at IS NULL
              GROUP BY st.tag
              ORDER BY song_count DESC, st.tag ASC",
         )

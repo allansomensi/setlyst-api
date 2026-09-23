@@ -123,6 +123,14 @@ pub fn validate_username(username: &str) -> Result<(), ValidationError> {
         ));
     }
 
+    // Slurs are refused outright. Other offensive terms are allowed here
+    // and flagged for a moderator instead (see `crate::moderation`).
+    if crate::moderation::wordlist::contains_exact_slur(username) {
+        return Err(error(
+            "This username is not allowed. Please choose another one.",
+        ));
+    }
+
     Ok(())
 }
 
@@ -165,6 +173,14 @@ mod tests {
         assert!(validate_username("augusto.").is_err());
         assert!(validate_username("au..gusto").is_err());
         assert!(validate_username("au_-gusto").is_err());
+    }
+
+    #[test]
+    fn rejects_exact_slurs_but_not_innocent_names() {
+        assert!(validate_username("n1gger").is_err());
+        assert!(validate_username("big.faggot").is_err());
+        assert!(validate_username("niger.music").is_ok());
+        assert!(validate_username("scunthorpe").is_ok());
     }
 
     #[test]

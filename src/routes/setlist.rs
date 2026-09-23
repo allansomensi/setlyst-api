@@ -1,8 +1,11 @@
-use crate::{controllers::setlist, database::AppState};
+use crate::{
+    controllers::setlist, database::AppState, middlewares::client_ip::ClientIpKeyExtractor,
+};
 use axum::{
     Router,
     routing::{delete, get, patch},
 };
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
 pub fn create_routes(state: AppState) -> Router {
     axum::Router::new()
@@ -68,11 +71,24 @@ pub fn create_routes(state: AppState) -> Router {
 /// share token. Mounted separately (outside the `authenticate` middleware) —
 /// see `routes/mod.rs`.
 pub fn create_public_routes(state: AppState) -> Router {
-    Router::new()
-        .route("/{token}", get(setlist::get_public_setlist))
+    // Anonymous PDF rendering is expensive: one per second per client IP,
+    // bursts of 5 (on top of the global PDF concurrency limit).
+    let pdf_governor = GovernorConfigBuilder::default()
+        .per_second(1)
+        .burst_size(5)
+        .key_extractor(ClientIpKeyExtractor)
+        .finish()
+        .expect("valid governor configuration");
+
+    let pdf = Router::new()
         .route(
             "/{token}/export/pdf",
             get(setlist::export_public_setlist_pdf),
         )
+        .layer(GovernorLayer::new(pdf_governor));
+
+    Router::new()
+        .route("/{token}", get(setlist::get_public_setlist))
+        .merge(pdf)
         .with_state(state)
 }

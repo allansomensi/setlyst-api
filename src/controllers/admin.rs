@@ -31,15 +31,10 @@ use axum::{
     response::IntoResponse,
 };
 use serde_json::json;
-use tracing::error;
 use uuid::Uuid;
 use validator::Validate;
 
-async fn notify(state: &AppState, notification: Notification) {
-    if let Err(e) = state.notification_repo.create(&notification).await {
-        error!(error = %e, "Failed to create notification");
-    }
-}
+use crate::services::notifier::notify;
 
 // ---------------------------------------------------------------------
 // Bands
@@ -923,8 +918,7 @@ pub async fn list_audit_logs(
     Query(query): Query<AuditLogQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_staff()?;
-    let page = query.page.unwrap_or(1).max(1);
-    let per_page = query.per_page.unwrap_or(50).clamp(1, 100);
+    let (page, per_page) = crate::models::resolve_page(query.page, query.per_page, 50);
     let (entries, total) = state.audit_repo.list(&query, page, per_page).await?;
     Ok(Json(PaginatedResponse::new(entries, total, page, per_page)))
 }

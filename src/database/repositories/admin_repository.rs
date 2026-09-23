@@ -19,9 +19,9 @@ macro_rules! admin_band_columns {
          (SELECT u.username FROM band_members bm INNER JOIN users u ON u.id = bm.user_id
             WHERE bm.band_id = b.id AND bm.role = 'owner' LIMIT 1) AS owner_username,
          (SELECT COUNT(*) FROM band_members bm WHERE bm.band_id = b.id) AS member_count,
-         (SELECT COUNT(*) FROM setlists s WHERE s.band_id = b.id) AS setlist_count,
-         (SELECT COUNT(*) FROM songs s WHERE s.band_id = b.id) AS song_count,
-         (SELECT COUNT(*) FROM gigs g WHERE g.band_id = b.id) AS gig_count,
+         (SELECT COUNT(*) FROM setlists s WHERE s.band_id = b.id AND s.deleted_at IS NULL) AS setlist_count,
+         (SELECT COUNT(*) FROM songs s WHERE s.band_id = b.id AND s.deleted_at IS NULL) AS song_count,
+         (SELECT COUNT(*) FROM gigs g WHERE g.band_id = b.id AND g.deleted_at IS NULL) AS gig_count,
          (SELECT u.username FROM users u WHERE u.id = b.updated_by) AS updated_by_username,
          b.created_at, b.updated_at"
     };
@@ -32,10 +32,11 @@ macro_rules! admin_song_columns {
         "s.id, s.title, s.artist_id, a.name AS artist_name, s.user_id,
          (SELECT u.username FROM users u WHERE u.id = s.user_id) AS owner_username,
          s.band_id, (SELECT b.name FROM bands b WHERE b.id = s.band_id) AS band_name,
-         s.tonality, s.tempo, s.genre, s.duration,
+         s.tonality, s.tempo, s.genre, s.duration, s.energy, s.time_signature, s.capo,
          (s.lyrics IS NOT NULL AND LENGTH(TRIM(s.lyrics)) > 0) AS has_lyrics,
          COALESCE((SELECT array_agg(st.tag ORDER BY st.tag) FROM song_tags st WHERE st.song_id = s.id), '{}') AS tags,
-         (SELECT COUNT(*) FROM setlist_songs ss WHERE ss.song_id = s.id) AS setlist_count,
+         (SELECT COUNT(*) FROM setlist_songs ss INNER JOIN setlists sx ON sx.id = ss.setlist_id
+            WHERE ss.song_id = s.id AND sx.deleted_at IS NULL) AS setlist_count,
          (SELECT u.username FROM users u WHERE u.id = s.updated_by) AS updated_by_username,
          s.created_at, s.updated_at"
     };
@@ -46,7 +47,8 @@ macro_rules! admin_setlist_columns {
         "s.id, s.title, s.description, s.user_id,
          (SELECT u.username FROM users u WHERE u.id = s.user_id) AS owner_username,
          s.band_id, (SELECT b.name FROM bands b WHERE b.id = s.band_id) AS band_name,
-         (SELECT COUNT(*) FROM setlist_songs ss WHERE ss.setlist_id = s.id) AS song_count,
+         (SELECT COUNT(*) FROM setlist_songs ss INNER JOIN songs so ON so.id = ss.song_id
+            WHERE ss.setlist_id = s.id AND so.deleted_at IS NULL) AS song_count,
          setlist_total_duration(s.id) AS total_duration,
          s.share_token, s.share_locked_at, s.share_lock_reason,
          (SELECT u.username FROM users u WHERE u.id = s.updated_by) AS updated_by_username,
@@ -151,7 +153,8 @@ impl AdminRepository for AdminRepositoryImpl {
             "SELECT COUNT(*) FROM songs s
              INNER JOIN artists a ON a.id = s.artist_id
              INNER JOIN users u ON u.id = s.user_id
-             WHERE ($1::text IS NULL OR s.title ILIKE $1 OR a.name ILIKE $1 OR u.username ILIKE $1)
+             WHERE s.deleted_at IS NULL
+               AND ($1::text IS NULL OR s.title ILIKE $1 OR a.name ILIKE $1 OR u.username ILIKE $1)
                AND ($2::uuid IS NULL OR s.user_id = $2)
                AND ($3::uuid IS NULL OR s.band_id = $3)",
         )
@@ -166,7 +169,8 @@ impl AdminRepository for AdminRepositoryImpl {
             " FROM songs s
              INNER JOIN artists a ON a.id = s.artist_id
              INNER JOIN users u ON u.id = s.user_id
-             WHERE ($1::text IS NULL OR s.title ILIKE $1 OR a.name ILIKE $1 OR u.username ILIKE $1)
+             WHERE s.deleted_at IS NULL
+               AND ($1::text IS NULL OR s.title ILIKE $1 OR a.name ILIKE $1 OR u.username ILIKE $1)
                AND ($2::uuid IS NULL OR s.user_id = $2)
                AND ($3::uuid IS NULL OR s.band_id = $3)
              ORDER BY s.updated_at DESC, s.id
@@ -193,7 +197,8 @@ impl AdminRepository for AdminRepositoryImpl {
         let count = sqlx::query_scalar(
             "SELECT COUNT(*) FROM setlists s
              INNER JOIN users u ON u.id = s.user_id
-             WHERE ($1::text IS NULL OR s.title ILIKE $1 OR u.username ILIKE $1)
+             WHERE s.deleted_at IS NULL
+               AND ($1::text IS NULL OR s.title ILIKE $1 OR u.username ILIKE $1)
                AND ($2::uuid IS NULL OR s.user_id = $2)
                AND ($3::uuid IS NULL OR s.band_id = $3)
                AND ($4::boolean IS NULL OR (s.share_token IS NOT NULL) = $4)",
@@ -209,7 +214,8 @@ impl AdminRepository for AdminRepositoryImpl {
             admin_setlist_columns!(),
             " FROM setlists s
              INNER JOIN users u ON u.id = s.user_id
-             WHERE ($1::text IS NULL OR s.title ILIKE $1 OR u.username ILIKE $1)
+             WHERE s.deleted_at IS NULL
+               AND ($1::text IS NULL OR s.title ILIKE $1 OR u.username ILIKE $1)
                AND ($2::uuid IS NULL OR s.user_id = $2)
                AND ($3::uuid IS NULL OR s.band_id = $3)
                AND ($4::boolean IS NULL OR (s.share_token IS NOT NULL) = $4)
@@ -232,7 +238,7 @@ impl AdminRepository for AdminRepositoryImpl {
         let song = sqlx::query_as::<_, AdminSongSummary>(concat!(
             "SELECT ",
             admin_song_columns!(),
-            " FROM songs s INNER JOIN artists a ON a.id = s.artist_id WHERE s.id = $1"
+            " FROM songs s INNER JOIN artists a ON a.id = s.artist_id WHERE s.id = $1 AND s.deleted_at IS NULL"
         ))
         .bind(id)
         .fetch_optional(&self.db)
@@ -244,7 +250,7 @@ impl AdminRepository for AdminRepositoryImpl {
         let setlist = sqlx::query_as::<_, AdminSetlistSummary>(concat!(
             "SELECT ",
             admin_setlist_columns!(),
-            " FROM setlists s WHERE s.id = $1"
+            " FROM setlists s WHERE s.id = $1 AND s.deleted_at IS NULL"
         ))
         .bind(id)
         .fetch_optional(&self.db)
@@ -264,10 +270,10 @@ impl AdminRepository for AdminRepositoryImpl {
         let count = sqlx::query_scalar(
             "SELECT COUNT(*) FROM (
                 SELECT s.title AS title, s.user_id AS owner_id, s.share_locked_at FROM setlists s
-                WHERE s.share_token IS NOT NULL OR s.share_locked_at IS NOT NULL
+                WHERE s.deleted_at IS NULL AND (s.share_token IS NOT NULL OR s.share_locked_at IS NOT NULL)
                 UNION ALL
                 SELECT g.venue AS title, g.user_id AS owner_id, g.share_locked_at FROM gigs g
-                WHERE g.share_token IS NOT NULL OR g.share_locked_at IS NOT NULL
+                WHERE g.deleted_at IS NULL AND (g.share_token IS NOT NULL OR g.share_locked_at IS NOT NULL)
              ) l
              INNER JOIN users u ON u.id = l.owner_id
              WHERE ($1::text IS NULL OR l.title ILIKE $1 OR u.username ILIKE $1)
@@ -287,12 +293,12 @@ impl AdminRepository for AdminRepositoryImpl {
                 SELECT 'setlist'::text AS kind, s.id, s.title, s.user_id AS owner_id, s.band_id,
                        s.share_token, s.share_locked_at, s.share_lock_reason, s.share_locked_by, s.updated_at
                 FROM setlists s
-                WHERE s.share_token IS NOT NULL OR s.share_locked_at IS NOT NULL
+                WHERE s.deleted_at IS NULL AND (s.share_token IS NOT NULL OR s.share_locked_at IS NOT NULL)
                 UNION ALL
                 SELECT 'gig'::text AS kind, g.id, g.venue AS title, g.user_id AS owner_id, g.band_id,
                        g.share_token, g.share_locked_at, g.share_lock_reason, g.share_locked_by, g.updated_at
                 FROM gigs g
-                WHERE g.share_token IS NOT NULL OR g.share_locked_at IS NOT NULL
+                WHERE g.deleted_at IS NULL AND (g.share_token IS NOT NULL OR g.share_locked_at IS NOT NULL)
              ) l
              INNER JOIN users u ON u.id = l.owner_id
              WHERE ($1::text IS NULL OR l.title ILIKE $1 OR u.username ILIKE $1)

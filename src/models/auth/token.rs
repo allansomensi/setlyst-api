@@ -24,6 +24,12 @@ pub struct Claims {
     /// as `sub`. Such tokens are read-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imp: Option<Uuid>,
+    /// On impersonation tokens: the impersonator's `token_version` at
+    /// issue time. Signing the staff member out everywhere (or changing
+    /// their password) therefore also ends every "view as" session they
+    /// opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iver: Option<i32>,
 }
 
 #[derive(Deserialize, Serialize, ToSchema)]

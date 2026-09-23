@@ -44,8 +44,27 @@ pub struct Gig {
     pub updated_by: Option<Uuid>,
     #[sqlx(default)]
     pub updated_by_username: Option<String>,
+    /// The tour this gig is part of (`None` when none, or when that tour
+    /// is in the trash).
+    #[sqlx(default)]
+    pub tour_id: Option<Uuid>,
+    #[sqlx(default)]
+    pub tour_name: Option<String>,
+    /// Whether the *caller* pinned this gig to their home screen.
+    #[sqlx(default)]
+    pub is_pinned: bool,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
+}
+
+/// Filters for the gig lists.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct GigListQuery {
+    pub page: Option<i64>,
+    pub per_page: Option<i64>,
+    /// Only the gigs of this tour.
+    pub tour_id: Option<Uuid>,
 }
 
 #[derive(Clone, Deserialize, Serialize, ToSchema, Validate)]
@@ -66,6 +85,9 @@ pub struct CreateGigPayload {
     pub status: Option<GigStatus>,
     #[validate(custom(function = "crate::validations::text::validate_description"))]
     pub notes: Option<String>,
+    /// The tour this gig belongs to: a live tour of the same scope (same
+    /// band, or one of the caller's personal tours for a personal gig).
+    pub tour_id: Option<Uuid>,
 }
 
 /// Nullable fields use `Option<Option<T>>`: absent = unchanged, `null` =
@@ -84,6 +106,8 @@ pub struct UpdateGigPayload {
     #[serde(default, deserialize_with = "crate::models::patch::double_option")]
     #[validate(custom(function = "crate::validations::text::validate_description"))]
     pub notes: Option<Option<String>>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    pub tour_id: Option<Option<Uuid>>,
 }
 
 impl Gig {
@@ -108,6 +132,9 @@ impl Gig {
             share_lock_reason: None,
             updated_by: None,
             updated_by_username: None,
+            tour_id: payload.tour_id,
+            tour_name: None,
+            is_pinned: false,
             created_at: now,
             updated_at: now,
         }

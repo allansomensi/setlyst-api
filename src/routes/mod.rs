@@ -1,20 +1,30 @@
 pub mod admin;
+pub mod announcement;
 pub mod artist;
 pub mod auth;
 pub mod backup;
 pub mod band;
+pub mod billing;
 pub mod gig;
 pub mod health;
 pub mod metrics;
 pub mod migrations;
 pub mod notification;
+pub mod pin;
+pub mod public;
 pub mod setlist;
 pub mod song;
 pub mod status;
 pub mod swagger;
+pub mod tour;
+pub mod trash;
 pub mod user;
 
-use crate::{config::Config, database::AppState, middlewares::authentication::authenticate};
+use crate::{
+    config::Config,
+    database::AppState,
+    middlewares::{authentication::authenticate, client_ip::ClientIpKeyExtractor},
+};
 use axum::{
     Router,
     extract::DefaultBodyLimit,
@@ -22,9 +32,7 @@ use axum::{
     middleware,
 };
 use std::time::Duration;
-use tower_governor::{
-    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
-};
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 use tower_http::{
     compression::CompressionLayer, set_header::SetResponseHeaderLayer, timeout::TimeoutLayer,
 };
@@ -49,6 +57,17 @@ fn protected_routes(state: AppState) -> Router {
         .nest("/metrics", metrics::create_routes(state.clone()))
         .nest("/backup", backup::create_routes(state.clone()))
         .nest("/admin", admin::create_routes(state.clone()))
+        .nest("/billing", billing::create_routes(state.clone()))
+        .nest("/announcements", announcement::create_routes(state.clone()))
+        .nest("/tours", tour::create_routes(state.clone()))
+        .nest("/trash", trash::create_routes(state.clone()))
+        .nest("/users/me/pins", pin::create_routes(state.clone()))
+        // Authenticated answers are per-user: never let a browser, proxy
+        // or service worker keep a copy.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
         .layer(middleware::from_fn_with_state(state, authenticate))
 }
 
@@ -65,7 +84,8 @@ pub fn api_router(state: AppState) -> Router {
                 "/public/setlists",
                 setlist::create_public_routes(state.clone()),
             )
-            .nest("/public/gigs", gig::create_public_routes(state)),
+            .nest("/public/gigs", gig::create_public_routes(state.clone()))
+            .merge(public::create_routes(state)),
     )
 }
 
@@ -73,12 +93,16 @@ pub fn create_routes(state: AppState) -> Router {
     let global_governor_conf = GovernorConfigBuilder::default()
         .per_millisecond(25)
         .burst_size(300)
-        .key_extractor(SmartIpKeyExtractor)
+        .key_extractor(ClientIpKeyExtractor)
         .finish()
-        .unwrap();
+        .expect("valid governor configuration");
 
-    api_router(state)
-        .merge(swagger::swagger_routes())
+    let mut router = api_router(state);
+    if Config::get().enable_swagger {
+        router = router.merge(swagger::swagger_routes());
+    }
+
+    router
         .layer(Config::cors())
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,

@@ -1,7 +1,11 @@
 use crate::{
     config::Config,
     database::AppState,
-    models::status::{Database, Dependencies, ServiceHealth, Status},
+    errors::api_error::ApiError,
+    models::{
+        auth::access::AccessControl,
+        status::{Database, Dependencies, PublicStatus, ServiceHealth, Status},
+    },
 };
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use chrono::Utc;
@@ -60,8 +64,7 @@ async fn probe_database(state: &AppState) -> Database {
         } else {
             ServiceHealth::Operational
         },
-        // "16.4 (Debian 16.4-1.pgdg120+1)" → "16.4": the distro build
-        // string is noise on a public status page.
+        // "16.4 (Debian 16.4-1.pgdg120+1)" → "16.4".
         version: version.split_whitespace().next().map(str::to_string),
         latency_ms: Some(latency_ms),
         max_connections,
@@ -71,18 +74,54 @@ async fn probe_database(state: &AppState) -> Database {
     }
 }
 
+fn http_status(health: ServiceHealth) -> StatusCode {
+    if health == ServiceHealth::Down {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/status",
     tags = ["Status"],
     summary = "Platform health.",
-    description = "Overall status, API version and uptime, and database health (latency and connection usage). Answers 503 when a dependency is down, with the same body.",
+    description = "Overall status and API version. Answers 503 when a dependency is down, with the same body. Infrastructure details (database version, connections, uptime) are only available to staff at `/status/details`.",
     responses(
-        (status = 200, description = "Operational or degraded.", body = Status),
-        (status = 503, description = "A dependency is down.", body = Status)
+        (status = 200, description = "Operational or degraded.", body = PublicStatus),
+        (status = 503, description = "A dependency is down.", body = PublicStatus)
     )
 )]
 pub async fn show_status(State(state): State<AppState>) -> impl IntoResponse {
+    let database = probe_database(&state).await;
+    (
+        http_status(database.status),
+        Json(PublicStatus {
+            status: database.status,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }),
+    )
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/status/details",
+    tags = ["Status"],
+    summary = "Detailed platform health (staff).",
+    description = "Overall status, API version and uptime, and database health (version, latency and connection usage). Requires Admin or Moderator role.",
+    security(("jwt_token" = [])),
+    responses(
+        (status = 200, description = "Operational or degraded.", body = Status),
+        (status = 403, description = "Not staff."),
+        (status = 503, description = "A dependency is down.", body = Status)
+    )
+)]
+pub async fn show_status_details(
+    State(state): State<AppState>,
+    access: AccessControl,
+) -> Result<impl IntoResponse, ApiError> {
+    access.require_staff()?;
     let database = probe_database(&state).await;
     let overall = database.status;
 
@@ -94,11 +133,5 @@ pub async fn show_status(State(state): State<AppState>) -> impl IntoResponse {
         dependencies: Dependencies { database },
     };
 
-    let code = if overall == ServiceHealth::Down {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else {
-        StatusCode::OK
-    };
-
-    (code, Json(body))
+    Ok((http_status(overall), Json(body)))
 }

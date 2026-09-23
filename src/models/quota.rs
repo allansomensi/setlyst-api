@@ -37,10 +37,12 @@ pub enum QuotaResource {
     BandGigs,
     BandSongs,
     SetlistItems,
+    Tours,
+    BandTours,
 }
 
 impl QuotaResource {
-    pub const ALL: [QuotaResource; 12] = [
+    pub const ALL: [QuotaResource; 14] = [
         QuotaResource::Songs,
         QuotaResource::Artists,
         QuotaResource::Setlists,
@@ -53,11 +55,13 @@ impl QuotaResource {
         QuotaResource::BandGigs,
         QuotaResource::BandSongs,
         QuotaResource::SetlistItems,
+        QuotaResource::Tours,
+        QuotaResource::BandTours,
     ];
 
     /// Resources counted against the user themselves (the rest are
     /// counted per band or per setlist).
-    pub const PER_USER: [QuotaResource; 7] = [
+    pub const PER_USER: [QuotaResource; 8] = [
         QuotaResource::Songs,
         QuotaResource::Artists,
         QuotaResource::Setlists,
@@ -65,6 +69,7 @@ impl QuotaResource {
         QuotaResource::Tags,
         QuotaResource::BandsOwned,
         QuotaResource::BandMemberships,
+        QuotaResource::Tours,
     ];
 
     pub fn key(&self) -> &'static str {
@@ -81,6 +86,8 @@ impl QuotaResource {
             QuotaResource::BandGigs => "band_gigs",
             QuotaResource::BandSongs => "band_songs",
             QuotaResource::SetlistItems => "setlist_items",
+            QuotaResource::Tours => "tours",
+            QuotaResource::BandTours => "band_tours",
         }
     }
 }
@@ -126,6 +133,10 @@ pub struct QuotaLimits {
     pub band_songs: i64,
     #[validate(custom(function = "validate_limit"))]
     pub setlist_items: i64,
+    #[validate(custom(function = "validate_limit"))]
+    pub tours: i64,
+    #[validate(custom(function = "validate_limit"))]
+    pub band_tours: i64,
 }
 
 impl Default for QuotaLimits {
@@ -145,6 +156,8 @@ impl Default for QuotaLimits {
             band_gigs: 500,
             band_songs: 2_000,
             setlist_items: 150,
+            tours: 50,
+            band_tours: 50,
         }
     }
 }
@@ -164,6 +177,8 @@ impl QuotaLimits {
             QuotaResource::BandGigs => self.band_gigs,
             QuotaResource::BandSongs => self.band_songs,
             QuotaResource::SetlistItems => self.setlist_items,
+            QuotaResource::Tours => self.tours,
+            QuotaResource::BandTours => self.band_tours,
         }
     }
 
@@ -186,7 +201,9 @@ impl QuotaLimits {
             band_setlists,
             band_gigs,
             band_songs,
-            setlist_items
+            setlist_items,
+            tours,
+            band_tours
         );
         self
     }
@@ -224,6 +241,10 @@ pub struct QuotaOverrides {
     pub band_songs: Option<i64>,
     #[validate(custom(function = "validate_optional_limit"))]
     pub setlist_items: Option<i64>,
+    #[validate(custom(function = "validate_optional_limit"))]
+    pub tours: Option<i64>,
+    #[validate(custom(function = "validate_optional_limit"))]
+    pub band_tours: Option<i64>,
 }
 
 /// A user's stored quota settings.

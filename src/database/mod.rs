@@ -1,20 +1,34 @@
 pub mod connection;
 pub mod repositories;
 
+use crate::{
+    moderation::{DefaultModerationService, ModerationService},
+    services::google::{GoogleJwksVerifier, GoogleTokenVerifier},
+};
 use repositories::{
     admin_repository::{AdminRepository, AdminRepositoryImpl},
+    announcement_repository::{AnnouncementRepository, AnnouncementRepositoryImpl},
     artist_repository::{ArtistRepository, ArtistRepositoryImpl},
     audit_repository::{AuditRepository, AuditRepositoryImpl},
     backup_repository::{BackupRepository, BackupRepositoryImpl},
     band_invite_repository::{BandInviteRepository, BandInviteRepositoryImpl},
     band_member_repository::{BandMemberRepository, BandMemberRepositoryImpl},
+    band_note_repository::{BandNoteRepository, BandNoteRepositoryImpl},
     band_repository::{BandRepository, BandRepositoryImpl},
+    billing_repository::{BillingRepository, BillingRepositoryImpl},
     gig_repository::{GigRepository, GigRepositoryImpl},
     metrics_repository::{MetricsRepository, MetricsRepositoryImpl},
+    moderation_repository::{ModerationRepository, ModerationRepositoryImpl},
     notification_repository::{NotificationRepository, NotificationRepositoryImpl},
+    pin_repository::{PinRepository, PinRepositoryImpl},
     quota_repository::{QuotaRepository, QuotaRepositoryImpl},
+    release_note_repository::{ReleaseNoteRepository, ReleaseNoteRepositoryImpl},
+    security_repository::{SecurityRepository, SecurityRepositoryImpl},
     setlist_repository::{SetlistRepository, SetlistRepositoryImpl},
     song_repository::{SongRepository, SongRepositoryImpl},
+    suggestion_repository::{SuggestionRepository, SuggestionRepositoryImpl},
+    tour_repository::{TourRepository, TourRepositoryImpl},
+    trash_repository::{TrashRepository, TrashRepositoryImpl},
     user_preferences_repository::{UserPreferencesRepository, UserPreferencesRepositoryImpl},
     user_repository::{UserRepository, UserRepositoryImpl},
 };
@@ -41,6 +55,20 @@ pub struct AppState {
     pub quota_repo: Arc<dyn QuotaRepository>,
     pub audit_repo: Arc<dyn AuditRepository>,
     pub admin_repo: Arc<dyn AdminRepository>,
+    pub security_repo: Arc<dyn SecurityRepository>,
+    pub billing_repo: Arc<dyn BillingRepository>,
+    pub announcement_repo: Arc<dyn AnnouncementRepository>,
+    pub release_note_repo: Arc<dyn ReleaseNoteRepository>,
+    pub moderation_repo: Arc<dyn ModerationRepository>,
+    pub tour_repo: Arc<dyn TourRepository>,
+    pub trash_repo: Arc<dyn TrashRepository>,
+    pub suggestion_repo: Arc<dyn SuggestionRepository>,
+    pub band_note_repo: Arc<dyn BandNoteRepository>,
+    pub pin_repo: Arc<dyn PinRepository>,
+    /// Verifies Google ID tokens (replaced by a fake in tests).
+    pub google_verifier: Arc<dyn GoogleTokenVerifier>,
+    /// Automatic moderation checks (replaced in tests).
+    pub moderation: Arc<dyn ModerationService>,
 }
 
 impl AppState {
@@ -48,6 +76,20 @@ impl AppState {
     /// repositories are registered — the server and the CLI binaries all
     /// build their state through here.
     pub fn new(pool: PgPool) -> Self {
+        Self::with_services(
+            pool,
+            Arc::new(GoogleJwksVerifier::new()),
+            Arc::new(DefaultModerationService::new()),
+        )
+    }
+
+    /// Like [`AppState::new`], with the external services injected (tests
+    /// use fakes that never touch the network).
+    pub fn with_services(
+        pool: PgPool,
+        google_verifier: Arc<dyn GoogleTokenVerifier>,
+        moderation: Arc<dyn ModerationService>,
+    ) -> Self {
         Self {
             started_at: Instant::now(),
             user_repo: Arc::new(UserRepositoryImpl::new(pool.clone())),
@@ -65,6 +107,18 @@ impl AppState {
             quota_repo: Arc::new(QuotaRepositoryImpl::new(pool.clone())),
             audit_repo: Arc::new(AuditRepositoryImpl::new(pool.clone())),
             admin_repo: Arc::new(AdminRepositoryImpl::new(pool.clone())),
+            security_repo: Arc::new(SecurityRepositoryImpl::new(pool.clone())),
+            billing_repo: Arc::new(BillingRepositoryImpl::new(pool.clone())),
+            announcement_repo: Arc::new(AnnouncementRepositoryImpl::new(pool.clone())),
+            release_note_repo: Arc::new(ReleaseNoteRepositoryImpl::new(pool.clone())),
+            moderation_repo: Arc::new(ModerationRepositoryImpl::new(pool.clone())),
+            tour_repo: Arc::new(TourRepositoryImpl::new(pool.clone())),
+            trash_repo: Arc::new(TrashRepositoryImpl::new(pool.clone())),
+            suggestion_repo: Arc::new(SuggestionRepositoryImpl::new(pool.clone())),
+            band_note_repo: Arc::new(BandNoteRepositoryImpl::new(pool.clone())),
+            pin_repo: Arc::new(PinRepositoryImpl::new(pool.clone())),
+            google_verifier,
+            moderation,
             db: pool,
         }
     }

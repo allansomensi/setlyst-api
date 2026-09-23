@@ -54,8 +54,7 @@ pub async fn list_notifications(
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = access.user_id();
 
-    let current_page = query.page.unwrap_or(1).max(1);
-    let per_page = query.per_page.unwrap_or(20).clamp(1, 100);
+    let (current_page, per_page) = crate::models::resolve_page(query.page, query.per_page, 20);
     let unread_only = query.unread_only.unwrap_or(false);
 
     debug!(%user_id, current_page, per_page, unread_only, "Processing request to list notifications");

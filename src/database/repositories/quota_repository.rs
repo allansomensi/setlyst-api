@@ -30,7 +30,9 @@ pub trait QuotaRepository: Send + Sync {
         actor_id: Uuid,
     ) -> Result<(), ApiError>;
     /// The limits that apply to `user_id`, or `None` when they are exempt
-    /// (admins, or the per-user `unlimited` flag).
+    /// (admins, or the per-user `unlimited` flag): the plan's limits when
+    /// plans are enforced (platform defaults without a plan), the platform
+    /// defaults otherwise, then the per-user overrides.
     async fn effective_limits(&self, user_id: Uuid) -> Result<Option<QuotaLimits>, ApiError>;
     /// Current usage for every per-user resource plus the effective
     /// per-band/per-setlist limits.
@@ -72,21 +74,21 @@ impl QuotaRepositoryImpl {
         // Each arm is a literal so sqlx accepts it (no runtime-built SQL).
         let query = match resource {
             QuotaResource::Songs => {
-                "SELECT COUNT(*) FROM songs WHERE user_id = $1 AND band_id IS NULL"
+                "SELECT COUNT(*) FROM songs WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL"
             }
             QuotaResource::Artists => {
-                "SELECT COUNT(*) FROM artists WHERE user_id = $1 AND band_id IS NULL"
+                "SELECT COUNT(*) FROM artists WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL"
             }
             QuotaResource::Setlists => {
-                "SELECT COUNT(*) FROM setlists WHERE user_id = $1 AND band_id IS NULL"
+                "SELECT COUNT(*) FROM setlists WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL"
             }
             QuotaResource::Gigs => {
-                "SELECT COUNT(*) FROM gigs WHERE user_id = $1 AND band_id IS NULL"
+                "SELECT COUNT(*) FROM gigs WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL"
             }
             QuotaResource::Tags => {
                 "SELECT COUNT(DISTINCT st.tag) FROM song_tags st
                  INNER JOIN songs s ON s.id = st.song_id
-                 WHERE s.user_id = $1 AND s.band_id IS NULL"
+                 WHERE s.user_id = $1 AND s.band_id IS NULL AND s.deleted_at IS NULL"
             }
             QuotaResource::BandsOwned => {
                 "SELECT COUNT(*) FROM band_members WHERE user_id = $1 AND role = 'owner'"
@@ -95,12 +97,26 @@ impl QuotaRepositoryImpl {
                 "SELECT COUNT(*) FROM band_members WHERE user_id = $1"
             }
             QuotaResource::BandMembers => "SELECT COUNT(*) FROM band_members WHERE band_id = $1",
-            QuotaResource::BandSetlists => "SELECT COUNT(*) FROM setlists WHERE band_id = $1",
-            QuotaResource::BandGigs => "SELECT COUNT(*) FROM gigs WHERE band_id = $1",
-            QuotaResource::BandSongs => "SELECT COUNT(*) FROM songs WHERE band_id = $1",
+            QuotaResource::BandSetlists => {
+                "SELECT COUNT(*) FROM setlists WHERE band_id = $1 AND deleted_at IS NULL AND NOT is_repertoire"
+            }
+            QuotaResource::BandGigs => {
+                "SELECT COUNT(*) FROM gigs WHERE band_id = $1 AND deleted_at IS NULL"
+            }
+            QuotaResource::BandSongs => {
+                "SELECT COUNT(*) FROM songs WHERE band_id = $1 AND deleted_at IS NULL"
+            }
             QuotaResource::SetlistItems => {
-                "SELECT (SELECT COUNT(*) FROM setlist_songs WHERE setlist_id = $1)
+                "SELECT (SELECT COUNT(*) FROM setlist_songs ss
+                         INNER JOIN songs s ON s.id = ss.song_id
+                         WHERE ss.setlist_id = $1 AND s.deleted_at IS NULL)
                       + (SELECT COUNT(*) FROM setlist_markers WHERE setlist_id = $1)"
+            }
+            QuotaResource::Tours => {
+                "SELECT COUNT(*) FROM tours WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL"
+            }
+            QuotaResource::BandTours => {
+                "SELECT COUNT(*) FROM tours WHERE band_id = $1 AND deleted_at IS NULL"
             }
         };
 
@@ -239,8 +255,19 @@ impl QuotaRepository for QuotaRepositoryImpl {
             return Ok(None);
         }
 
-        let defaults = self.get_defaults().await?;
-        Ok(Some(defaults.with_overrides(&settings.overrides)))
+        // With plans enforced, the plan's limits replace the platform
+        // defaults (accounts without a plan keep the defaults); per-user
+        // overrides apply on top either way.
+        let billing = super::billing_repository::load_settings(&self.db).await?;
+        let base = if billing.enforced {
+            match super::billing_repository::load_effective_plan(&self.db, user_id).await? {
+                Some(plan) => plan.limits,
+                None => self.get_defaults().await?,
+            }
+        } else {
+            self.get_defaults().await?
+        };
+        Ok(Some(base.with_overrides(&settings.overrides)))
     }
 
     async fn report(&self, user_id: Uuid) -> Result<QuotaReport, ApiError> {
@@ -332,7 +359,7 @@ impl QuotaRepository for QuotaRepositoryImpl {
              WHERE NOT EXISTS (
                 SELECT 1 FROM song_tags st
                 INNER JOIN songs s ON s.id = st.song_id
-                WHERE s.user_id = $1 AND s.band_id IS NULL AND st.tag = t.tag
+                WHERE s.user_id = $1 AND s.band_id IS NULL AND s.deleted_at IS NULL AND st.tag = t.tag
              )",
         )
         .bind(user_id)

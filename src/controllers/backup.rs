@@ -16,9 +16,11 @@ use tracing::{debug, error, info};
     path = "/api/v1/backup/export",
     tags = ["Backup"],
     summary = "Export a full data backup.",
-    description = "Returns a downloadable JSON file containing all artists, songs, and \
-                   setlists belonging to the authenticated user. The file can be used to \
-                   restore data into any account via the import endpoint.",
+    description = "Returns a downloadable JSON file (format version 2) containing the \
+                   authenticated user's personal artists, songs (with energy, time signature, \
+                   capo, tuning, performance notes and links), setlists (with links), gigs and \
+                   tours. Items in the trash are left out. The file can be used to restore \
+                   data into any account via the import endpoint.",
     security(("jwt_token" = [])),
     responses(
         (status = 200, description = "Backup file generated successfully.",
@@ -81,10 +83,13 @@ pub async fn export_backup(
                    **Merge rules:**\n\
                    - Artists already present under the same name are reused, not duplicated.\n\
                    - Songs already present with the same title and artist are reused.\n\
-                   - Setlists are always created as new entries.\n\
+                   - Setlists, gigs and tours are always created as new entries.\n\
                    - Song positions inside setlists are preserved exactly.\n\n\
-                   The entire operation is atomic — a failure at any step leaves the \
-                   account completely unchanged.",
+                   Version 1 and 2 files are accepted. Everything is validated first \
+                   (lengths, ranges, links — `INVALID_LINK`), and every quota is enforced, \
+                   including the per-setlist item limit and tours (`QUOTA_EXCEEDED`). The \
+                   entire operation is atomic — a failure at any step leaves the account \
+                   completely unchanged.",
     request_body = BackupFile,
     security(("jwt_token" = [])),
     responses(
@@ -122,6 +127,7 @@ pub async fn import_backup(
                 songs_imported = summary.songs_imported,
                 setlists_imported = summary.setlists_imported,
                 gigs_imported = summary.gigs_imported,
+                tours_imported = summary.tours_imported,
                 "Backup imported successfully"
             );
             Ok((StatusCode::CREATED, Json(summary)))

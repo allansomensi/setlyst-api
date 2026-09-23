@@ -1,0 +1,859 @@
+//! Plans, subscriptions, promo codes, promotions, referrals and credits.
+
+use crate::{
+    models::{quota::QuotaLimits, user_preferences::SUPPORTED_LANGUAGES},
+    services::entitlements::Feature,
+};
+use chrono::NaiveDateTime;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sqlx::{FromRow, Type};
+use std::{borrow::Cow, collections::BTreeMap};
+use utoipa::{IntoParams, ToSchema};
+use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+/// Platform-setting key of [`BillingSettings`].
+pub const BILLING_SETTINGS_KEY: &str = "billing";
+
+fn error(code: &'static str, message: impl Into<String>) -> ValidationError {
+    let mut error = ValidationError::new(code);
+    error.message = Some(Cow::from(message.into()));
+    error
+}
+
+/// A localized text map `{"en": ..., "pt-BR": ..., "es": ...}`: only
+/// supported locales, `required` ones present, every value `min..=max`
+/// characters after trimming.
+pub fn validate_localized_map(
+    value: &Value,
+    required: &[&str],
+    min: usize,
+    max: usize,
+) -> Result<(), ValidationError> {
+    let Some(map) = value.as_object() else {
+        return Err(error(
+            "invalid_localized_text",
+            "Must be an object keyed by locale.",
+        ));
+    };
+    for (locale, text) in map {
+        if !SUPPORTED_LANGUAGES.contains(&locale.as_str()) {
+            return Err(error(
+                "invalid_localized_text",
+                format!("Unsupported locale '{locale}'."),
+            ));
+        }
+        let Some(text) = text.as_str() else {
+            return Err(error("invalid_localized_text", "Values must be strings."));
+        };
+        let len = text.trim().chars().count();
+        if len < min || len > max {
+            return Err(error(
+                "invalid_localized_text",
+                format!("Each text must have between {min} and {max} characters."),
+            ));
+        }
+    }
+    for locale in required {
+        if !map.contains_key(*locale) {
+            return Err(error(
+                "invalid_localized_text",
+                format!("The '{locale}' text is required."),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Trims every value of a localized map (after validation).
+pub fn trim_localized(value: &Value) -> Value {
+    match value.as_object() {
+        Some(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        Value::String(v.as_str().unwrap_or_default().trim().to_string()),
+                    )
+                })
+                .collect(),
+        ),
+        None => value.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema, Validate)]
+#[serde(default)]
+pub struct ReferralSettings {
+    pub enabled: bool,
+    #[validate(range(min = 0, max = 100_000))]
+    pub referrer_credits: i32,
+    #[validate(range(min = 0, max = 100_000))]
+    pub referred_credits: i32,
+    /// Rewarded referrals per referrer per calendar month.
+    #[validate(range(min = 0, max = 10_000))]
+    pub max_rewarded_per_month: i64,
+}
+
+impl Default for ReferralSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            referrer_credits: 50,
+            referred_credits: 20,
+            max_rewarded_per_month: 20,
+        }
+    }
+}
+
+/// Plan time that can be bought with credits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema, Validate)]
+pub struct Reward {
+    #[validate(length(min = 1, max = 40))]
+    pub id: String,
+    #[validate(length(min = 1, max = 32))]
+    pub plan: String,
+    #[validate(range(min = 1, max = 3650))]
+    pub days: i64,
+    #[validate(range(min = 1, max = 100_000))]
+    pub cost: i32,
+}
+
+/// Platform billing configuration (`platform_settings.billing`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema, Validate)]
+#[serde(default)]
+pub struct BillingSettings {
+    /// While `false`, every account has every feature and the platform
+    /// default quotas apply.
+    pub enforced: bool,
+    #[validate(range(min = 0, max = 365))]
+    pub trial_days: i64,
+    #[validate(length(min = 1, max = 32))]
+    pub trial_plan: String,
+    #[validate(nested)]
+    pub referral: ReferralSettings,
+    #[validate(nested, length(max = 20))]
+    pub rewards: Vec<Reward>,
+}
+
+impl Default for BillingSettings {
+    fn default() -> Self {
+        Self {
+            enforced: false,
+            trial_days: 30,
+            trial_plan: "pro".into(),
+            referral: ReferralSettings::default(),
+            rewards: vec![
+                Reward {
+                    id: "intermediate_30d".into(),
+                    plan: "intermediate".into(),
+                    days: 30,
+                    cost: 80,
+                },
+                Reward {
+                    id: "pro_30d".into(),
+                    plan: "pro".into(),
+                    days: 30,
+                    cost: 120,
+                },
+            ],
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Plans
+// ---------------------------------------------------------------------
+
+/// The flags of every known feature, missing keys as `false`.
+pub fn normalize_features(stored: &Value) -> BTreeMap<String, bool> {
+    Feature::ALL
+        .iter()
+        .map(|f| {
+            (
+                f.key().to_string(),
+                stored
+                    .get(f.key())
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            )
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct PlanRow {
+    pub code: String,
+    pub name: Value,
+    pub description: Value,
+    pub price_monthly_cents: i32,
+    pub price_yearly_cents: i32,
+    pub currency: String,
+    pub limits: Value,
+    pub features: Value,
+    pub highlighted: bool,
+    pub is_public: bool,
+    pub sort_order: i32,
+    pub updated_at: NaiveDateTime,
+}
+
+/// A plan.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct Plan {
+    pub code: String,
+    /// Localized: `{"en": ..., "pt-BR": ..., "es": ...}`.
+    pub name: Value,
+    pub description: Value,
+    pub price_monthly_cents: i32,
+    pub price_yearly_cents: i32,
+    pub currency: String,
+    pub limits: QuotaLimits,
+    /// Every known feature, `true` when included.
+    pub features: BTreeMap<String, bool>,
+    pub highlighted: bool,
+    pub is_public: bool,
+    pub sort_order: i32,
+    pub updated_at: NaiveDateTime,
+}
+
+impl From<PlanRow> for Plan {
+    fn from(row: PlanRow) -> Self {
+        Self {
+            code: row.code,
+            name: row.name,
+            description: row.description,
+            price_monthly_cents: row.price_monthly_cents,
+            price_yearly_cents: row.price_yearly_cents,
+            currency: row.currency,
+            limits: serde_json::from_value(row.limits).unwrap_or_default(),
+            features: normalize_features(&row.features),
+            highlighted: row.highlighted,
+            is_public: row.is_public,
+            sort_order: row.sort_order,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
+impl Plan {
+    pub fn has(&self, feature: Feature) -> bool {
+        self.features.get(feature.key()).copied().unwrap_or(false)
+    }
+}
+
+/// The promotion shown next to a plan on the pricing page.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, FromRow)]
+pub struct PlanPromotion {
+    pub id: Uuid,
+    /// Localized headline map.
+    pub headline: Value,
+    pub discount_percent: i32,
+    pub ends_at: NaiveDateTime,
+}
+
+/// A plan as listed publicly (`GET /public/plans`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PublicPlan {
+    pub code: String,
+    pub name: Value,
+    pub description: Value,
+    pub price_monthly_cents: i32,
+    pub price_yearly_cents: i32,
+    pub currency: String,
+    pub limits: QuotaLimits,
+    pub features: BTreeMap<String, bool>,
+    pub highlighted: bool,
+    pub sort_order: i32,
+    /// The best active promotion for this plan, if any.
+    pub promotion: Option<PlanPromotion>,
+}
+
+fn validate_plan_code(code: &str) -> Result<(), ValidationError> {
+    let valid = (2..=32).contains(&code.len())
+        && code.starts_with(|c: char| c.is_ascii_lowercase())
+        && code
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && !matches!(code, "none" | "trial");
+    if valid {
+        Ok(())
+    } else {
+        Err(error(
+            "invalid_plan_code",
+            "Plan codes use 2 to 32 lower-case letters, digits and underscores ('none' and 'trial' are reserved).",
+        ))
+    }
+}
+
+pub fn check_plan_code(code: &str) -> Result<(), ValidationError> {
+    validate_plan_code(code)
+}
+
+fn validate_plan_name(value: &Value) -> Result<(), ValidationError> {
+    validate_localized_map(value, &["en", "pt-BR"], 1, 60)
+}
+
+fn validate_plan_description(value: &Value) -> Result<(), ValidationError> {
+    validate_localized_map(value, &[], 0, 400)
+}
+
+fn validate_feature_map(value: &BTreeMap<String, bool>) -> Result<(), ValidationError> {
+    for key in value.keys() {
+        if !Feature::ALL.iter().any(|f| f.key() == key) {
+            return Err(error(
+                "unknown_feature",
+                format!("Unknown feature '{key}'."),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_currency(value: &str) -> Result<(), ValidationError> {
+    if value.len() == 3 && value.chars().all(|c| c.is_ascii_uppercase()) {
+        Ok(())
+    } else {
+        Err(error(
+            "invalid_currency",
+            "Currency must be an ISO 4217 code.",
+        ))
+    }
+}
+
+/// Body of `PUT /admin/plans/{code}`. Omitted fields keep their value; a
+/// new plan needs at least `name`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Validate)]
+pub struct UpsertPlanPayload {
+    #[validate(custom(function = "validate_plan_name"))]
+    pub name: Option<Value>,
+    #[validate(custom(function = "validate_plan_description"))]
+    pub description: Option<Value>,
+    #[validate(range(min = 0, max = 100_000_000))]
+    pub price_monthly_cents: Option<i32>,
+    #[validate(range(min = 0, max = 1_000_000_000))]
+    pub price_yearly_cents: Option<i32>,
+    #[validate(custom(function = "validate_currency"))]
+    pub currency: Option<String>,
+    #[validate(nested)]
+    pub limits: Option<QuotaLimits>,
+    #[validate(custom(function = "validate_feature_map"))]
+    pub features: Option<BTreeMap<String, bool>>,
+    pub highlighted: Option<bool>,
+    pub is_public: Option<bool>,
+    #[validate(range(min = -10_000, max = 10_000))]
+    pub sort_order: Option<i32>,
+}
+
+// ---------------------------------------------------------------------
+// Subscriptions
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "subscription_status", rename_all = "snake_case")]
+pub enum SubscriptionStatus {
+    Trialing,
+    Active,
+    PastDue,
+    Canceled,
+    Expired,
+}
+
+impl SubscriptionStatus {
+    pub fn key(&self) -> &'static str {
+        match self {
+            SubscriptionStatus::Trialing => "trialing",
+            SubscriptionStatus::Active => "active",
+            SubscriptionStatus::PastDue => "past_due",
+            SubscriptionStatus::Canceled => "canceled",
+            SubscriptionStatus::Expired => "expired",
+        }
+    }
+
+    /// Statuses that grant the plan (until the period ends).
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self,
+            SubscriptionStatus::Trialing | SubscriptionStatus::Active | SubscriptionStatus::PastDue
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "subscription_source", rename_all = "snake_case")]
+pub enum SubscriptionSource {
+    Trial,
+    Admin,
+    PromoCode,
+    Credits,
+    Referral,
+    Payment,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize, ToSchema)]
+pub struct Subscription {
+    pub plan_code: String,
+    pub status: SubscriptionStatus,
+    pub source: SubscriptionSource,
+    pub started_at: NaiveDateTime,
+    /// `None` = open-ended.
+    pub current_period_end: Option<NaiveDateTime>,
+    pub trial_ends_at: Option<NaiveDateTime>,
+    pub cancel_at_period_end: bool,
+}
+
+impl Subscription {
+    /// `true` while the subscription grants its plan at `now`.
+    pub fn is_effective(&self, now: NaiveDateTime) -> bool {
+        self.status.is_live() && self.current_period_end.is_none_or(|end| end > now)
+    }
+}
+
+/// One change in a subscription's history.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize, ToSchema)]
+pub struct SubscriptionEvent {
+    pub id: Uuid,
+    pub kind: String,
+    pub from_plan: Option<String>,
+    pub to_plan: Option<String>,
+    pub from_status: Option<SubscriptionStatus>,
+    pub to_status: Option<SubscriptionStatus>,
+    pub data: Value,
+    pub actor_username: Option<String>,
+    pub created_at: NaiveDateTime,
+}
+
+// ---------------------------------------------------------------------
+// The caller's billing (`GET /billing/me`)
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreditsSummary {
+    pub balance: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReferralSummary {
+    pub code: Option<String>,
+    /// `/register?ref=CODE`.
+    pub link_path: Option<String>,
+    pub rewarded_count: i64,
+    pub pending_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BillingMe {
+    pub enforced: bool,
+    /// The plan in effect, if any.
+    pub plan: Option<Plan>,
+    pub subscription: Option<Subscription>,
+    /// What the caller may use right now.
+    pub features: BTreeMap<String, bool>,
+    pub credits: CreditsSummary,
+    pub referral: ReferralSummary,
+    pub rewards: Vec<Reward>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Validate)]
+pub struct RedeemCodePayload {
+    #[validate(length(min = 1, max = 32))]
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "promo_kind", rename_all = "snake_case")]
+pub enum PromoKind {
+    PlanGrant,
+    TrialExtension,
+    Credits,
+    Discount,
+}
+
+/// What a redeemed promo code did.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RedemptionSummary {
+    pub kind: PromoKind,
+    pub plan_code: Option<String>,
+    pub days: Option<i32>,
+    pub credits: Option<i32>,
+    /// For `discount` codes: applied to the next payment, not now.
+    pub discount_percent: Option<i32>,
+}
+
+/// Answer of `POST /billing/redeem`: the updated billing state plus what
+/// the code did.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RedeemResponse {
+    #[serde(flatten)]
+    pub billing: BillingMe,
+    pub redemption: RedemptionSummary,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize, ToSchema)]
+pub struct CreditEntry {
+    pub id: Uuid,
+    pub amount: i32,
+    pub reason: String,
+    pub note: Option<String>,
+    pub created_at: NaiveDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Validate)]
+pub struct RedeemRewardPayload {
+    #[validate(length(min = 1, max = 40))]
+    pub reward_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "referral_status", rename_all = "snake_case")]
+pub enum ReferralStatus {
+    Pending,
+    Rewarded,
+    Rejected,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize, ToSchema)]
+pub struct ReferralEntry {
+    pub username: String,
+    pub status: ReferralStatus,
+    pub created_at: NaiveDateTime,
+    pub rewarded_at: Option<NaiveDateTime>,
+}
+
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct BillingPageQuery {
+    pub page: Option<i64>,
+    pub per_page: Option<i64>,
+}
+
+// ---------------------------------------------------------------------
+// Staff
+// ---------------------------------------------------------------------
+
+/// `GET /admin/users/{id}/subscription`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminSubscriptionView {
+    pub subscription: Option<Subscription>,
+    pub events: Vec<SubscriptionEvent>,
+    pub credits_balance: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Validate)]
+pub struct GrantSubscriptionPayload {
+    #[validate(length(min = 1, max = 32))]
+    pub plan_code: String,
+    /// `null` = open-ended.
+    #[validate(range(min = 1, max = 3650))]
+    pub days: Option<i64>,
+    #[validate(length(max = 500))]
+    pub note: Option<String>,
+}
+
+fn validate_credit_amount(amount: i32) -> Result<(), ValidationError> {
+    if amount != 0 && (-100_000..=100_000).contains(&amount) {
+        Ok(())
+    } else {
+        Err(error(
+            "invalid_amount",
+            "Amount must be between -100000 and 100000 and not zero.",
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Validate)]
+pub struct AdjustCreditsPayload {
+    #[validate(custom(function = "validate_credit_amount"))]
+    pub amount: i32,
+    #[validate(length(min = 1, max = 255))]
+    pub note: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize, ToSchema)]
+pub struct PromoCode {
+    pub id: Uuid,
+    pub code: String,
+    pub description: Option<String>,
+    pub kind: PromoKind,
+    pub plan_code: Option<String>,
+    pub duration_days: Option<i32>,
+    pub credits: Option<i32>,
+    pub discount_percent: Option<i32>,
+    pub max_redemptions: Option<i32>,
+    pub redemptions_count: i32,
+    pub new_users_only: bool,
+    pub starts_at: Option<NaiveDateTime>,
+    pub expires_at: Option<NaiveDateTime>,
+    pub disabled_at: Option<NaiveDateTime>,
+    pub created_by_username: Option<String>,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
+fn validate_promo_code(code: &str) -> Result<(), ValidationError> {
+    let code = code.trim();
+    if (4..=32).contains(&code.len())
+        && code
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        Ok(())
+    } else {
+        Err(error(
+            "invalid_promo_code",
+            "Codes have 4 to 32 letters, digits, '-' or '_'.",
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Validate)]
+pub struct CreatePromoCodePayload {
+    /// Generated when omitted. Stored upper-case.
+    #[validate(custom(function = "validate_promo_code"))]
+    pub code: Option<String>,
+    #[validate(length(max = 255))]
+    pub description: Option<String>,
+    pub kind: PromoKind,
+    /// `plan_grant` only.
+    #[validate(length(min = 1, max = 32))]
+    pub plan_code: Option<String>,
+    /// `plan_grant` and `trial_extension`.
+    #[validate(range(min = 1, max = 3650))]
+    pub duration_days: Option<i32>,
+    /// `credits` only.
+    #[validate(range(min = 1, max = 100_000))]
+    pub credits: Option<i32>,
+    /// `discount` only.
+    #[validate(range(min = 1, max = 100))]
+    pub discount_percent: Option<i32>,
+    #[validate(range(min = 1, max = 1_000_000))]
+    pub max_redemptions: Option<i32>,
+    #[serde(default)]
+    pub new_users_only: bool,
+    pub starts_at: Option<NaiveDateTime>,
+    pub expires_at: Option<NaiveDateTime>,
+}
+
+impl CreatePromoCodePayload {
+    /// Checks that exactly the fields of `kind` are present.
+    pub fn check_kind_fields(&self) -> Result<(), String> {
+        let (plan, days, credits, discount) = match self.kind {
+            PromoKind::PlanGrant => (true, true, false, false),
+            PromoKind::TrialExtension => (false, true, false, false),
+            PromoKind::Credits => (false, false, true, false),
+            PromoKind::Discount => (false, false, false, true),
+        };
+        let checks = [
+            ("plan_code", plan, self.plan_code.is_some()),
+            ("duration_days", days, self.duration_days.is_some()),
+            ("credits", credits, self.credits.is_some()),
+            (
+                "discount_percent",
+                discount,
+                self.discount_percent.is_some(),
+            ),
+        ];
+        for (field, required, present) in checks {
+            if required && !present {
+                return Err(format!("'{field}' is required for this kind of code."));
+            }
+            if !required && present {
+                return Err(format!("'{field}' does not apply to this kind of code."));
+            }
+        }
+        if let (Some(start), Some(end)) = (self.starts_at, self.expires_at)
+            && end <= start
+        {
+            return Err("'expires_at' must be after 'starts_at'.".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, Validate)]
+pub struct UpdatePromoCodePayload {
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    #[schema(value_type = Option<String>)]
+    pub description: Option<Option<String>>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    #[schema(value_type = Option<NaiveDateTime>)]
+    pub expires_at: Option<Option<NaiveDateTime>>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    #[schema(value_type = Option<i32>)]
+    pub max_redemptions: Option<Option<i32>>,
+    pub disabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize, ToSchema)]
+pub struct PromoRedemption {
+    pub user_id: Uuid,
+    pub username: String,
+    pub redeemed_at: NaiveDateTime,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize, ToSchema)]
+pub struct Promotion {
+    pub id: Uuid,
+    pub name: String,
+    pub headline: Value,
+    /// `None` = every paid plan.
+    pub plan_code: Option<String>,
+    pub discount_percent: i32,
+    pub starts_at: NaiveDateTime,
+    pub ends_at: NaiveDateTime,
+    pub active: bool,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
+fn validate_headline(value: &Value) -> Result<(), ValidationError> {
+    validate_localized_map(value, &[], 1, 120)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Validate)]
+pub struct CreatePromotionPayload {
+    #[validate(length(min = 1, max = 80))]
+    pub name: String,
+    #[validate(custom(function = "validate_headline"))]
+    pub headline: Value,
+    #[validate(length(min = 1, max = 32))]
+    pub plan_code: Option<String>,
+    #[validate(range(min = 1, max = 100))]
+    pub discount_percent: i32,
+    pub starts_at: NaiveDateTime,
+    pub ends_at: NaiveDateTime,
+    pub active: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, Validate)]
+pub struct UpdatePromotionPayload {
+    #[validate(length(min = 1, max = 80))]
+    pub name: Option<String>,
+    #[validate(custom(function = "validate_headline"))]
+    pub headline: Option<Value>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    #[schema(value_type = Option<String>)]
+    pub plan_code: Option<Option<String>>,
+    #[validate(range(min = 1, max = 100))]
+    pub discount_percent: Option<i32>,
+    pub starts_at: Option<NaiveDateTime>,
+    pub ends_at: Option<NaiveDateTime>,
+    pub active: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Validate)]
+pub struct GrantTrialsPayload {
+    #[validate(range(min = 1, max = 365))]
+    pub days: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GrantTrialsResponse {
+    pub granted: i64,
+}
+
+/// `GET /admin/billing/overview`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BillingOverview {
+    pub enforced: bool,
+    /// Subscriptions per status.
+    pub by_status: BTreeMap<String, i64>,
+    /// Subscriptions currently granting each plan.
+    pub by_plan: BTreeMap<String, i64>,
+    pub accounts_without_subscription: i64,
+    /// Credits ever granted (positive ledger entries).
+    pub credits_issued: i64,
+    /// Credits ever spent or removed (negative entries, as a positive number).
+    pub credits_spent: i64,
+    pub promo_redemptions_last_30_days: i64,
+    pub referrals_rewarded: i64,
+}
+
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct PromoListQuery {
+    pub page: Option<i64>,
+    pub per_page: Option<i64>,
+    /// Case-insensitive search over code and description.
+    pub q: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn settings_default_and_partial_json() {
+        let settings: BillingSettings =
+            serde_json::from_value(json!({ "enforced": true })).unwrap();
+        assert!(settings.enforced);
+        assert_eq!(settings.trial_days, 30);
+        assert_eq!(settings.rewards.len(), 2);
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn localized_maps_are_validated() {
+        assert!(
+            validate_localized_map(
+                &json!({"en": "Pro", "pt-BR": "Pro"}),
+                &["en", "pt-BR"],
+                1,
+                10
+            )
+            .is_ok()
+        );
+        assert!(validate_localized_map(&json!({"en": "Pro"}), &["en", "pt-BR"], 1, 10).is_err());
+        assert!(validate_localized_map(&json!({"fr": "Pro"}), &[], 1, 10).is_err());
+        assert!(validate_localized_map(&json!({"en": 1}), &[], 1, 10).is_err());
+        assert!(validate_localized_map(&json!("x"), &[], 1, 10).is_err());
+    }
+
+    #[test]
+    fn promo_kinds_require_their_fields() {
+        let mut payload = CreatePromoCodePayload {
+            code: None,
+            description: None,
+            kind: PromoKind::Credits,
+            plan_code: None,
+            duration_days: None,
+            credits: Some(10),
+            discount_percent: None,
+            max_redemptions: None,
+            new_users_only: false,
+            starts_at: None,
+            expires_at: None,
+        };
+        assert!(payload.check_kind_fields().is_ok());
+        payload.duration_days = Some(3);
+        assert!(payload.check_kind_fields().is_err());
+        payload.kind = PromoKind::PlanGrant;
+        payload.credits = None;
+        assert!(payload.check_kind_fields().is_err());
+        payload.plan_code = Some("pro".into());
+        assert!(payload.check_kind_fields().is_ok());
+    }
+
+    #[test]
+    fn plan_codes_and_features() {
+        assert!(check_plan_code("pro").is_ok());
+        assert!(check_plan_code("none").is_err());
+        assert!(check_plan_code("Pro").is_err());
+        let features = normalize_features(&json!({ "tours": true, "bogus": true }));
+        assert_eq!(features.len(), Feature::ALL.len());
+        assert!(features["tours"]);
+        assert!(!features["create_bands"]);
+        let mut map = BTreeMap::new();
+        map.insert("bogus".to_string(), true);
+        assert!(validate_feature_map(&map).is_err());
+    }
+}

@@ -9,18 +9,24 @@ use crate::{
             ImpersonationResponse,
             access::{AccessControl, ClientIp},
         },
+        moderation::{ModerationSource, ModerationTarget, NewFlag},
         notification::Notification,
         quota::{QuotaReport, UpdateUserQuotaPayload, UserQuotaSettings},
         user::{
             AdminResetPasswordPayload, BanUserPayload, ChangePasswordPayload,
-            ChangePasswordResponse, CreateUserPayload, Role, Status, UpdateCurrentUserPayload,
-            UpdateUserPayload, UserListQuery, UserProfileView, UserPublic, UsernameAvailability,
-            UsernameHistoryEntry,
+            ChangePasswordResponse, CreateUserPayload, ProfileUpdate, ReportReason,
+            ReportUserPayload, Role, Status, UpdateCurrentUserPayload, UpdateUserPayload,
+            UserListQuery, UserProfileView, UserPublic, UsernameAvailability, UsernameHistoryEntry,
+            clearable, normalize_instruments,
         },
         user_preferences::{SUPPORTED_LANGUAGES, UpdatePreferencesPayload, UserPreferences},
     },
+    moderation,
+    services::{account::too_many_attempts, notifier::notify},
     utils::{hashing, jwt::generate_impersonation_jwt},
-    validations::{password::password_issues, username::validate_username},
+    validations::{
+        image_url::validate_image_url, password::password_issues, username::validate_username,
+    },
 };
 use axum::{
     Json,
@@ -30,7 +36,7 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use serde_json::json;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 use uuid::Uuid;
 use validator::Validate;
 
@@ -47,6 +53,25 @@ fn fallback_language_from_headers(headers: &HeaderMap) -> String {
         .filter(|locale| SUPPORTED_LANGUAGES.contains(locale))
         .unwrap_or("en")
         .to_string()
+}
+
+/// Fails with `EMAIL_TAKEN` when another account already uses `email`
+/// (case-insensitively). Blank values (clearing) always pass.
+async fn ensure_email_free(
+    state: &AppState,
+    email: Option<&str>,
+    exclude: Option<Uuid>,
+) -> Result<(), ApiError> {
+    if let Some(email) = email.map(str::trim).filter(|e| !e.is_empty())
+        && state.user_repo.is_email_taken(email, exclude).await?
+    {
+        return Err(ApiError::rule(
+            StatusCode::CONFLICT,
+            codes::EMAIL_TAKEN,
+            "This e-mail address is already in use.",
+        ));
+    }
+    Ok(())
 }
 
 /// Loads the account a staff action targets, refusing when it's the
@@ -193,7 +218,7 @@ pub async fn get_user_overview(
     path = "/api/v1/users/{id}/profile",
     tags = ["Users"],
     summary = "View another user's profile.",
-    description = "Any authenticated user can view any other user's basic profile. Staff additionally see privileged details.",
+    description = "Any authenticated user can view any other user's public profile (avatar, bio, location, instruments, bands in common). Staff additionally see privileged details, including the number of open moderation flags.",
     security(("jwt_token" = [])),
     params(("id" = Uuid, Path, description = "User UUID")),
     responses(
@@ -212,7 +237,112 @@ pub async fn get_user_profile(
         .await?
         .ok_or(ApiError::NotFound)?;
 
-    Ok(Json(user.into_profile_view(access.is_staff())))
+    let is_self = id == access.user_id();
+    let bands_in_common = if is_self {
+        Vec::new()
+    } else {
+        state
+            .user_repo
+            .bands_in_common(access.user_id(), id)
+            .await?
+    };
+    let open_flags = if access.is_staff() {
+        state.moderation_repo.count_open_for_user(id).await?
+    } else {
+        0
+    };
+
+    Ok(Json(user.into_profile_view(
+        access.is_staff(),
+        is_self,
+        bands_in_common,
+        open_flags,
+    )))
+}
+
+/// Reports per reporter per 24 hours.
+const REPORTS_PER_DAY: i64 = 10;
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/users/{id}/report",
+    tags = ["Users"],
+    summary = "Report a profile to the moderators.",
+    description = "Raises a moderation flag (`source: report`). One open report per reporter and profile (`ALREADY_EXISTS`), at most 10 reports a day (`TOO_MANY_ATTEMPTS`). You can't report yourself (`CANNOT_TARGET_SELF`).",
+    security(("jwt_token" = [])),
+    params(("id" = Uuid, Path, description = "User UUID")),
+    request_body = ReportUserPayload,
+    responses(
+        (status = 201, description = "Report filed."),
+        (status = 404, description = "User not found"),
+        (status = 409, description = "Already reported."),
+        (status = 429, description = "Too many reports."),
+    )
+)]
+pub async fn report_user(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<ReportUserPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    payload.validate()?;
+    if id == access.user_id() {
+        return Err(ApiError::cannot_target_self("You can't report yourself."));
+    }
+    let target = state
+        .user_repo
+        .find_by_id(id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    let since = Utc::now().naive_utc() - Duration::hours(24);
+    if state
+        .moderation_repo
+        .count_reports_since(access.user_id(), since)
+        .await?
+        >= REPORTS_PER_DAY
+    {
+        return Err(too_many_attempts(3600));
+    }
+    if state
+        .moderation_repo
+        .has_open_report(access.user_id(), id)
+        .await?
+    {
+        return Err(ApiError::AlreadyExists);
+    }
+
+    let (target_type, value) = match payload.reason {
+        ReportReason::InappropriateAvatar => (
+            ModerationTarget::Avatar,
+            target.avatar_url.clone().unwrap_or_default(),
+        ),
+        ReportReason::OffensiveUsername => (ModerationTarget::Username, target.username.clone()),
+        _ => (ModerationTarget::Profile, target.username.clone()),
+    };
+    let flag_id = state
+        .moderation_repo
+        .create_report(&NewFlag {
+            target_type,
+            user_id: id,
+            band_id: None,
+            value,
+            reasons: vec!["user_report".into(), payload.reason.key().into()],
+            score: None,
+            details: json!({ "reason": payload.reason.key() }),
+            source: ModerationSource::Report,
+            reported_by: Some(access.user_id()),
+            report_note: payload
+                .details
+                .as_deref()
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .map(str::to_string),
+        })
+        .await?;
+
+    info!(reporter_id = %access.user_id(), target_user_id = %id, %flag_id, "Profile reported");
+    Ok((StatusCode::CREATED, Json(json!({ "id": flag_id }))))
 }
 
 #[utoipa::path(
@@ -281,6 +411,7 @@ pub async fn create_user(
 
     payload.validate()?;
     state.user_repo.is_unique(&payload.username, None).await?;
+    ensure_email_free(&state, payload.email.as_deref(), None).await?;
 
     let must_change = payload.require_password_change.unwrap_or(true);
     let new_user = state
@@ -375,19 +506,15 @@ pub async fn update_user(
         access
             .require_admin()
             .map_err(|_| ApiError::insufficient_role("Only admins can change platform roles."))?;
-
-        if target.role == Role::Admin && state.user_repo.count_active_admins().await? <= 1 {
-            return Err(ApiError::rule(
-                StatusCode::CONFLICT,
-                codes::LAST_ADMIN,
-                "The platform must keep at least one active admin.",
-            ));
-        }
+        // The "last active admin" rule is enforced inside the update's
+        // transaction (with the admin rows locked), so two concurrent
+        // demotions can't both pass.
     }
 
     if let Some(username) = &payload.username {
         state.user_repo.is_unique(username, Some(id)).await?;
     }
+    ensure_email_free(&state, payload.email.as_deref(), Some(id)).await?;
 
     state
         .user_repo
@@ -399,15 +526,16 @@ pub async fn update_user(
     if let Some(new_role) = &payload.role
         && *new_role != target.role
     {
-        let notification = Notification::platform_role_changed(
-            id,
-            target.role.clone(),
-            new_role.clone(),
-            access.user_id(),
-        );
-        if let Err(e) = state.notification_repo.create(&notification).await {
-            error!(target_user_id = %id, error = %e, "Failed to create role change notification");
-        }
+        notify(
+            &state,
+            Notification::platform_role_changed(
+                id,
+                target.role.clone(),
+                new_role.clone(),
+                access.user_id(),
+            ),
+        )
+        .await;
 
         AuditEvent::by(&access, actions::USER_ROLE_CHANGED)
             .target("user", id, label)
@@ -456,6 +584,10 @@ pub async fn update_user(
             .ip(&ip.0)
             .record(&*state.audit_repo)
             .await;
+    }
+
+    if let Some(username) = &payload.username {
+        moderation::spawn_username_review(&state, id, username.trim());
     }
 
     let updated = state
@@ -701,7 +833,15 @@ pub async fn impersonate_user(
         .await?
         .ok_or(ApiError::NotFound)?;
 
-    let (token, expires_at) = generate_impersonation_jwt(&account, access.user_id())?;
+    // Bound to the impersonator's current sessions: signing them out ends
+    // this "view as" session too.
+    let impersonator = state
+        .user_repo
+        .auth_state(access.user_id())
+        .await?
+        .ok_or_else(ApiError::session_revoked)?;
+    let (token, expires_at) =
+        generate_impersonation_jwt(&account, access.user_id(), impersonator.token_version)?;
 
     AuditEvent::by(&access, actions::USER_IMPERSONATED)
         .target("user", id, &account.username)
@@ -826,7 +966,7 @@ pub async fn get_current_user_quotas(
     path = "/api/v1/users/me",
     tags = ["Users"],
     summary = "Update current user profile",
-    description = "Username changes are limited to one every 90 days (`USERNAME_COOLDOWN`). Empty strings clear optional fields.",
+    description = "Username changes are limited to one every 90 days (`USERNAME_COOLDOWN`). Empty strings clear optional fields (`bio`, `location`, `avatar_url`, names); `instruments: []` clears the list. `avatar_url` must be an `https` image link (`INVALID_IMAGE_URL`) and is reviewed automatically. The e-mail can't be changed here (`BAD_REQUEST`): use `POST /users/me/email/change`.",
     request_body = UpdateCurrentUserPayload,
     security(("jwt_token" = [])),
     responses(
@@ -842,7 +982,17 @@ pub async fn update_current_user(
     let user_id = access.user_id();
     debug!(%user_id, "Processing request to update current user profile");
 
+    if payload.email.is_some() {
+        return Err(ApiError::BadRequest(
+            "Use the e-mail change flow (POST /users/me/email/change).".into(),
+        ));
+    }
     payload.validate()?;
+
+    let avatar_url = match clearable(&payload.avatar_url) {
+        Some(Some(url)) => Some(Some(validate_image_url(&url)?)),
+        other => other,
+    };
 
     if let Some(new_username) = &payload.username {
         state
@@ -876,14 +1026,43 @@ pub async fn update_current_user(
         }
     }
 
-    let payload = UpdateUserPayload::from(payload);
+    let account_fields = payload.account_fields();
     match state
         .user_repo
-        .update(user_id, &payload, Some(user_id))
+        .update(user_id, &account_fields, Some(user_id))
         .await
     {
         Ok(_) | Err(ApiError::NotModified) => {}
         Err(e) => return Err(e),
+    }
+
+    if payload.has_profile_fields() {
+        let previous_avatar = state
+            .user_repo
+            .find_by_id(user_id)
+            .await?
+            .and_then(|u| u.avatar_url);
+        state
+            .user_repo
+            .update_profile(
+                user_id,
+                &ProfileUpdate {
+                    bio: clearable(&payload.bio),
+                    location: clearable(&payload.location),
+                    instruments: payload.instruments.as_deref().map(normalize_instruments),
+                    avatar_url: avatar_url.clone(),
+                },
+            )
+            .await?;
+        if let Some(Some(url)) = &avatar_url
+            && previous_avatar.as_deref() != Some(url.as_str())
+        {
+            moderation::spawn_avatar_review(&state, user_id, url);
+        }
+    }
+
+    if let Some(username) = &payload.username {
+        moderation::spawn_username_review(&state, user_id, username.trim());
     }
 
     let user = state
@@ -966,7 +1145,17 @@ pub async fn change_current_user_password(
         .await?
         .ok_or(ApiError::NotFound)?;
 
-    hashing::verify_password(&payload.current_password, &user.password_hash)?;
+    // Accounts created through Google have no password to confirm; they
+    // set one through password recovery.
+    if !user.password_set {
+        return Err(ApiError::rule(
+            StatusCode::CONFLICT,
+            codes::PASSWORD_NOT_SET,
+            "This account has no password yet. Use password recovery to set one.",
+        ));
+    }
+
+    hashing::verify_password_async(&payload.current_password, &user.password_hash).await?;
 
     if payload.current_password == payload.new_password {
         return Err(ApiError::rule(
@@ -992,6 +1181,32 @@ pub async fn change_current_user_password(
         .ip(&ip.0)
         .record(&*state.audit_repo)
         .await;
+
+    if let Some(email) = user.email.clone() {
+        let locale = crate::services::account::user_locale(&state, user_id)
+            .await
+            .unwrap_or_else(|_| "en".into());
+        if let Err(e) = crate::email::enqueue(
+            &state.db,
+            &crate::email::OutgoingEmail {
+                user_id: Some(user_id),
+                to: email,
+                locale,
+                template: crate::email::EmailTemplate::PasswordChanged {
+                    username: user.username.clone(),
+                },
+            },
+        )
+        .await
+        {
+            tracing::error!(%user_id, error = %e, "Could not queue the password notice");
+        }
+    }
+    notify(
+        &state,
+        Notification::security_alert(user_id, "password_changed"),
+    )
+    .await;
 
     info!(%user_id, "Password changed; sessions revoked");
 

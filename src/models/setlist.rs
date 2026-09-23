@@ -5,6 +5,11 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 use validator::Validate;
 
+use super::{
+    link::{LinkInput, Links},
+    song::PublicSong,
+};
+
 #[derive(ToSchema, Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Setlist {
     pub id: Uuid,
@@ -38,8 +43,28 @@ pub struct Setlist {
     pub updated_by: Option<Uuid>,
     #[sqlx(default)]
     pub updated_by_username: Option<String>,
+    /// Reference links (a playlist, the charts folder...).
+    #[sqlx(json, default)]
+    pub links: Links,
+    /// `true` for a band's repertoire: the special setlist that collects
+    /// every song the band plays. It can't be deleted or renamed.
+    #[sqlx(default)]
+    pub is_repertoire: bool,
+    /// Whether the *caller* pinned this setlist to their home screen.
+    #[sqlx(default)]
+    pub is_pinned: bool,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
+}
+
+/// `POST /setlists/{id}/duplicate` answer: the new personal setlist plus
+/// how many band songs could not be copied into the caller's library
+/// (their song or artist quota was reached).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DuplicateSetlistResponse {
+    #[serde(flatten)]
+    pub setlist: Setlist,
+    pub skipped_band_songs: i64,
 }
 
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
@@ -51,6 +76,9 @@ pub struct CreateSetlistPayload {
     /// Optionally create the setlist under a band instead of personally.
     /// The caller must be a member of the band with permission to manage its setlists.
     pub band_id: Option<Uuid>,
+    /// At most 5 links to supported providers.
+    #[validate(length(max = 5, message = "At most 5 links are allowed."))]
+    pub links: Option<Vec<LinkInput>>,
 }
 
 #[derive(Deserialize, Serialize, ToSchema, Validate)]
@@ -61,6 +89,9 @@ pub struct UpdateSetlistPayload {
     #[serde(default, deserialize_with = "crate::models::patch::double_option")]
     #[validate(custom(function = "crate::validations::text::validate_description"))]
     pub description: Option<Option<String>>,
+    /// Absent = unchanged, `[]` = remove every link.
+    #[validate(length(max = 5, message = "At most 5 links are allowed."))]
+    pub links: Option<Vec<LinkInput>>,
 }
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
@@ -189,7 +220,11 @@ pub struct SetlistItemRef {
 
 #[derive(Debug, Deserialize, Serialize, ToSchema, Validate)]
 pub struct ReorderSetlistItemsPayload {
-    #[validate(length(min = 1, message = "The list of items cannot be empty."))]
+    #[validate(length(
+        min = 1,
+        max = 1000,
+        message = "The list of items must have between 1 and 1000 entries."
+    ))]
     pub items: Vec<SetlistItemRef>,
 }
 
@@ -216,6 +251,9 @@ impl Setlist {
             owner_username: None,
             updated_by: None,
             updated_by_username: None,
+            links: Links::default(),
+            is_repertoire: false,
+            is_pinned: false,
             created_at: now,
             updated_at: now,
         }
@@ -224,22 +262,46 @@ impl Setlist {
 
 #[derive(Debug, Deserialize, Serialize, ToSchema, Validate)]
 pub struct ReorderSetlistSongsPayload {
-    #[validate(length(min = 1, message = "The list of song IDs cannot be empty."))]
+    #[validate(length(
+        min = 1,
+        max = 1000,
+        message = "The list of song IDs must have between 1 and 1000 entries."
+    ))]
     pub song_ids: Vec<Uuid>,
 }
 
+/// A block header or break on the public share endpoints (no ids or
+/// timestamps).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PublicMarker {
+    pub marker_type: SetlistMarkerType,
+    pub label: Option<String>,
+    pub duration_minutes: Option<i32>,
+    pub position: i32,
+}
+
+impl From<SetlistMarker> for PublicMarker {
+    fn from(marker: SetlistMarker) -> Self {
+        Self {
+            marker_type: marker.marker_type,
+            label: marker.label,
+            duration_minutes: marker.duration_minutes,
+            position: marker.position,
+        }
+    }
+}
+
 /// The read-only shape returned by the public (unauthenticated) setlist
-/// endpoints. Deliberately excludes internal fields — `id`, `user_id`,
-/// `band_id`, `share_token` — that an anonymous viewer has no use for and
-/// that shouldn't be handed out to the internet.
+/// endpoints. Only what a viewer needs to follow the running order: no
+/// account, band or record identifiers, usernames, tags or timestamps.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PublicSetlist {
     pub title: String,
     pub description: Option<String>,
     pub total_duration: i32,
-    pub songs: Vec<crate::models::song::SongWithArtist>,
+    pub links: Links,
+    pub songs: Vec<PublicSong>,
     /// Block headers and breaks in the setlist's running order. Merge these
-    /// with `songs` by `position` to reconstruct the full timeline (see
-    /// `SetlistItem`), same as the authenticated `/items` endpoint.
-    pub markers: Vec<SetlistMarker>,
+    /// with `songs` by `position` to reconstruct the full timeline.
+    pub markers: Vec<PublicMarker>,
 }

@@ -30,7 +30,12 @@ Built with Rust for reliability and performance, using Axum, SQLx, and PostgreSQ
 - **PDF Export** — Generate printable setlist PDFs with optional title, duration, key, and BPM display; supports `en`, `pt-BR`, and `es` locales
 - **ChordPro Export** — Export all songs as a single `.cho` file compatible with ChordPro readers
 - **Backup & Restore** — Export/import a full portable JSON snapshot of all user data; atomic import with smart merge rules
-- **Rate Limiting** — IP-based rate limiting on auth routes and globally across all endpoints
+- **Account security** — Sign-in by username or e-mail, per-account lockout after repeated failures, two-factor authentication (TOTP, RFC 6238) with single-use recovery codes, e-mail verification and change by code, password recovery by e-mail, Google sign-in, self-service account deletion and consent tracking
+- **Transactional e-mail** — Localized (`en`, `pt-BR`, `es`) templates delivered through an outbox and a background worker (SMTP via `lettre`), with per-category communication preferences and one-click unsubscribe links
+- **Announcements & release notes** — Staff-published announcements (modal, banner, notification, e-mail) targeted by role, plan and language, and editable "What's new" notes
+- **Plans & billing** — Plans with feature flags and limits (enforced only when switched on), trials, promo codes, promotions, credits, referral rewards and complimentary grants
+- **Moderation** — Automatic checks of usernames, avatars and band logos (word list, blocked domains, optional image classification), user reports and a staff queue
+- **Rate Limiting** — Per-client-IP rate limiting (trusted-proxy aware) on sign-in, password recovery, Google sign-in and globally across all endpoints
 - **OpenAPI / Swagger UI** — Interactive API documentation available at `/swagger-ui`
 - **Structured Logging** — Console and optional rolling file logs with configurable levels via `RUST_LOG_CONSOLE` / `RUST_LOG_FILE`
 - **Graceful Shutdown** — Handles `SIGTERM` and `Ctrl+C` cleanly
@@ -80,7 +85,9 @@ cd setlyst-api
 cp .env.example .env
 ```
 
-Edit `.env` and set a secure `JWT_SECRET` (minimum 32 characters) and your database credentials.
+Edit `.env` and set a secure `JWT_SECRET` (minimum 32 characters), a `DATA_ENCRYPTION_KEY` (generate it with `openssl rand -base64 32`; the server won't start without one) and your database credentials.
+
+PDF export reads its fonts from `assets/fonts`. When the binary runs from another directory (a deployment, a service manager), point `ASSETS_DIR` at a copy of `assets`; missing fonts are logged as an error at startup.
 
 **3. Start the database**
 
@@ -127,6 +134,24 @@ Swagger UI: `http://127.0.0.1:8000/swagger-ui`
 | `RUST_LOG_CONSOLE` | Console log level | `info` |
 | `RUST_LOG_FILE` | File log level | `trace` |
 | `LOG_TO_FILE` | Enable rolling file logs | `false` |
+| `APP_BASE_URL` | Public web origin used in e-mail links | `http://localhost:3000` |
+| `DATA_ENCRYPTION_KEY` | **Required.** 32-byte key (base64) for AES-256-GCM encryption of secrets at rest (TOTP seeds). Generate with `openssl rand -base64 32` and never change it (stored 2FA secrets become unreadable). The server refuses to start without it | — |
+| `ALLOW_DERIVED_DATA_KEY` | Local development only: `true` derives the data key from `JWT_SECRET` when `DATA_ENCRYPTION_KEY` is unset (a warning is logged; rotating `JWT_SECRET` then breaks every 2FA account) | `false` |
+| `ASSETS_DIR` | Directory containing `fonts/` (Inter TTFs used by PDF export). Missing fonts are reported at startup | `./assets`, else the source tree's `assets` |
+| `PDF_FONTS_DIR` | Overrides the font directory itself (legacy; prefer `ASSETS_DIR`) | `<ASSETS_DIR>/fonts` |
+| `TRUSTED_PROXIES` | Comma-separated CIDRs whose `X-Forwarded-For` is trusted. Empty = forwarding headers are ignored | empty |
+| `INTERNAL_API_SECRET` | Shared secret the web server sends as `X-Setlyst-Internal`, with the visitor's address in `X-Setlyst-Client-IP` | — |
+| `GOOGLE_CLIENT_IDS` | Comma-separated OAuth client IDs accepted for Google sign-in. Empty = disabled | empty |
+| `SMTP_HOST` | SMTP server. When unset, e-mails are rendered and logged only | — |
+| `SMTP_PORT` | SMTP port | `587` / `465` / `25` by `SMTP_TLS` |
+| `SMTP_USERNAME` / `SMTP_PASSWORD` | SMTP credentials | — |
+| `SMTP_TLS` | `starttls`, `tls` or `none` | `starttls` |
+| `SMTP_FROM` | Sender, e.g. `Setlyst <no-reply@setlyst.app>` | `Setlyst <no-reply@setlyst.app>` |
+| `SMTP_REPLY_TO` | Optional reply-to address | — |
+| `EMAIL_WORKER_INTERVAL_SECS` | E-mail outbox polling interval | `10` |
+| `MODERATION_VISION_API_KEY` | Google Cloud Vision key for image classification. Unset = URL heuristics only | — |
+| `TRASH_RETENTION_DAYS` | Days before trashed items are purged | `30` |
+| `ENABLE_SWAGGER` | Serve `/swagger-ui` and `/api-docs/openapi.json` | `true` |
 | `TEST_DATABASE_URL` | PostgreSQL server used by the integration tests (tests are skipped when unset) | — |
 
 ---
@@ -139,7 +164,7 @@ Full interactive documentation is available via Swagger UI at `/swagger-ui` when
 
 | Tag | Base Path | Description |
 |---|---|---|
-| Auth | `/api/v1/auth` | Login, register, token verification |
+| Auth | `/api/v1/auth` | Login (password, 2FA, Google), register, password recovery, token verification |
 | Users | `/api/v1/users` | User management, profiles, preferences |
 | Artists | `/api/v1/artists` | Artist CRUD |
 | Songs | `/api/v1/songs` | Song CRUD, ChordPro export |
@@ -147,7 +172,11 @@ Full interactive documentation is available via Swagger UI at `/swagger-ui` when
 | Setlists | `/api/v1/setlists` | Setlist management, song ordering, PDF export |
 | Metrics | `/api/v1/metrics` | User and admin dashboard metrics |
 | Backup | `/api/v1/backup` | Data export and import |
-| Status | `/api/v1/status` | Database info |
+| Status | `/api/v1/status` | Health and version (details for staff at `/status/details`) |
+| Public | `/api/v1/public` | Legal version, plans, release notes, e-mail unsubscribe |
+| Billing | `/api/v1/billing` | The caller's plan, credits, promo codes and referrals |
+| Announcements | `/api/v1/announcements` | Announcements for the caller |
+| Admin | `/api/v1/admin` | Staff console (content, audit log, limits, announcements, release notes, plans, promo codes, moderation) |
 | Health | `/api/v1/health` | API health |
 | Migrations | `/api/v1/migrations` | Admin-only migration runner |
 

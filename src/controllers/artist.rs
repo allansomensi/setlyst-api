@@ -43,8 +43,7 @@ pub async fn find_all_artists(
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = access.user_id();
 
-    let current_page = pagination.page.unwrap_or(1).max(1);
-    let per_page = pagination.per_page.unwrap_or(20).clamp(1, 100);
+    let (current_page, per_page) = pagination.resolve();
 
     debug!(
         %user_id,
@@ -94,7 +93,7 @@ pub async fn find_all_artists(
     path = "/api/v1/artists/{id}",
     tags = ["Artists"],
     summary = "Get a specific artist by ID.",
-    description = "This endpoint retrieves an artist's details from the database using its ID.",
+    description = "Your own artists, and (read-only) the artists owned by a band you are a member of, like the band's songs.",
     params(
         ("id", description = "The unique identifier of the artist to retrieve.", example = Uuid::new_v4)
     ),
@@ -291,8 +290,8 @@ pub async fn update_artist(
     delete,
     path = "/api/v1/artists/{id}",
     tags = ["Artists"],
-    summary = "Delete an existing artist.",
-    description = "This endpoint deletes a specific artist from the database using its ID.",
+    summary = "Move an artist (and its songs) to the trash.",
+    description = "The artist and its songs are trashed together and restored together (`POST /trash/artist/{id}/restore`) until they are purged.",
     params(
         ("id" = Uuid, Path, description = "The ID of the artist to delete")
     ),
@@ -301,7 +300,7 @@ pub async fn update_artist(
         ("jwt_token" = [])
     ),
     responses(
-         (status = 204, description = "Artist deleted successfully"),
+         (status = 204, description = "Artist moved to the trash"),
          (status = 404, description = "Artist ID not found"),
          (status = 500, description = "An error occurred while deleting the artist")
      )
@@ -321,12 +320,13 @@ pub async fn delete_artist(
 
     state.artist_repo.exists(id, user_id).await?;
 
-    match state.artist_repo.delete(id).await {
-        Ok(_) => {
+    match state.artist_repo.trash(id, user_id).await {
+        Ok(songs) => {
             info!(
                 %user_id,
                 artist_id = %id,
-                "Artist deleted successfully"
+                songs,
+                "Artist moved to the trash"
             );
             Ok(StatusCode::NO_CONTENT)
         }

@@ -50,6 +50,28 @@ tower_governor = { version = "0.8", features = ["tracing"] }
 genpdf = "0.2.0"
 serde_json = "1.0.151"
 serde_urlencoded = "0.7"
+aes-gcm = "0.10"
+base64 = "0.22"
+hkdf = "0.12"
+hmac = "0.12"
+ipnet = "2"
+lettre = { version = "0.11", default-features = false, features = [
+    "builder",
+    "hostname",
+    "smtp-transport",
+    "tokio1",
+    "tokio1-rustls-tls",
+] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+rpassword = "7"
+sha1 = "0.10"
+sha2 = "0.10"
+subtle = "2.6"
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

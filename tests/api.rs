@@ -30,7 +30,7 @@ async fn registration_enforces_the_password_and_username_policies() {
             axum::http::Method::POST,
             "/auth/register",
             None,
-            Some(json!({ "username": "newbie", "password": "password" })),
+            Some(json!({ "username": "newbie", "email": "newbie@example.com", "accept_terms": true, "password": "password" })),
         )
         .await;
     assert_eq!(weak.status, StatusCode::BAD_REQUEST);
@@ -43,7 +43,7 @@ async fn registration_enforces_the_password_and_username_policies() {
             axum::http::Method::POST,
             "/auth/register",
             None,
-            Some(json!({ "username": "newbie", "password": "Newbie#2026" })),
+            Some(json!({ "username": "newbie", "email": "newbie@example.com", "accept_terms": true, "password": "Newbie#2026" })),
         )
         .await;
     assert_eq!(contains_username.code(), "WEAK_PASSWORD");
@@ -53,7 +53,7 @@ async fn registration_enforces_the_password_and_username_policies() {
             axum::http::Method::POST,
             "/auth/register",
             None,
-            Some(json!({ "username": "admin", "password": STRONG_PASSWORD })),
+            Some(json!({ "username": "admin", "email": "admin@example.com", "accept_terms": true, "password": STRONG_PASSWORD })),
         )
         .await;
     assert_eq!(reserved.status, StatusCode::BAD_REQUEST);
@@ -64,7 +64,7 @@ async fn registration_enforces_the_password_and_username_policies() {
             axum::http::Method::POST,
             "/auth/register",
             None,
-            Some(json!({ "username": "newbie", "password": STRONG_PASSWORD, "email": "" })),
+            Some(json!({ "username": "newbie", "password": STRONG_PASSWORD, "email": "newbie@example.com", "accept_terms": true })),
         )
         .await;
     assert_eq!(ok.status, StatusCode::CREATED, "{}", ok.body);
@@ -75,7 +75,7 @@ async fn registration_enforces_the_password_and_username_policies() {
             axum::http::Method::POST,
             "/auth/register",
             None,
-            Some(json!({ "username": "NEWBIE", "password": STRONG_PASSWORD })),
+            Some(json!({ "username": "NEWBIE", "email": "other@example.com", "accept_terms": true, "password": STRONG_PASSWORD })),
         )
         .await;
     assert_eq!(duplicate.status, StatusCode::CONFLICT);
@@ -757,7 +757,11 @@ async fn status_reports_health_version_and_database() {
         Some("operational" | "degraded")
     ));
     assert_eq!(status.body["version"], env!("CARGO_PKG_VERSION"));
-    assert!(status.body["dependencies"]["database"]["latency_ms"].is_number());
+    // Infrastructure details are staff-only (v0.12).
+    assert!(status.body.get("dependencies").is_none());
+    let (_, staff) = app.user("status.mod", Role::Moderator).await;
+    let details = app.get("/status/details", &staff).await;
+    assert!(details.body["dependencies"]["database"]["latency_ms"].is_number());
 }
 
 #[tokio::test]

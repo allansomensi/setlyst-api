@@ -63,14 +63,14 @@ impl MetricsRepository for MetricsRepositoryImpl {
     async fn get_user_metrics(&self, user_id: Uuid) -> Result<UserMetrics, ApiError> {
         let counts_fut = sqlx::query_as::<_, UserCountsRow>(
             "SELECT
-                (SELECT COUNT(*) FROM artists  WHERE user_id = $1 AND band_id IS NULL) AS total_artists,
-                (SELECT COUNT(*) FROM songs    WHERE user_id = $1 AND band_id IS NULL) AS total_songs,
-                (SELECT COUNT(*) FROM setlists WHERE user_id = $1 AND band_id IS NULL) AS total_setlists,
+                (SELECT COUNT(*) FROM artists  WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL) AS total_artists,
+                (SELECT COUNT(*) FROM songs    WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL) AS total_songs,
+                (SELECT COUNT(*) FROM setlists WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL) AS total_setlists,
                 (SELECT COUNT(*) FROM band_members WHERE user_id = $1) AS total_bands,
-                (SELECT COUNT(*) FROM songs    WHERE user_id = $1 AND band_id IS NULL AND lyrics IS NOT NULL AND lyrics <> '') AS songs_with_lyrics,
-                (SELECT COUNT(*) FROM songs    WHERE user_id = $1 AND band_id IS NULL AND (lyrics IS NULL OR lyrics = ''))     AS songs_without_lyrics,
-                (SELECT COUNT(*) FROM songs    WHERE user_id = $1 AND band_id IS NULL AND tonality IS NOT NULL)                AS songs_with_tonality,
-                (SELECT COUNT(*) FROM songs    WHERE user_id = $1 AND band_id IS NULL AND tempo IS NOT NULL)                   AS songs_with_tempo"
+                (SELECT COUNT(*) FROM songs    WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL AND lyrics IS NOT NULL AND lyrics <> '') AS songs_with_lyrics,
+                (SELECT COUNT(*) FROM songs    WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL AND (lyrics IS NULL OR lyrics = ''))     AS songs_without_lyrics,
+                (SELECT COUNT(*) FROM songs    WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL AND tonality IS NOT NULL)                AS songs_with_tonality,
+                (SELECT COUNT(*) FROM songs    WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL AND tempo IS NOT NULL)                   AS songs_with_tempo"
         )
         .bind(user_id)
         .fetch_one(&self.db);
@@ -78,7 +78,7 @@ impl MetricsRepository for MetricsRepositoryImpl {
         let genres_fut = sqlx::query_as::<_, GenreCount>(
             "SELECT genre::text AS genre, COUNT(*) AS count
              FROM songs
-             WHERE user_id = $1 AND band_id IS NULL AND genre IS NOT NULL
+             WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL AND genre IS NOT NULL
              GROUP BY genre
              ORDER BY COUNT(*) DESC
              LIMIT 5",
@@ -89,8 +89,8 @@ impl MetricsRepository for MetricsRepositoryImpl {
         let artists_fut = sqlx::query_as::<_, ArtistSongCount>(
             "SELECT a.name AS artist_name, COUNT(s.id) AS song_count
              FROM artists a
-             LEFT JOIN songs s ON s.artist_id = a.id AND s.user_id = $1 AND s.band_id IS NULL
-             WHERE a.user_id = $1 AND a.band_id IS NULL
+             LEFT JOIN songs s ON s.artist_id = a.id AND s.user_id = $1 AND s.band_id IS NULL AND s.deleted_at IS NULL
+             WHERE a.user_id = $1 AND a.band_id IS NULL AND a.deleted_at IS NULL
              GROUP BY a.id, a.name
              ORDER BY COUNT(s.id) DESC
              LIMIT 5",
@@ -125,12 +125,12 @@ impl MetricsRepository for MetricsRepositoryImpl {
         let counts_fut = sqlx::query_as::<_, AdminCountsRow>(
             "SELECT
                 (SELECT COUNT(*) FROM users)    AS total_users,
-                (SELECT COUNT(*) FROM artists WHERE forked_from IS NULL) AS total_artists,
-                (SELECT COUNT(*) FROM songs   WHERE forked_from IS NULL) AS total_songs,
-                (SELECT COUNT(*) FROM setlists) AS total_setlists,
+                (SELECT COUNT(*) FROM artists WHERE forked_from IS NULL AND deleted_at IS NULL) AS total_artists,
+                (SELECT COUNT(*) FROM songs   WHERE forked_from IS NULL AND deleted_at IS NULL) AS total_songs,
+                (SELECT COUNT(*) FROM setlists WHERE deleted_at IS NULL AND NOT is_repertoire) AS total_setlists,
                 (SELECT COUNT(*) FROM bands)    AS total_bands,
-                (SELECT COUNT(*) FROM songs WHERE forked_from IS NULL AND lyrics IS NOT NULL AND lyrics <> '') AS songs_with_lyrics,
-                (SELECT COUNT(*) FROM songs WHERE forked_from IS NULL AND (lyrics IS NULL OR lyrics = ''))     AS songs_without_lyrics,
+                (SELECT COUNT(*) FROM songs WHERE forked_from IS NULL AND deleted_at IS NULL AND lyrics IS NOT NULL AND lyrics <> '') AS songs_with_lyrics,
+                (SELECT COUNT(*) FROM songs WHERE forked_from IS NULL AND deleted_at IS NULL AND (lyrics IS NULL OR lyrics = ''))     AS songs_without_lyrics,
                 (SELECT COUNT(*) FROM users WHERE status = 'active')                   AS active_users,
                 (SELECT COUNT(*) FROM users WHERE status = 'inactive')                 AS inactive_users"
         )
@@ -139,7 +139,7 @@ impl MetricsRepository for MetricsRepositoryImpl {
         let genres_fut = sqlx::query_as::<_, GenreCount>(
             "SELECT genre::text AS genre, COUNT(*) AS count
              FROM songs
-             WHERE genre IS NOT NULL AND forked_from IS NULL
+             WHERE genre IS NOT NULL AND forked_from IS NULL AND deleted_at IS NULL
              GROUP BY genre
              ORDER BY COUNT(*) DESC
              LIMIT 5",
@@ -179,19 +179,19 @@ impl MetricsRepository for MetricsRepositoryImpl {
     ) -> Result<UserTimeseries, ApiError> {
         let songs_fut = self.daily_counts_for_user(
             "songs",
-            "t.user_id = $2 AND t.band_id IS NULL",
+            "t.user_id = $2 AND t.band_id IS NULL AND t.deleted_at IS NULL",
             days,
             user_id,
         );
         let setlists_fut = self.daily_counts_for_user(
             "setlists",
-            "t.user_id = $2 AND t.band_id IS NULL",
+            "t.user_id = $2 AND t.band_id IS NULL AND t.deleted_at IS NULL",
             days,
             user_id,
         );
         let gigs_fut = self.daily_counts_for_user(
             "gigs",
-            "t.user_id = $2 AND t.band_id IS NULL",
+            "t.user_id = $2 AND t.band_id IS NULL AND t.deleted_at IS NULL",
             days,
             user_id,
         );
@@ -211,8 +211,16 @@ impl MetricsRepository for MetricsRepositoryImpl {
         // Exclude forked band copies (see get_admin_metrics) so this trend
         // reflects genuinely new songs, not a spike every time someone
         // forks their existing songs into a band setlist.
-        let songs_fut = self.daily_counts_global("songs", Some("t.forked_from IS NULL"), days);
-        let setlists_fut = self.daily_counts_global("setlists", None, days);
+        let songs_fut = self.daily_counts_global(
+            "songs",
+            Some("t.forked_from IS NULL AND t.deleted_at IS NULL"),
+            days,
+        );
+        let setlists_fut = self.daily_counts_global(
+            "setlists",
+            Some("t.deleted_at IS NULL AND NOT t.is_repertoire"),
+            days,
+        );
         let bands_fut = self.daily_counts_global("bands", None, days);
 
         let (users_registered, songs_created, setlists_created, bands_created) =

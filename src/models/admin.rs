@@ -32,10 +32,7 @@ pub struct AdminListQuery {
 
 impl AdminListQuery {
     pub fn page(&self) -> (i64, i64) {
-        (
-            self.page.unwrap_or(1).max(1),
-            self.per_page.unwrap_or(25).clamp(1, 100),
-        )
+        crate::models::resolve_page(self.page, self.per_page, 25)
     }
 
     /// `q` as an escaped `ILIKE` pattern, or `None` when blank.
@@ -95,6 +92,12 @@ pub struct AdminSongSummary {
     pub tempo: Option<i32>,
     pub genre: Option<Genre>,
     pub duration: Option<i32>,
+    #[sqlx(default)]
+    pub energy: Option<i16>,
+    #[sqlx(default)]
+    pub time_signature: Option<String>,
+    #[sqlx(default)]
+    pub capo: Option<i16>,
     pub has_lyrics: bool,
     pub tags: Vec<String>,
     pub setlist_count: i64,

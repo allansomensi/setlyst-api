@@ -1,7 +1,11 @@
 use crate::{
     errors::api_error::ApiError,
-    models::user_preferences::{
-        UpdatePreferencesPayload, UserPreferences, UserTheme, merge_ui_settings,
+    models::{
+        communication::CommunicationPreferences,
+        user_preferences::{
+            UpdatePreferencesPayload, UserPreferences, UserTheme, check_merged_ui_settings,
+            merge_ui_settings,
+        },
     },
 };
 use chrono::Utc;
@@ -28,6 +32,17 @@ pub trait UserPreferencesRepository: Send + Sync {
         user_id: Uuid,
         payload: &UpdatePreferencesPayload,
     ) -> Result<UserPreferences, ApiError>;
+    /// The user's communication preferences (defaults when never saved)
+    /// and their UI language (`None` when never saved).
+    async fn get_communication(
+        &self,
+        user_id: Uuid,
+    ) -> Result<(CommunicationPreferences, Option<String>), ApiError>;
+    async fn set_communication(
+        &self,
+        user_id: Uuid,
+        prefs: &CommunicationPreferences,
+    ) -> Result<(), ApiError>;
 }
 
 pub struct UserPreferencesRepositoryImpl {
@@ -87,7 +102,14 @@ impl UserPreferencesRepository for UserPreferencesRepositoryImpl {
         .await?;
 
         let ui_settings = match &payload.ui_settings {
-            Some(patch) => merge_ui_settings(&current.unwrap_or_else(|| json!({})), patch),
+            Some(patch) => {
+                let merged = merge_ui_settings(&current.unwrap_or_else(|| json!({})), patch);
+                // The patch alone is bounded by validation, but many small
+                // patches could still grow the stored object without
+                // limit: the merged result is checked too.
+                check_merged_ui_settings(&merged)?;
+                merged
+            }
             None => current.unwrap_or_else(|| json!({})),
         };
 
@@ -116,5 +138,45 @@ impl UserPreferencesRepository for UserPreferencesRepositoryImpl {
 
         tx.commit().await?;
         Ok(prefs)
+    }
+
+    async fn get_communication(
+        &self,
+        user_id: Uuid,
+    ) -> Result<(CommunicationPreferences, Option<String>), ApiError> {
+        let row: Option<(Value, String)> = sqlx::query_as(
+            "SELECT communication, language FROM user_preferences WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.db)
+        .await?;
+        Ok(match row {
+            Some((stored, language)) => (
+                CommunicationPreferences::from_stored(&stored),
+                Some(language),
+            ),
+            None => (CommunicationPreferences::default(), None),
+        })
+    }
+
+    async fn set_communication(
+        &self,
+        user_id: Uuid,
+        prefs: &CommunicationPreferences,
+    ) -> Result<(), ApiError> {
+        let now = Utc::now().naive_utc();
+        sqlx::query(
+            "INSERT INTO user_preferences (id, user_id, language, theme, live_mode_font_size, ui_settings,
+                                           communication, created_at, updated_at)
+             VALUES ($1, $2, 'en', 'system', 100, '{}', $3, $4, $4)
+             ON CONFLICT (user_id) DO UPDATE SET communication = $3, updated_at = $4",
+        )
+        .bind(Uuid::new_v4())
+        .bind(user_id)
+        .bind(prefs.to_stored())
+        .bind(now)
+        .execute(&self.db)
+        .await?;
+        Ok(())
     }
 }

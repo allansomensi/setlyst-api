@@ -42,3 +42,11 @@ pub struct Status {
     pub uptime_seconds: u64,
     pub dependencies: Dependencies,
 }
+
+/// The public status: health and version only. Infrastructure details
+/// are staff-only (see [`Status`]).
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct PublicStatus {
+    pub status: ServiceHealth,
+    pub version: String,
+}

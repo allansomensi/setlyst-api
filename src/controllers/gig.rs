@@ -1,14 +1,17 @@
 use crate::{
+    controllers::pin::{mark_one, mark_pinned},
     database::AppState,
     errors::api_error::ApiError,
     models::{
-        PaginatedResponse, PaginationMeta, PaginationQuery,
+        PaginatedResponse, PaginationMeta,
         auth::access::AccessControl,
         band::{BandPermission, BandRole},
-        gig::{CreateGigPayload, Gig, PublicGig, UpdateGigPayload},
+        gig::{CreateGigPayload, Gig, GigListQuery, PublicGig, UpdateGigPayload},
         quota::QuotaResource,
-        setlist::PublicSetlist,
+        resolve_page,
     },
+    services::entitlements::{Feature, ensure_feature},
+    utils::share_token::token_fingerprint,
 };
 use axum::{
     Json,
@@ -47,13 +50,39 @@ async fn validate_setlist_scope(
     Ok(())
 }
 
+/// Ensures a `tour_id` attached to a gig is a live tour of the same scope:
+/// the same band, or — for a personal gig — a personal tour of the gig's
+/// owner.
+async fn validate_tour_scope(
+    state: &AppState,
+    tour_id: Uuid,
+    gig_band_id: Option<Uuid>,
+    gig_owner: Uuid,
+) -> Result<(), ApiError> {
+    let tour = state
+        .tour_repo
+        .find_any(tour_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let same_scope = match gig_band_id {
+        Some(band_id) => tour.band_id == Some(band_id),
+        None => tour.band_id.is_none() && tour.user_id == gig_owner,
+    };
+    if !same_scope {
+        return Err(ApiError::BadRequest(
+            "The tour must belong to the same band as the gig (or be one of your personal tours for a personal gig).".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/gigs",
     tags = ["Gigs"],
     summary = "List the caller's personal gigs.",
-    description = "Fetches a paginated list of the caller's own personal (non-band) gigs, soonest first.",
-    params(PaginationQuery),
+    description = "Fetches a paginated list of the caller's own personal (non-band) gigs, soonest first. `tour_id` narrows it to one tour.",
+    params(GigListQuery),
     security((), ("jwt_token" = [])),
     responses(
         (status = 200, description = "Gigs retrieved successfully.", body = PaginatedResponse<Gig>),
@@ -63,20 +92,20 @@ async fn validate_setlist_scope(
 pub async fn find_all_gigs(
     State(state): State<AppState>,
     access: AccessControl,
-    Query(pagination): Query<PaginationQuery>,
+    Query(query): Query<GigListQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = access.user_id();
-    let current_page = pagination.page.unwrap_or(1).max(1);
-    let per_page = pagination.per_page.unwrap_or(20).clamp(1, 100);
+    let (current_page, per_page) = resolve_page(query.page, query.per_page, 20);
 
     debug!(%user_id, current_page, per_page, "Processing request to retrieve paginated gigs");
 
     match state
         .gig_repo
-        .find_all(user_id, current_page, per_page)
+        .find_all(user_id, query.tour_id, current_page, per_page)
         .await
     {
-        Ok((gigs, total_items)) => {
+        Ok((mut gigs, total_items)) => {
+            mark_pinned(&state, user_id, &mut gigs).await?;
             let total_pages = (total_items as f64 / per_page as f64).ceil() as i64;
 
             info!(%user_id, total_items, "Gigs retrieved successfully");
@@ -121,7 +150,8 @@ pub async fn find_gig_by_id(
     debug!(%user_id, gig_id = %id, "Processing request to retrieve gig by ID");
 
     match state.gig_repo.find_by_id(id, user_id).await {
-        Ok(Some(gig)) => {
+        Ok(Some(mut gig)) => {
+            mark_one(&state, user_id, &mut gig).await?;
             info!(%user_id, gig_id = %id, "Gig retrieved successfully");
             Ok(Json(gig))
         }
@@ -195,6 +225,9 @@ pub async fn create_gig(
     if let Some(setlist_id) = payload.setlist_id {
         validate_setlist_scope(&state, user_id, setlist_id, payload.band_id).await?;
     }
+    if let Some(tour_id) = payload.tour_id {
+        validate_tour_scope(&state, tour_id, payload.band_id, user_id).await?;
+    }
 
     match state.gig_repo.create(&payload, user_id).await {
         Ok(new_gig) => {
@@ -220,7 +253,7 @@ pub async fn create_gig(
     path = "/api/v1/gigs/{id}",
     tags = ["Gigs"],
     summary = "Update an existing gig.",
-    description = "This endpoint updates the details of an existing gig in the database.",
+    description = "`setlist_id`, `location`, `notes` and `tour_id` can be cleared with `null`. A tour must be live and of the same scope as the gig.",
     params(("id" = Uuid, Path, description = "The ID of the gig to update")),
     request_body = UpdateGigPayload,
     security((), ("jwt_token" = [])),
@@ -243,14 +276,19 @@ pub async fn update_gig(
 
     state.gig_repo.can_manage(id, user_id).await?;
 
-    if let Some(Some(setlist_id)) = payload.setlist_id {
+    if matches!(payload.setlist_id, Some(Some(_))) || matches!(payload.tour_id, Some(Some(_))) {
         let gig = state
             .gig_repo
             .find_by_id(id, user_id)
             .await?
             .ok_or(ApiError::NotFound)?;
 
-        validate_setlist_scope(&state, user_id, setlist_id, gig.band_id).await?;
+        if let Some(Some(setlist_id)) = payload.setlist_id {
+            validate_setlist_scope(&state, user_id, setlist_id, gig.band_id).await?;
+        }
+        if let Some(Some(tour_id)) = payload.tour_id {
+            validate_tour_scope(&state, tour_id, gig.band_id, gig.user_id).await?;
+        }
     }
 
     match state.gig_repo.update(id, &payload, user_id).await {
@@ -269,11 +307,11 @@ pub async fn update_gig(
     delete,
     path = "/api/v1/gigs/{id}",
     tags = ["Gigs"],
-    summary = "Delete an existing gig.",
-    description = "This endpoint deletes a specific gig from the database using its ID.",
+    summary = "Move a gig to the trash.",
+    description = "It can be restored from the trash until it is purged.",
     params(("id" = Uuid, Path, description = "The ID of the gig to delete")),
     security((), ("jwt_token" = [])),
-    responses((status = 204, description = "Gig deleted successfully"))
+    responses((status = 204, description = "Gig moved to the trash"))
 )]
 pub async fn delete_gig(
     State(state): State<AppState>,
@@ -285,9 +323,9 @@ pub async fn delete_gig(
 
     state.gig_repo.can_manage(id, user_id).await?;
 
-    match state.gig_repo.delete(id).await {
+    match state.gig_repo.trash(id, user_id).await {
         Ok(_) => {
-            info!(%user_id, gig_id = %id, "Gig deleted successfully");
+            info!(%user_id, gig_id = %id, "Gig moved to the trash");
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => {
@@ -303,7 +341,7 @@ pub async fn delete_gig(
     tags = ["Bands"],
     summary = "List a band's gigs.",
     description = "The caller must be a member of the band.",
-    params(("id" = Uuid, Path, description = "The ID of the band"), PaginationQuery),
+    params(("id" = Uuid, Path, description = "The ID of the band"), GigListQuery),
     security((), ("jwt_token" = [])),
     responses(
         (status = 200, description = "Gigs retrieved successfully.", body = PaginatedResponse<Gig>),
@@ -314,11 +352,10 @@ pub async fn find_band_gigs(
     State(state): State<AppState>,
     access: AccessControl,
     Path(band_id): Path<Uuid>,
-    Query(pagination): Query<PaginationQuery>,
+    Query(query): Query<GigListQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = access.user_id();
-    let current_page = pagination.page.unwrap_or(1).max(1);
-    let per_page = pagination.per_page.unwrap_or(20).clamp(1, 100);
+    let (current_page, per_page) = resolve_page(query.page, query.per_page, 20);
 
     debug!(%user_id, %band_id, current_page, per_page, "Processing request to list a band's gigs");
 
@@ -327,10 +364,11 @@ pub async fn find_band_gigs(
         .require_role(band_id, user_id, BandRole::Member)
         .await?;
 
-    let (gigs, total_items) = state
+    let (mut gigs, total_items) = state
         .gig_repo
-        .find_all_for_band(band_id, current_page, per_page)
+        .find_all_for_band(band_id, query.tour_id, current_page, per_page)
         .await?;
+    mark_pinned(&state, user_id, &mut gigs).await?;
 
     let total_pages = (total_items as f64 / per_page as f64).ceil() as i64;
 
@@ -356,7 +394,7 @@ pub async fn find_band_gigs(
     path = "/api/v1/gigs/{id}/share",
     tags = ["Gigs"],
     summary = "Enable (or rotate) a public read-only share link for a gig.",
-    description = "Generates a fresh, unguessable share token, replacing any previous one — so re-sharing invalidates links that were already handed out. Requires the same permission as editing the gig.",
+    description = "Generates a fresh, unguessable share token, replacing any previous one — so re-sharing invalidates links that were already handed out. Requires the same permission as editing the gig and the plan feature `public_sharing`.",
     params(("id" = Uuid, Path, description = "The ID of the gig")),
     security((), ("jwt_token" = [])),
     responses(
@@ -374,6 +412,7 @@ pub async fn enable_gig_sharing(
     debug!(%user_id, gig_id = %id, "Processing request to enable public sharing for gig");
 
     state.gig_repo.can_manage(id, user_id).await?;
+    ensure_feature(&state, user_id, Feature::PublicSharing).await?;
 
     let gig = state.gig_repo.enable_sharing(id).await?;
 
@@ -415,7 +454,7 @@ pub async fn disable_gig_sharing(
     path = "/api/v1/public/gigs/{token}",
     tags = ["Gigs"],
     summary = "View a publicly shared gig.",
-    description = "No authentication required. The token itself is the only access control — anyone who has it can view the gig, and its linked setlist, read-only.",
+    description = "No authentication required. The token itself is the only access control — anyone who has it can view the gig, and its linked setlist, read-only. The setlist is left out when it is in the trash or when staff took its public link down.",
     params(("token" = String, Path, description = "The gig's public share token")),
     responses(
         (status = 200, description = "Gig retrieved successfully.", body = PublicGig),
@@ -426,7 +465,7 @@ pub async fn get_public_gig(
     State(state): State<AppState>,
     Path(token): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!(share_token = %token, "Processing request to view a public gig");
+    debug!(share = %token_fingerprint(&token), "Processing request to view a public gig");
 
     let gig = state
         .gig_repo
@@ -434,28 +473,18 @@ pub async fn get_public_gig(
         .await?
         .ok_or(ApiError::NotFound)?;
 
+    // Resolved without an access filter: the share token already
+    // authorizes the gig, and its creator may have since left the band
+    // (which would otherwise hide the band's setlist). A setlist that is
+    // in the trash or whose public link staff took down is never exposed
+    // through the gig.
     let setlist = match gig.setlist_id {
-        Some(setlist_id) => {
-            // Resolved without an access filter: the share token already
-            // authorizes the gig, and its creator may have since left the
-            // band (which would otherwise hide the band's setlist).
-            let setlist = state.setlist_repo.find_any(setlist_id).await?;
-            match setlist {
-                Some(setlist) => {
-                    let songs = state.setlist_repo.get_songs(setlist.id, 1, 10_000);
-                    let markers = state.setlist_repo.get_markers(setlist.id);
-                    let ((songs, _), markers) = tokio::try_join!(songs, markers)?;
-                    Some(PublicSetlist {
-                        title: setlist.title,
-                        description: setlist.description,
-                        total_duration: setlist.total_duration,
-                        songs,
-                        markers,
-                    })
-                }
-                None => None,
+        Some(setlist_id) => match state.setlist_repo.find_any(setlist_id).await? {
+            Some(setlist) if setlist.share_locked_at.is_none() => {
+                Some(crate::controllers::setlist::public_setlist(&state, setlist).await?)
             }
-        }
+            _ => None,
+        },
         None => None,
     };
 

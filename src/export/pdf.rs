@@ -1,7 +1,7 @@
-//! Setlist PDF export.
+//! Setlist and song PDF export.
 //!
 //! Produces a printable running order (and, optionally, a full songbook
-//! with lyrics and chords) from a setlist. Everything a performer might
+//! with lyrics and chords) from a setlist, or a single song sheet. Everything a performer might
 //! want to tune for a stage sheet is an option: what to show, typography
 //! scale, a compact or two-column layout, paper size and orientation,
 //! margins, page numbers and the Setlyst watermark.
@@ -195,6 +195,29 @@ pub struct PdfExportOptions {
     pub locale: PdfLocale,
 }
 
+impl PdfExportOptions {
+    /// Options that need the `advanced_pdf` plan feature: two columns, the
+    /// songbook (`include_lyrics`), no watermark, or non-default margins.
+    /// Everything else (what to show, compact layout, text size, paper,
+    /// orientation, chord mode, language, page numbers) is basic.
+    pub fn is_advanced(&self) -> bool {
+        self.columns == 2
+            || self.include_lyrics
+            || !self.watermark
+            || self.margins != MarginSize::Normal
+    }
+
+    /// The same options with every advanced one reset to its default.
+    pub fn to_basic(mut self) -> Self {
+        self.columns = 1;
+        self.include_lyrics = false;
+        self.page_break_per_song = false;
+        self.watermark = true;
+        self.margins = MarginSize::Normal;
+        self
+    }
+}
+
 impl Default for PdfExportOptions {
     fn default() -> Self {
         serde_urlencoded::from_str::<ExportQuery>("")
@@ -274,6 +297,10 @@ struct PdfLabels {
     verse: &'static str,
     bridge: &'static str,
     date_format: &'static str,
+    capo: &'static str,
+    tuning: &'static str,
+    time_signature: &'static str,
+    notes: &'static str,
 }
 
 impl PdfLocale {
@@ -294,6 +321,10 @@ impl PdfLocale {
                 verse: "Verso",
                 bridge: "Ponte",
                 date_format: "%d/%m/%Y",
+                capo: "Capotraste",
+                tuning: "Afinação",
+                time_signature: "Compasso",
+                notes: "Observações",
             },
             Self::En => PdfLabels {
                 estimated_duration: "Estimated duration",
@@ -310,6 +341,10 @@ impl PdfLocale {
                 verse: "Verse",
                 bridge: "Bridge",
                 date_format: "%Y-%m-%d",
+                capo: "Capo",
+                tuning: "Tuning",
+                time_signature: "Time",
+                notes: "Performance notes",
             },
             Self::Es => PdfLabels {
                 estimated_duration: "Duración estimada",
@@ -326,6 +361,10 @@ impl PdfLocale {
                 verse: "Verso",
                 bridge: "Puente",
                 date_format: "%d/%m/%Y",
+                capo: "Cejilla",
+                tuning: "Afinación",
+                time_signature: "Compás",
+                notes: "Notas",
             },
         }
     }
@@ -369,6 +408,13 @@ fn format_duration(total_secs: i32) -> String {
 
 /// A file name that is safe on every OS, derived from the setlist title.
 pub fn pdf_filename(title: &str) -> String {
+    slug_filename("setlist", title, "pdf")
+}
+
+/// `<prefix>-<slug>.<ext>` from a title (letters and digits kept, in any
+/// script; everything else collapsed into single dashes; at most 80
+/// characters), or `<prefix>.<ext>` when nothing is left.
+pub fn slug_filename(prefix: &str, title: &str, ext: &str) -> String {
     let slug: String = title
         .trim()
         .chars()
@@ -386,10 +432,11 @@ pub fn pdf_filename(title: &str) -> String {
         .join("-");
 
     let slug: String = slug.chars().take(80).collect();
+    let slug = slug.trim_end_matches('-');
     if slug.is_empty() {
-        "setlist.pdf".to_string()
+        format!("{prefix}.{ext}")
     } else {
-        format!("setlist-{slug}.pdf")
+        format!("{prefix}-{slug}.{ext}")
     }
 }
 
@@ -958,13 +1005,50 @@ impl PageDecorator for SetlystPageDecorator {
 // Document assembly
 // ---------------------------------------------------------------------
 
+/// Font files every PDF needs (the Inter family, in `<assets>/fonts`).
+pub const REQUIRED_FONT_FILES: [&str; 4] = [
+    "Inter-Regular.ttf",
+    "Inter-Bold.ttf",
+    "Inter-Italic.ttf",
+    "Inter-BoldItalic.ttf",
+];
+
+/// Where the PDF fonts are read from: `PDF_FONTS_DIR` when set (kept for
+/// existing deployments), else `fonts` inside the configured assets
+/// directory (`ASSETS_DIR`, see `config::resolve_assets_dir`). Never a
+/// path relative to the working directory alone, so the binary can be
+/// started from anywhere.
+pub fn fonts_dir() -> std::path::PathBuf {
+    if let Some(dir) = std::env::var("PDF_FONTS_DIR")
+        .ok()
+        .filter(|d| !d.trim().is_empty())
+    {
+        return dir.into();
+    }
+    match crate::config::Config::try_get() {
+        Some(config) => config.assets_dir.join("fonts"),
+        None => crate::config::resolve_assets_dir(None).join("fonts"),
+    }
+}
+
+/// The required font files missing from [`fonts_dir`] (empty when PDF
+/// export can work). Checked at startup so a bad deployment is reported
+/// right away rather than on the first export.
+pub fn missing_fonts() -> Vec<std::path::PathBuf> {
+    let dir = fonts_dir();
+    REQUIRED_FONT_FILES
+        .iter()
+        .map(|f| dir.join(f))
+        .filter(|p| !p.is_file())
+        .collect()
+}
+
 fn font_family() -> Result<fonts::FontFamily<fonts::FontData>, PdfError> {
     static FONTS: OnceLock<fonts::FontFamily<fonts::FontData>> = OnceLock::new();
     if let Some(family) = FONTS.get() {
         return Ok(family.clone());
     }
-    let dir = std::env::var("PDF_FONTS_DIR").unwrap_or_else(|_| "assets/fonts".to_string());
-    let family = fonts::from_files(dir, "Inter", None)?;
+    let family = fonts::from_files(fonts_dir(), "Inter", None)?;
     Ok(FONTS.get_or_init(|| family).clone())
 }
 
@@ -1345,58 +1429,99 @@ fn push_songbook(
             continue;
         }
 
-        for line in lines {
-            match line {
-                LyricLine::Blank => doc.push(elements::Break::new(0.5)),
-                LyricLine::Heading(text) => {
-                    doc.push(elements::Break::new(0.3));
-                    doc.push(Paragraph::new(text).styled(styles.text(11.0).bold()));
-                }
-                LyricLine::Comment(text) => {
-                    doc.push(Paragraph::new(text).styled(styles.muted(10.5).italic()));
-                }
-                LyricLine::Segments(segments) => doc.push(ChordLyricLine {
-                    segments,
-                    lyric_style,
-                    chord_style,
-                }),
+        let mut layout = LinearLayout::vertical();
+        push_lyric_lines(&mut layout, lines, styles, lyric_style, chord_style);
+        doc.push(layout);
+    }
+}
+
+/// Appends printable lyric lines to `layout`.
+fn push_lyric_lines(
+    layout: &mut LinearLayout,
+    lines: Vec<LyricLine>,
+    styles: &Styles,
+    lyric_style: Style,
+    chord_style: Style,
+) {
+    for line in lines {
+        match line {
+            LyricLine::Blank => layout.push(elements::Break::new(0.5)),
+            LyricLine::Heading(text) => {
+                layout.push(elements::Break::new(0.3));
+                layout.push(Paragraph::new(text).styled(styles.text(11.0).bold()));
             }
+            LyricLine::Comment(text) => {
+                layout.push(Paragraph::new(text).styled(styles.muted(10.5).italic()));
+            }
+            LyricLine::Segments(segments) => layout.push(ChordLyricLine {
+                segments,
+                lyric_style,
+                chord_style,
+            }),
         }
     }
+}
+
+/// Page setup shared by every export.
+struct PageSetup {
+    paper: PaperFormat,
+    orientation: Orientation,
+    margins: MarginSize,
+    watermark: bool,
+    page_numbers: bool,
+    font_scale: u16,
+    locale: PdfLocale,
+    compact: bool,
+}
+
+fn new_document(title: String, setup: &PageSetup) -> Result<(Document, Styles), PdfError> {
+    let mut doc = Document::new(font_family()?);
+    doc.set_title(title);
+    doc.set_line_spacing(if setup.compact { 1.1 } else { 1.25 });
+
+    let paper: Size = match setup.paper {
+        PaperFormat::A4 => genpdf::PaperSize::A4.into(),
+        PaperFormat::Letter => genpdf::PaperSize::Letter.into(),
+        PaperFormat::Legal => genpdf::PaperSize::Legal.into(),
+    };
+    let paper = match setup.orientation {
+        Orientation::Portrait => paper,
+        Orientation::Landscape => Size::new(paper.height, paper.width),
+    };
+    doc.set_paper_size(paper);
+
+    let scale = f64::from(setup.font_scale) / 100.0;
+    let labels = setup.locale.labels();
+    doc.set_page_decorator(SetlystPageDecorator {
+        page: 0,
+        margins: setup.margins.mm(),
+        watermark: setup.watermark,
+        page_numbers: setup.page_numbers,
+        page_label: labels.page,
+        credit: labels.generated_with,
+        font_scale: scale,
+    });
+
+    Ok((doc, Styles { scale }))
 }
 
 pub fn generate_setlist_pdf(
     data: &SetlistPdfData<'_>,
     options: &PdfExportOptions,
 ) -> Result<Vec<u8>, PdfError> {
-    let mut doc = Document::new(font_family()?);
-    doc.set_title(format!("Setlist - {}", data.title));
-    doc.set_line_spacing(if options.compact { 1.1 } else { 1.25 });
-
-    let paper: Size = match options.paper {
-        PaperFormat::A4 => genpdf::PaperSize::A4.into(),
-        PaperFormat::Letter => genpdf::PaperSize::Letter.into(),
-        PaperFormat::Legal => genpdf::PaperSize::Legal.into(),
-    };
-    let paper = match options.orientation {
-        Orientation::Portrait => paper,
-        Orientation::Landscape => Size::new(paper.height, paper.width),
-    };
-    doc.set_paper_size(paper);
-
-    let scale = f64::from(options.font_scale) / 100.0;
-    let labels = options.locale.labels();
-    doc.set_page_decorator(SetlystPageDecorator {
-        page: 0,
-        margins: options.margins.mm(),
-        watermark: options.watermark,
-        page_numbers: options.page_numbers,
-        page_label: labels.page,
-        credit: labels.generated_with,
-        font_scale: scale,
-    });
-
-    let styles = Styles { scale };
+    let (mut doc, styles) = new_document(
+        format!("Setlist - {}", data.title),
+        &PageSetup {
+            paper: options.paper,
+            orientation: options.orientation,
+            margins: options.margins,
+            watermark: options.watermark,
+            page_numbers: options.page_numbers,
+            font_scale: options.font_scale,
+            locale: options.locale,
+            compact: options.compact,
+        },
+    )?;
 
     push_header(&mut doc, data, options, &styles);
     push_running_order(&mut doc, data, options, &styles)?;
@@ -1407,6 +1532,273 @@ pub fn generate_setlist_pdf(
     let mut buffer = Cursor::new(Vec::new());
     doc.render(&mut buffer)?;
 
+    Ok(buffer.into_inner())
+}
+
+// ---------------------------------------------------------------------
+// Single-song sheet
+// ---------------------------------------------------------------------
+
+/// Query parameters of `GET /songs/{id}/export/pdf`. Every field is
+/// optional; the defaults give a one-column sheet with chords above the
+/// lyrics and every piece of metadata shown.
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct SongExportQuery {
+    #[serde(default = "default_true")]
+    pub show_artist: bool,
+    #[serde(default = "default_true")]
+    pub show_key: bool,
+    #[serde(default = "default_true")]
+    pub show_capo: bool,
+    #[serde(default = "default_true")]
+    pub show_bpm: bool,
+    #[serde(default = "default_true")]
+    pub show_time_signature: bool,
+    #[serde(default = "default_true")]
+    pub show_tuning: bool,
+    /// Print the performance notes under the header.
+    #[serde(default)]
+    pub show_notes: bool,
+    /// How chords are printed (`chords` is accepted as an alias).
+    #[serde(default, alias = "chords")]
+    pub chord_mode: ChordMode,
+    /// 1 or 2 columns for the lyrics.
+    #[serde(default = "default_columns")]
+    pub columns: u8,
+    /// Text size, in percent of the default (60–200).
+    #[serde(default = "default_font_scale")]
+    pub font_scale: u16,
+    #[serde(default)]
+    pub uppercase_titles: bool,
+    /// Faint Setlyst watermark and footer credit.
+    #[serde(default = "default_true")]
+    pub watermark: bool,
+    #[serde(default = "default_true")]
+    pub page_numbers: bool,
+    #[serde(default)]
+    pub paper: PaperFormat,
+    #[serde(default)]
+    pub orientation: Orientation,
+    #[serde(default)]
+    pub margins: MarginSize,
+    #[serde(default)]
+    pub lang: PdfLocale,
+}
+
+/// Normalized, clamped song-sheet options.
+#[derive(Debug, Clone)]
+pub struct SongPdfOptions {
+    pub show_artist: bool,
+    pub show_key: bool,
+    pub show_capo: bool,
+    pub show_bpm: bool,
+    pub show_time_signature: bool,
+    pub show_tuning: bool,
+    pub show_notes: bool,
+    pub chords: ChordMode,
+    pub columns: u8,
+    pub font_scale: u16,
+    pub uppercase_titles: bool,
+    pub watermark: bool,
+    pub page_numbers: bool,
+    pub paper: PaperFormat,
+    pub orientation: Orientation,
+    pub margins: MarginSize,
+    pub locale: PdfLocale,
+}
+
+impl From<SongExportQuery> for SongPdfOptions {
+    fn from(query: SongExportQuery) -> Self {
+        Self {
+            show_artist: query.show_artist,
+            show_key: query.show_key,
+            show_capo: query.show_capo,
+            show_bpm: query.show_bpm,
+            show_time_signature: query.show_time_signature,
+            show_tuning: query.show_tuning,
+            show_notes: query.show_notes,
+            chords: query.chord_mode,
+            columns: query.columns.clamp(1, 2),
+            font_scale: query.font_scale.clamp(60, 200),
+            uppercase_titles: query.uppercase_titles,
+            watermark: query.watermark,
+            page_numbers: query.page_numbers,
+            paper: query.paper,
+            orientation: query.orientation,
+            margins: query.margins,
+            locale: query.lang,
+        }
+    }
+}
+
+impl Default for SongPdfOptions {
+    fn default() -> Self {
+        serde_urlencoded::from_str::<SongExportQuery>("")
+            .map(Self::from)
+            .expect("an empty query always deserializes")
+    }
+}
+
+impl SongPdfOptions {
+    /// Options that need the `advanced_pdf` plan feature: two columns, no
+    /// watermark, or non-default margins (see
+    /// [`PdfExportOptions::is_advanced`]).
+    pub fn is_advanced(&self) -> bool {
+        self.columns == 2 || !self.watermark || self.margins != MarginSize::Normal
+    }
+}
+
+/// Stanzas longer than this are split when laid out in two columns, so a
+/// table row always fits on a page.
+const MAX_STANZA_LINES: usize = 24;
+
+/// Splits lyric lines into stanzas (separated by blank lines).
+fn stanzas(lines: Vec<LyricLine>) -> Vec<Vec<LyricLine>> {
+    let mut out: Vec<Vec<LyricLine>> = vec![Vec::new()];
+    for line in lines {
+        let current = out.last_mut().expect("never empty");
+        if line == LyricLine::Blank {
+            if !current.is_empty() {
+                out.push(Vec::new());
+            }
+            continue;
+        }
+        if current.len() >= MAX_STANZA_LINES {
+            out.push(Vec::new());
+        }
+        out.last_mut().expect("never empty").push(line);
+    }
+    out.retain(|stanza| !stanza.is_empty());
+    out
+}
+
+/// A single song with its metadata and lyrics.
+pub fn generate_song_pdf(
+    song: &SongWithArtist,
+    options: &SongPdfOptions,
+) -> Result<Vec<u8>, PdfError> {
+    let labels = options.locale.labels();
+    let (mut doc, styles) = new_document(
+        format!("{} - {}", song.title, song.artist_name),
+        &PageSetup {
+            paper: options.paper,
+            orientation: options.orientation,
+            margins: options.margins,
+            watermark: options.watermark,
+            page_numbers: options.page_numbers,
+            font_scale: options.font_scale,
+            locale: options.locale,
+            compact: false,
+        },
+    )?;
+
+    let title = if options.uppercase_titles {
+        song.title.to_uppercase()
+    } else {
+        song.title.clone()
+    };
+    doc.push(Paragraph::new(title).styled(styles.text(22.0).bold()));
+    if options.show_artist {
+        doc.push(Paragraph::new(song.artist_name.clone()).styled(styles.muted(13.0)));
+    }
+
+    let mut meta: Vec<String> = Vec::new();
+    if options.show_key
+        && let Some(key) = &song.tonality
+    {
+        meta.push(format!("{}: {}", labels.key, format_tonality(key)));
+    }
+    if options.show_capo
+        && let Some(capo) = song.capo.filter(|c| *c > 0)
+    {
+        meta.push(format!("{}: {capo}", labels.capo));
+    }
+    if options.show_bpm
+        && let Some(bpm) = song.tempo
+    {
+        meta.push(format!("{bpm} BPM"));
+    }
+    if options.show_time_signature
+        && let Some(time) = &song.time_signature
+    {
+        meta.push(format!("{}: {time}", labels.time_signature));
+    }
+    if options.show_tuning
+        && let Some(tuning) = &song.tuning
+    {
+        meta.push(format!("{}: {tuning}", labels.tuning));
+    }
+    if !meta.is_empty() {
+        doc.push(Paragraph::new(meta.join("  ·  ")).styled(styles.muted(11.0)));
+    }
+    if options.show_notes
+        && let Some(notes) = song
+            .performance_notes
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+    {
+        doc.push(elements::Break::new(0.4));
+        doc.push(Paragraph::new(format!("{}:", labels.notes)).styled(styles.text(10.5).bold()));
+        for line in notes.lines() {
+            doc.push(Paragraph::new(line.to_string()).styled(styles.muted(10.5).italic()));
+        }
+    }
+
+    doc.push(elements::Break::new(0.5));
+    doc.push(HorizontalRule {
+        color: Color::Rgb(210, 210, 210),
+    });
+    doc.push(elements::Break::new(0.6));
+
+    let lines = song
+        .lyrics
+        .as_deref()
+        .map(|lyrics| parse_lyrics(lyrics, options.chords, options.locale))
+        .unwrap_or_default();
+
+    let lyric_style = styles.text(12.0);
+    let chord_style = styles.text(11.0).bold().with_color(Color::Rgb(30, 90, 170));
+
+    if lines.is_empty() {
+        doc.push(Paragraph::new(labels.no_lyrics).styled(styles.muted(11.0).italic()));
+    } else if options.columns == 2 {
+        // Stanzas side by side, two per row, read left to right.
+        let mut blocks = stanzas(lines).into_iter();
+        let mut table = TableLayout::new(vec![1, 1]);
+        while let Some(left) = blocks.next() {
+            let mut left_layout = LinearLayout::vertical();
+            push_lyric_lines(&mut left_layout, left, &styles, lyric_style, chord_style);
+            left_layout.push(elements::Break::new(0.6));
+            let mut row = table.row();
+            row.push_element(elements::PaddedElement::new(
+                left_layout,
+                Margins::trbl(0, 4, 0, 0),
+            ));
+            match blocks.next() {
+                Some(right) => {
+                    let mut right_layout = LinearLayout::vertical();
+                    push_lyric_lines(&mut right_layout, right, &styles, lyric_style, chord_style);
+                    right_layout.push(elements::Break::new(0.6));
+                    row.push_element(elements::PaddedElement::new(
+                        right_layout,
+                        Margins::trbl(0, 0, 0, 4),
+                    ));
+                }
+                None => row.push_element(elements::Break::new(0)),
+            }
+            row.push()?;
+        }
+        doc.push(table);
+    } else {
+        let mut layout = LinearLayout::vertical();
+        push_lyric_lines(&mut layout, lines, &styles, lyric_style, chord_style);
+        doc.push(layout);
+    }
+
+    let mut buffer = Cursor::new(Vec::new());
+    doc.render(&mut buffer)?;
     Ok(buffer.into_inner())
 }
 
@@ -1431,6 +1823,12 @@ mod tests {
             tonality: Some(Tonality::FSharpM),
             genre: None,
             duration: Some(215),
+            energy: Some(4),
+            time_signature: Some("6/8".to_string()),
+            capo: Some(2),
+            tuning: Some("Drop D".to_string()),
+            performance_notes: Some("Entrada suave\nSolo no final".to_string()),
+            links: Default::default(),
             tags: vec!["balada".to_string()],
             updated_by: None,
             updated_by_username: None,
@@ -1586,10 +1984,70 @@ mod tests {
             "setlist-show-de-sábado.pdf"
         );
         assert_eq!(pdf_filename("///"), "setlist.pdf");
+        assert_eq!(slug_filename("song", "Ação!", "cho"), "song-ação.cho");
         let header = content_disposition("setlist-canções.pdf");
         assert!(header.contains("filename=\"setlist-can__es.pdf\""));
         assert!(header.contains("filename*=UTF-8''setlist-can%C3%A7%C3%B5es.pdf"));
         assert!(header.is_ascii());
+    }
+
+    #[test]
+    fn renders_single_song_sheets() {
+        let long_lyrics = (0..120)
+            .map(|i| {
+                if i % 6 == 5 {
+                    String::new()
+                } else {
+                    format!("[G]Linha [D/F#]número {i} da [Em]canção")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let chart = song("Canção longa", Some(&long_lyrics));
+        for query in [
+            "",
+            "columns=2&chord_mode=inline&show_notes=true&lang=pt-BR",
+            "chords=hide&watermark=false&margins=wide&paper=letter&orientation=landscape",
+            "columns=2&font_scale=200&uppercase_titles=true&show_key=false&show_capo=false",
+        ] {
+            let options =
+                SongPdfOptions::from(serde_urlencoded::from_str::<SongExportQuery>(query).unwrap());
+            let pdf = generate_song_pdf(&chart, &options).expect("song pdf renders");
+            assert!(pdf.starts_with(b"%PDF"), "{query}");
+        }
+        let empty = song("Sem letra", None);
+        assert!(
+            generate_song_pdf(&empty, &SongPdfOptions::default())
+                .unwrap()
+                .starts_with(b"%PDF")
+        );
+    }
+
+    #[test]
+    fn advanced_options_are_classified() {
+        let basic = PdfExportOptions::from(
+            serde_urlencoded::from_str::<ExportQuery>(
+                "compact=true&font_scale=150&paper=letter&orientation=landscape&show_artist=true&chords=inline",
+            )
+            .unwrap(),
+        );
+        assert!(!basic.is_advanced());
+        for query in [
+            "columns=2",
+            "include_lyrics=true",
+            "watermark=false",
+            "margins=narrow",
+        ] {
+            let options =
+                PdfExportOptions::from(serde_urlencoded::from_str::<ExportQuery>(query).unwrap());
+            assert!(options.is_advanced(), "{query}");
+            assert!(!options.to_basic().is_advanced(), "{query}");
+        }
+        assert!(!SongPdfOptions::default().is_advanced());
+        let song_advanced = SongPdfOptions::from(
+            serde_urlencoded::from_str::<SongExportQuery>("columns=2").unwrap(),
+        );
+        assert!(song_advanced.is_advanced());
     }
 
     #[test]

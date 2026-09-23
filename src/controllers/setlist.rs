@@ -1,9 +1,13 @@
 use crate::{
+    controllers::pin::{mark_one, mark_pinned},
     database::AppState,
     errors::api_error::ApiError,
-    export::pdf::{
-        ExportQuery, PdfExportOptions, SetlistPdfData, content_disposition, generate_setlist_pdf,
-        pdf_filename,
+    export::{
+        limiter::render_pdf,
+        pdf::{
+            ExportQuery, PdfExportOptions, SetlistPdfData, content_disposition,
+            generate_setlist_pdf, pdf_filename,
+        },
     },
     models::{
         PaginatedResponse, PaginationMeta, PaginationQuery,
@@ -12,12 +16,15 @@ use crate::{
         quota::QuotaResource,
         setlist::{
             AddSongToSetlistPayload, CreateSetlistBlockPayload, CreateSetlistBreakPayload,
-            CreateSetlistPayload, DuplicateSetlistPayload, PublicSetlist,
-            ReorderSetlistItemsPayload, ReorderSetlistSongsPayload, Setlist, SetlistItem,
-            SetlistMarker, UpdateSetlistBlockPayload, UpdateSetlistBreakPayload,
+            CreateSetlistPayload, DuplicateSetlistPayload, DuplicateSetlistResponse, PublicMarker,
+            PublicSetlist, ReorderSetlistItemsPayload, ReorderSetlistSongsPayload, Setlist,
+            SetlistItem, SetlistMarker, UpdateSetlistBlockPayload, UpdateSetlistBreakPayload,
             UpdateSetlistPayload,
         },
+        song::PublicSong,
     },
+    services::entitlements::{Feature, ensure_feature, has_feature},
+    utils::share_token::token_fingerprint,
 };
 use axum::{
     Json,
@@ -48,8 +55,7 @@ pub async fn find_all_setlists(
     Query(pagination): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = access.user_id();
-    let current_page = pagination.page.unwrap_or(1).max(1);
-    let per_page = pagination.per_page.unwrap_or(20).clamp(1, 100);
+    let (current_page, per_page) = pagination.resolve();
 
     debug!(
         %user_id,
@@ -63,7 +69,8 @@ pub async fn find_all_setlists(
         .find_all(user_id, current_page, per_page)
         .await
     {
-        Ok((setlists, total_items)) => {
+        Ok((mut setlists, total_items)) => {
+            mark_pinned(&state, user_id, &mut setlists).await?;
             let total_pages = (total_items as f64 / per_page as f64).ceil() as i64;
 
             info!(
@@ -121,7 +128,8 @@ pub async fn find_setlist_by_id(
     );
 
     match state.setlist_repo.find_by_id(id, access.user_id()).await {
-        Ok(Some(setlist)) => {
+        Ok(Some(mut setlist)) => {
+            mark_one(&state, user_id, &mut setlist).await?;
             info!(
                 %user_id,
                 setlist_id = %id,
@@ -248,12 +256,12 @@ pub async fn create_setlist(
     path = "/api/v1/setlists/{id}/duplicate",
     tags = ["Setlists"],
     summary = "Duplicate a setlist.",
-    description = "Creates an independent personal copy of a setlist the caller can view, including all of its songs, blocks and breaks. If the title is not provided (or already taken), a suffix such as \" (copy)\" or \" (2)\" is appended automatically.",
+    description = "Creates an independent personal copy of a setlist the caller can view, including all of its songs, blocks, breaks and links. If the title is not provided (or already taken), a suffix such as \" (copy)\" or \" (2)\" is appended automatically.\n\nA band setlist's songs are never referenced by the copy: each becomes a song of the caller's own library (an existing song with the same title and artist is reused, otherwise the artist and song are created). Songs that would take the caller over their song or artist quota are left out and counted in `skipped_band_songs`. The answer is the new `Setlist` plus `skipped_band_songs`.",
     params(("id" = Uuid, Path, description = "The ID of the setlist to duplicate")),
     request_body = DuplicateSetlistPayload,
     security((), ("jwt_token" = [])),
     responses(
-        (status = 201, description = "Setlist duplicated successfully.", body = Setlist),
+        (status = 201, description = "Setlist duplicated successfully.", body = DuplicateSetlistResponse),
         (status = 404, description = "Setlist not found.")
     )
 )]
@@ -278,14 +286,22 @@ pub async fn duplicate_setlist(
         .ensure_user(user_id, QuotaResource::Setlists, 1)
         .await?;
 
+    let limits = state.quota_repo.effective_limits(user_id).await?;
+
     match state
         .setlist_repo
-        .duplicate(id, user_id, payload.title)
+        .duplicate(id, user_id, payload.title, limits)
         .await
     {
-        Ok(new_setlist) => {
-            info!(%user_id, setlist_id = %id, new_setlist_id = %new_setlist.id, "Setlist duplicated successfully");
-            Ok((StatusCode::CREATED, Json(new_setlist)))
+        Ok((new_setlist, skipped_band_songs)) => {
+            info!(%user_id, setlist_id = %id, new_setlist_id = %new_setlist.id, skipped_band_songs, "Setlist duplicated successfully");
+            Ok((
+                StatusCode::CREATED,
+                Json(DuplicateSetlistResponse {
+                    setlist: new_setlist,
+                    skipped_band_songs,
+                }),
+            ))
         }
         Err(e) => {
             error!(%user_id, setlist_id = %id, error = %e, "Failed to duplicate setlist");
@@ -364,11 +380,14 @@ pub async fn update_setlist(
     delete,
     path = "/api/v1/setlists/{id}",
     tags = ["Setlists"],
-    summary = "Delete an existing setlist.",
-    description = "This endpoint deletes a specific setlist from the database using its ID.",
+    summary = "Move a setlist to the trash.",
+    description = "The setlist disappears from lists, gigs and public links, and can be restored from the trash until it is purged. A band's repertoire can't be deleted (`REPERTOIRE_PROTECTED`).",
     params(("id" = Uuid, Path, description = "The ID of the setlist to delete")),
     security((), ("jwt_token" = [])),
-    responses((status = 204, description = "Setlist deleted successfully"))
+    responses(
+        (status = 204, description = "Setlist moved to the trash"),
+        (status = 409, description = "The band's repertoire can't be deleted.")
+    )
 )]
 pub async fn delete_setlist(
     State(state): State<AppState>,
@@ -384,12 +403,12 @@ pub async fn delete_setlist(
 
     state.setlist_repo.can_manage(id, user_id).await?;
 
-    match state.setlist_repo.delete(id).await {
+    match state.setlist_repo.trash(id, user_id).await {
         Ok(_) => {
             info!(
                 %user_id,
                 setlist_id = %id,
-                "Setlist deleted successfully"
+                "Setlist moved to the trash"
             );
             Ok(StatusCode::NO_CONTENT)
         }
@@ -445,13 +464,17 @@ pub async fn add_song_to_setlist(
         .find_by_id(payload.song_id, user_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    state.quota_repo.ensure_setlist_items(setlist_id, 1).await?;
 
     let setlist = state
         .setlist_repo
         .find_by_id(setlist_id, user_id)
         .await?
         .ok_or(ApiError::NotFound)?;
+
+    // The repertoire is bounded by the band's song quota instead.
+    if !setlist.is_repertoire {
+        state.quota_repo.ensure_setlist_items(setlist_id, 1).await?;
+    }
 
     // Band setlists never link directly to a member's personal song. If the
     // song isn't already a copy owned by this band, fork it into one first:
@@ -465,42 +488,7 @@ pub async fn add_song_to_setlist(
                 .find_with_artist_name(payload.song_id)
                 .await?
                 .ok_or(ApiError::NotFound)?;
-
-            if source.band_id == Some(band_id) {
-                payload.song_id
-            } else if source.band_id.is_some() {
-                // Another band's copy can't be pulled into this band.
-                return Err(ApiError::NotFound);
-            } else {
-                if !state.song_repo.has_band_fork(band_id, source.id).await? {
-                    state
-                        .quota_repo
-                        .ensure_band(band_id, QuotaResource::BandSongs, 1)
-                        .await?;
-                }
-
-                let band_artist = state
-                    .artist_repo
-                    .find_or_create_for_band(
-                        band_id,
-                        &source.artist_name,
-                        user_id,
-                        Some(source.artist_id),
-                    )
-                    .await?;
-
-                let forked = state
-                    .song_repo
-                    .create_band_copy(&source, band_id, band_artist.id, user_id)
-                    .await?;
-
-                info!(
-                    %user_id, %band_id, source_song_id = %payload.song_id, forked_song_id = %forked.id,
-                    "Forked a personal song into an independent band copy"
-                );
-
-                forked.id
-            }
+            band_song_for(&state, band_id, &source, user_id).await?
         }
         None => {
             if source_song.band_id.is_some() {
@@ -616,8 +604,7 @@ pub async fn get_setlist_songs(
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = access.user_id();
 
-    let current_page = pagination.page.unwrap_or(1).max(1);
-    let per_page = pagination.per_page.unwrap_or(20).clamp(1, 100);
+    let (current_page, per_page) = pagination.resolve();
 
     info!(
         %user_id,
@@ -815,7 +802,7 @@ pub async fn create_setlist_block(
 
     state.setlist_repo.can_manage(setlist_id, user_id).await?;
 
-    state.quota_repo.ensure_setlist_items(setlist_id, 1).await?;
+    ensure_item_room(&state, setlist_id, user_id).await?;
 
     let marker = state
         .setlist_repo
@@ -897,7 +884,7 @@ pub async fn create_setlist_break(
 
     state.setlist_repo.can_manage(setlist_id, user_id).await?;
 
-    state.quota_repo.ensure_setlist_items(setlist_id, 1).await?;
+    ensure_item_room(&state, setlist_id, user_id).await?;
 
     let marker = state
         .setlist_repo
@@ -997,7 +984,7 @@ pub async fn delete_setlist_marker(
     path = "/api/v1/setlists/{id}/export/pdf",
     tags = ["Setlists"],
     summary = "Export a setlist to PDF.",
-    description = "Generates and returns a PDF file containing the setlist's songs, blocks and breaks. Supports localization via query params.",
+    description = "Generates and returns a PDF file containing the setlist's songs, blocks and breaks. Supports localization via query params.\n\n**Advanced options** (plan feature `advanced_pdf`, `FEATURE_NOT_IN_PLAN` otherwise): `columns=2`, the songbook (`include_lyrics=true`, with `page_break_per_song`), `watermark=false` and `margins` other than `normal`. Everything else (what to show, `compact`, `font_scale`, paper, orientation, chord mode, language, page numbers, subtitle) is available to every plan.\n\nAt most 3 PDFs render at once; when busy for 10 s the answer is `SERVICE_BUSY` (503, `meta.retry_after_seconds`).",
     params(
         ("id" = Uuid, Path, description = "The ID of the setlist to export"),
         ExportQuery
@@ -1031,20 +1018,106 @@ pub async fn export_setlist_pdf(
         .await?
         .ok_or(ApiError::NotFound)?;
 
-    let items = state.setlist_repo.get_items(id).await?;
     let options = PdfExportOptions::from(query);
+    if options.is_advanced() {
+        ensure_feature(&state, user_id, Feature::AdvancedPdf).await?;
+    }
+    let items = state.setlist_repo.get_items(id).await?;
 
-    render_setlist_pdf(&state, &setlist, &items, &options).await
+    render_setlist_pdf(&state, &setlist, items, options).await
 }
 
-/// Renders a setlist to PDF on the blocking pool (PDF layout is CPU-bound
-/// and would otherwise stall the async runtime for every other request)
-/// and wraps it in a download response.
+/// A PDF download (`Cache-Control: no-store`, RFC 5987 file name).
+pub(crate) fn pdf_response(bytes: Vec<u8>, filename: &str) -> axum::response::Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/pdf"),
+    );
+    if let Ok(disposition) = HeaderValue::from_str(&content_disposition(filename)) {
+        headers.insert(axum::http::header::CONTENT_DISPOSITION, disposition);
+    }
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    (StatusCode::OK, headers, bytes).into_response()
+}
+
+/// Fails with `QUOTA_EXCEEDED` when the setlist is full. The repertoire is
+/// bounded by the band's song quota instead.
+async fn ensure_item_room(
+    state: &AppState,
+    setlist_id: Uuid,
+    user_id: Uuid,
+) -> Result<(), ApiError> {
+    let setlist = state
+        .setlist_repo
+        .find_by_id(setlist_id, user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if !setlist.is_repertoire {
+        state.quota_repo.ensure_setlist_items(setlist_id, 1).await?;
+    }
+    Ok(())
+}
+
+/// The band's copy of `source` for `band_id`, forking the caller's personal
+/// song into the band (and resolving its artist) when needed. Band setlists
+/// never link directly to a member's personal song: this decouples the
+/// band from that member's account, so editing or deleting their own
+/// original later can never take the song out from under the band.
+pub(crate) async fn band_song_for(
+    state: &AppState,
+    band_id: Uuid,
+    source: &crate::models::song::SongWithArtist,
+    actor_id: Uuid,
+) -> Result<Uuid, ApiError> {
+    if source.band_id == Some(band_id) {
+        return Ok(source.id);
+    }
+    if source.band_id.is_some() {
+        // Another band's copy can't be pulled into this band.
+        return Err(ApiError::NotFound);
+    }
+    if let Some(existing) = state.song_repo.find_band_fork(band_id, source.id).await? {
+        return Ok(existing);
+    }
+    state
+        .quota_repo
+        .ensure_band(band_id, QuotaResource::BandSongs, 1)
+        .await?;
+
+    let band_artist = state
+        .artist_repo
+        .find_or_create_for_band(
+            band_id,
+            &source.artist_name,
+            actor_id,
+            Some(source.artist_id),
+        )
+        .await?;
+
+    let forked = state
+        .song_repo
+        .create_band_copy(source, band_id, band_artist.id, actor_id)
+        .await?;
+
+    info!(
+        %actor_id, %band_id, source_song_id = %source.id, forked_song_id = %forked.id,
+        "Forked a personal song into an independent band copy"
+    );
+    Ok(forked.id)
+}
+
+/// Renders a setlist to PDF on the blocking pool, behind the global PDF
+/// limit (PDF layout is CPU-bound and would otherwise stall the async
+/// runtime for every other request), and wraps it in a download response.
 async fn render_setlist_pdf(
     state: &AppState,
     setlist: &Setlist,
-    items: &[SetlistItem],
-    options: &PdfExportOptions,
+    items: Vec<SetlistItem>,
+    options: PdfExportOptions,
 ) -> Result<axum::response::Response, ApiError> {
     let band_name = match setlist.band_id {
         Some(band_id) => state.band_repo.find_any(band_id).await?.map(|b| b.name),
@@ -1054,11 +1127,8 @@ async fn render_setlist_pdf(
     let title = setlist.title.clone();
     let description = setlist.description.clone();
     let total_duration_secs = setlist.total_duration;
-    let items = items.to_vec();
-    let options = options.clone();
-    let setlist_id = setlist.id;
 
-    let rendered = tokio::task::spawn_blocking(move || {
+    let bytes = render_pdf(move || {
         let data = SetlistPdfData {
             title: &title,
             description: description.as_deref(),
@@ -1068,34 +1138,8 @@ async fn render_setlist_pdf(
         };
         generate_setlist_pdf(&data, &options)
     })
-    .await
-    .map_err(|e| ApiError::ServerError(axum::Error::new(e)))?;
-
-    match rendered {
-        Ok(pdf_bytes) => {
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_static("application/pdf"),
-            );
-            if let Ok(disposition) =
-                HeaderValue::from_str(&content_disposition(&pdf_filename(&setlist.title)))
-            {
-                headers.insert(axum::http::header::CONTENT_DISPOSITION, disposition);
-            }
-            headers.insert(
-                axum::http::header::CACHE_CONTROL,
-                HeaderValue::from_static("no-store"),
-            );
-            Ok((StatusCode::OK, headers, pdf_bytes).into_response())
-        }
-        Err(e) => {
-            error!(%setlist_id, error = ?e, "Failed to generate PDF");
-            Err(ApiError::ServerError(axum::Error::new(
-                std::io::Error::other("Failed to generate PDF"),
-            )))
-        }
-    }
+    .await?;
+    Ok(pdf_response(bytes, &pdf_filename(&setlist.title)))
 }
 
 #[utoipa::path(
@@ -1103,7 +1147,7 @@ async fn render_setlist_pdf(
     path = "/api/v1/bands/{id}/setlists",
     tags = ["Bands"],
     summary = "List a band's setlists.",
-    description = "The caller must be a member of the band.",
+    description = "The caller must be a member of the band. The band's repertoire (`is_repertoire`) always comes first.",
     params(("id" = Uuid, Path, description = "The ID of the band"), PaginationQuery),
     security((), ("jwt_token" = [])),
     responses(
@@ -1118,8 +1162,7 @@ pub async fn find_band_setlists(
     Query(pagination): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = access.user_id();
-    let current_page = pagination.page.unwrap_or(1).max(1);
-    let per_page = pagination.per_page.unwrap_or(20).clamp(1, 100);
+    let (current_page, per_page) = pagination.resolve();
 
     debug!(%user_id, %band_id, current_page, per_page, "Processing request to list a band's setlists");
 
@@ -1128,10 +1171,11 @@ pub async fn find_band_setlists(
         .require_role(band_id, user_id, BandRole::Member)
         .await?;
 
-    let (setlists, total_items) = state
+    let (mut setlists, total_items) = state
         .setlist_repo
         .find_all_for_band(band_id, user_id, current_page, per_page)
         .await?;
+    mark_pinned(&state, user_id, &mut setlists).await?;
 
     let total_pages = (total_items as f64 / per_page as f64).ceil() as i64;
 
@@ -1146,6 +1190,49 @@ pub async fn find_band_setlists(
             total_pages,
         },
     }))
+}
+
+/// Filters for `GET /bands/{id}/repertoire`.
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct RepertoireQuery {
+    /// Case-insensitive search over title and artist.
+    pub q: Option<String>,
+    pub page: Option<i64>,
+    pub per_page: Option<i64>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/bands/{id}/repertoire",
+    tags = ["Bands"],
+    summary = "Songs of a band's repertoire.",
+    description = "Paginated, alphabetical; for the \"add from repertoire\" picker. Any member.",
+    params(("id" = Uuid, Path, description = "The ID of the band"), RepertoireQuery),
+    security(("jwt_token" = [])),
+    responses(
+        (status = 200, description = "Songs.", body = PaginatedResponse<crate::models::song::SongWithArtist>),
+        (status = 404, description = "Band not found, or the caller is not a member.")
+    )
+)]
+pub async fn find_band_repertoire(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(band_id): Path<Uuid>,
+    Query(query): Query<RepertoireQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+    let (page, per_page) = crate::models::resolve_page(query.page, query.per_page, 20);
+    state
+        .band_repo
+        .require_role(band_id, user_id, BandRole::Member)
+        .await?;
+    let search: Option<String> = query.q.map(|q| q.chars().take(100).collect());
+    let (songs, total) = state
+        .setlist_repo
+        .get_repertoire_songs(band_id, search.as_deref(), page, per_page)
+        .await?;
+    Ok(Json(PaginatedResponse::new(songs, total, page, per_page)))
 }
 
 // ---------------------------------------------------------------------
@@ -1215,7 +1302,7 @@ pub async fn unfavorite_setlist(
     path = "/api/v1/setlists/{id}/share",
     tags = ["Setlists"],
     summary = "Enable (or rotate) a public read-only share link for a setlist.",
-    description = "Generates a fresh, unguessable share token, replacing any previous one — so re-sharing invalidates links that were already handed out. Requires the same permission as editing the setlist.",
+    description = "Generates a fresh, unguessable share token, replacing any previous one — so re-sharing invalidates links that were already handed out. Requires the same permission as editing the setlist and the plan feature `public_sharing`.",
     params(("id" = Uuid, Path, description = "The ID of the setlist")),
     security((), ("jwt_token" = [])),
     responses(
@@ -1233,6 +1320,7 @@ pub async fn enable_setlist_sharing(
     debug!(%user_id, setlist_id = %id, "Processing request to enable public sharing for setlist");
 
     state.setlist_repo.can_manage(id, user_id).await?;
+    ensure_feature(&state, user_id, Feature::PublicSharing).await?;
 
     let setlist = state.setlist_repo.enable_sharing(id).await?;
 
@@ -1285,7 +1373,7 @@ pub async fn get_public_setlist(
     State(state): State<AppState>,
     Path(token): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    debug!(share_token = %token, "Processing request to view a public setlist");
+    debug!(share = %token_fingerprint(&token), "Processing request to view a public setlist");
 
     let setlist = state
         .setlist_repo
@@ -1293,19 +1381,32 @@ pub async fn get_public_setlist(
         .await?
         .ok_or(ApiError::NotFound)?;
 
-    let songs = state.setlist_repo.get_songs(setlist.id, 1, 10_000);
+    let public = public_setlist(&state, setlist).await?;
+    Ok(Json(public))
+}
+
+/// The public (anonymous) view of a setlist: dedicated DTOs only.
+pub(crate) async fn public_setlist(
+    state: &AppState,
+    setlist: Setlist,
+) -> Result<PublicSetlist, ApiError> {
+    let songs = state.setlist_repo.get_positioned_songs(setlist.id);
     let markers = state.setlist_repo.get_markers(setlist.id);
-    let ((songs, _), markers) = tokio::try_join!(songs, markers)?;
+    let (songs, markers) = tokio::try_join!(songs, markers)?;
 
     info!(setlist_id = %setlist.id, "Public setlist retrieved successfully");
 
-    Ok(Json(PublicSetlist {
+    Ok(PublicSetlist {
         title: setlist.title,
         description: setlist.description,
         total_duration: setlist.total_duration,
-        songs,
-        markers,
-    }))
+        links: setlist.links,
+        songs: songs
+            .into_iter()
+            .map(|(position, song)| PublicSong::from_song(position, song))
+            .collect(),
+        markers: markers.into_iter().map(PublicMarker::from).collect(),
+    })
 }
 
 #[utoipa::path(
@@ -1313,7 +1414,7 @@ pub async fn get_public_setlist(
     path = "/api/v1/public/setlists/{token}/export/pdf",
     tags = ["Setlists"],
     summary = "Export a publicly shared setlist to PDF.",
-    description = "No authentication required — same access model as viewing it. Supports the same localization query params as the authenticated export endpoint.",
+    description = "No authentication required — same access model as viewing it. Supports the same query params as the authenticated export endpoint; advanced options are only applied when the setlist's owner has the `advanced_pdf` plan feature (otherwise they fall back to the defaults). Rate limited per client IP (1 per second, bursts of 5) and subject to the global PDF limit (`SERVICE_BUSY`).",
     params(
         ("token" = String, Path, description = "The setlist's public share token"),
         ExportQuery
@@ -1328,7 +1429,7 @@ pub async fn export_public_setlist_pdf(
     Path(token): Path<String>,
     Query(query): Query<ExportQuery>,
 ) -> Result<axum::response::Response, ApiError> {
-    debug!(share_token = %token, "Processing request to export a public setlist to PDF");
+    debug!(share = %token_fingerprint(&token), "Processing request to export a public setlist to PDF");
 
     let setlist = state
         .setlist_repo
@@ -1336,8 +1437,11 @@ pub async fn export_public_setlist_pdf(
         .await?
         .ok_or(ApiError::NotFound)?;
 
+    let mut options = PdfExportOptions::from(query);
+    if options.is_advanced() && !has_feature(&state, setlist.user_id, Feature::AdvancedPdf).await? {
+        options = options.to_basic();
+    }
     let items = state.setlist_repo.get_items(setlist.id).await?;
-    let options = PdfExportOptions::from(query);
 
-    render_setlist_pdf(&state, &setlist, &items, &options).await
+    render_setlist_pdf(&state, &setlist, items, options).await
 }
