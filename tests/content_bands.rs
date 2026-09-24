@@ -296,12 +296,13 @@ async fn suggestions_are_rejected_withdrawn_or_accepted_by_votes() {
         .await;
     assert_eq!(withdrawn.body["status"], "withdrawn");
 
-    // Two up-votes accept automatically.
+    // With a threshold of 1, one up-vote from another member accepts it
+    // automatically; the suggester's own vote never counts.
     let threshold = app
         .patch(
             &format!("/bands/{band}"),
             &owner,
-            json!({ "suggestion_auto_accept_votes": 2 }),
+            json!({ "suggestion_auto_accept_votes": 1 }),
         )
         .await;
     assert_eq!(threshold.status, StatusCode::OK, "{}", threshold.body);

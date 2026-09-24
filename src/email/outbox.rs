@@ -6,9 +6,10 @@
 //! fails a request.
 
 use super::templates::EmailTemplate;
-use crate::errors::api_error::ApiError;
+use crate::{errors::api_error::ApiError, models::communication::Category};
 use chrono::{NaiveDateTime, Utc};
 use sqlx::{Executor, Postgres};
+use tracing::warn;
 use uuid::Uuid;
 
 /// One message to enqueue.
@@ -22,8 +23,83 @@ pub struct OutgoingEmail {
     pub template: EmailTemplate,
 }
 
+/// Delivery priority of queued messages (`email_outbox.priority`); lower
+/// is sent first, so a bulk send never delays a code that expires in
+/// minutes.
+pub mod priority {
+    /// One-time codes and security notices.
+    pub const SECURITY: i16 = 0;
+    /// Account and billing messages.
+    pub const ACCOUNT: i16 = 3;
+    /// Everything else (copies of in-app notifications). Also the column
+    /// default.
+    pub const NORMAL: i16 = 5;
+    /// Announcements and release notes, sent to many users at once.
+    pub const BULK: i16 = 9;
+}
+
+/// One-time-code e-mails to the same address (per template) accepted in
+/// 24 hours, whatever account asked for them: sign-up and recovery take an
+/// arbitrary address, and nothing else stops them from being used to flood
+/// someone's inbox. Further requests are dropped (see [`enqueue`]).
+pub const CODE_EMAILS_PER_ADDRESS_PER_DAY: i64 = 3;
+
+/// The outbox priority of `template`. Unknown templates (added later) get
+/// a priority from their name: `*_code` are codes, billing words mean an
+/// account message, anything else is [`priority::NORMAL`].
+pub fn priority_of(template: &EmailTemplate) -> i16 {
+    match template {
+        EmailTemplate::Notification {
+            category: Category::Security,
+            ..
+        } => return priority::SECURITY,
+        EmailTemplate::Notification { .. } => return priority::NORMAL,
+        _ => {}
+    }
+    priority_of_name(template.name())
+}
+
+fn priority_of_name(name: &str) -> i16 {
+    match name {
+        "password_changed"
+        | "two_factor_enabled"
+        | "two_factor_disabled"
+        | "email_changed_notice"
+        | "account_deleted" => priority::SECURITY,
+        "announcement" | "release_notes" => priority::BULK,
+        "welcome" => priority::ACCOUNT,
+        name if is_code_template(name) => priority::SECURITY,
+        name if [
+            "trial",
+            "subscription",
+            "payment",
+            "billing",
+            "invoice",
+            "refund",
+            "withdraw",
+        ]
+        .iter()
+        .any(|word| name.contains(word)) =>
+        {
+            priority::ACCOUNT
+        }
+        _ => priority::NORMAL,
+    }
+}
+
+/// Templates carrying a one-time code, capped per recipient.
+pub fn is_code_template(name: &str) -> bool {
+    name.ends_with("_code")
+}
+
 /// Enqueues one message. `executor` may be the pool or an open
 /// transaction.
+///
+/// One-time codes are capped per recipient address
+/// ([`CODE_EMAILS_PER_ADDRESS_PER_DAY`] per template): past the cap the
+/// message is silently dropped (logged, never reported to the caller, so
+/// the answer of a sign-up or recovery request doesn't reveal anything)
+/// and the nil id is returned.
 pub async fn enqueue<'e, E>(executor: E, email: &OutgoingEmail) -> Result<Uuid, ApiError>
 where
     E: Executor<'e, Database = Postgres>,
@@ -32,25 +108,57 @@ where
     let now = Utc::now().naive_utc();
     let (template, payload) = email.template.to_parts();
     let to: String = email.to.trim().chars().take(254).collect();
-    sqlx::query(
+    let cap = is_code_template(template).then_some(CODE_EMAILS_PER_ADDRESS_PER_DAY);
+    // One statement (the executor may be a transaction, usable once): the
+    // row is only written while the recipient is under the cap.
+    let inserted = sqlx::query(
         "INSERT INTO email_outbox (id, user_id, to_email, template, locale, payload, status,
-                                   attempts, scheduled_at, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0, $7, $7)",
+                                   attempts, scheduled_at, created_at, priority)
+         SELECT $1, $2, $3, $4, $5, $6, 'pending', 0, $7, $7, $8
+         WHERE $9::bigint IS NULL
+            OR (SELECT COUNT(*) FROM email_outbox
+                WHERE LOWER(to_email) = LOWER($3) AND template = $4
+                  AND created_at > $7 - INTERVAL '24 hours') < $9",
     )
     .bind(id)
     .bind(email.user_id)
-    .bind(to)
+    .bind(&to)
     .bind(template)
     .bind(&email.locale)
     .bind(payload)
     .bind(now)
+    .bind(priority_of(&email.template))
+    .bind(cap)
     .execute(executor)
-    .await?;
+    .await?
+    .rows_affected();
+    if inserted == 0 {
+        warn!(
+            template,
+            to = %mask_email(&to),
+            user_id = ?email.user_id,
+            "Per-recipient e-mail cap reached; message dropped"
+        );
+        return Ok(Uuid::nil());
+    }
     Ok(id)
 }
 
 /// Enqueues many messages with one statement per chunk of 500.
 pub async fn enqueue_many(pool: &sqlx::PgPool, emails: &[OutgoingEmail]) -> Result<u64, ApiError> {
+    if emails.is_empty() {
+        return Ok(0);
+    }
+    let mut conn = pool.acquire().await?;
+    enqueue_many_in(&mut conn, emails).await
+}
+
+/// [`enqueue_many`] on a given connection, e.g. inside the transaction of
+/// the change that sends them (committed or rolled back together).
+pub async fn enqueue_many_in(
+    conn: &mut sqlx::PgConnection,
+    emails: &[OutgoingEmail],
+) -> Result<u64, ApiError> {
     let mut inserted = 0;
     for chunk in emails.chunks(500) {
         let now: NaiveDateTime = Utc::now().naive_utc();
@@ -60,6 +168,7 @@ pub async fn enqueue_many(pool: &sqlx::PgPool, emails: &[OutgoingEmail]) -> Resu
         let mut templates = Vec::with_capacity(chunk.len());
         let mut locales = Vec::with_capacity(chunk.len());
         let mut payloads = Vec::with_capacity(chunk.len());
+        let mut priorities = Vec::with_capacity(chunk.len());
         for email in chunk {
             let (template, payload) = email.template.to_parts();
             ids.push(Uuid::now_v7());
@@ -68,13 +177,16 @@ pub async fn enqueue_many(pool: &sqlx::PgPool, emails: &[OutgoingEmail]) -> Resu
             templates.push(template.to_string());
             locales.push(email.locale.clone());
             payloads.push(payload);
+            priorities.push(priority_of(&email.template));
         }
         let result = sqlx::query(
             "INSERT INTO email_outbox (id, user_id, to_email, template, locale, payload, status,
-                                       attempts, scheduled_at, created_at)
-             SELECT t.id, t.user_id, t.to_email, t.template, t.locale, t.payload, 'pending', 0, $7, $7
-             FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::text[], $6::jsonb[])
-                  AS t(id, user_id, to_email, template, locale, payload)",
+                                       attempts, scheduled_at, created_at, priority)
+             SELECT t.id, t.user_id, t.to_email, t.template, t.locale, t.payload, 'pending', 0, $7, $7,
+                    t.priority
+             FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::text[], $6::jsonb[],
+                         $8::smallint[])
+                  AS t(id, user_id, to_email, template, locale, payload, priority)",
         )
         .bind(&ids)
         .bind(&users)
@@ -83,7 +195,8 @@ pub async fn enqueue_many(pool: &sqlx::PgPool, emails: &[OutgoingEmail]) -> Resu
         .bind(&locales)
         .bind(&payloads)
         .bind(now)
-        .execute(pool)
+        .bind(&priorities)
+        .execute(&mut *conn)
         .await?;
         inserted += result.rows_affected();
     }
@@ -102,6 +215,35 @@ pub fn mask_email(email: &str) -> String {
     }
 }
 
+/// Masks every e-mail address inside free text (SMTP error messages often
+/// quote the recipient), word by word, with [`mask_email`].
+pub fn mask_emails_in(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        if !word.is_empty() {
+            // Keep the punctuation around an address (`<a@b.c>:`) visible.
+            let trimmed = word.trim_matches(|c: char| !c.is_alphanumeric());
+            if trimmed.contains('@') && !trimmed.starts_with('@') && !trimmed.ends_with('@') {
+                out.push_str(&word.replace(trimmed, &mask_email(trimmed)));
+            } else {
+                out.push_str(word);
+            }
+            word.clear();
+        }
+    };
+    for c in text.chars() {
+        if c.is_whitespace() || matches!(c, ',' | ';' | '<' | '>' | '(' | ')' | '"' | '\'') {
+            flush(&mut word, &mut out);
+            out.push(c);
+        } else {
+            word.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +252,33 @@ mod tests {
     fn masks_addresses() {
         assert_eq!(mask_email("ana.maria@example.com"), "a***@example.com");
         assert_eq!(mask_email("x"), "***");
+    }
+
+    #[test]
+    fn masks_addresses_inside_smtp_errors() {
+        assert_eq!(
+            mask_emails_in("550 5.1.1 <ana.maria@example.com>: Recipient address rejected"),
+            "550 5.1.1 <a***@example.com>: Recipient address rejected"
+        );
+        assert_eq!(
+            mask_emails_in("mailbox bob@x.org, full; retry"),
+            "mailbox b***@x.org, full; retry"
+        );
+        assert_eq!(mask_emails_in("421 try again later"), "421 try again later");
+    }
+
+    #[test]
+    fn priorities_put_codes_first_and_bulk_last() {
+        assert_eq!(priority_of_name("password_reset_code"), priority::SECURITY);
+        assert_eq!(priority_of_name("reauth_code"), priority::SECURITY);
+        assert_eq!(priority_of_name("two_factor_disabled"), priority::SECURITY);
+        assert_eq!(priority_of_name("subscription_changed"), priority::ACCOUNT);
+        assert_eq!(priority_of_name("withdrawal_confirmed"), priority::ACCOUNT);
+        assert_eq!(priority_of_name("welcome"), priority::ACCOUNT);
+        assert_eq!(priority_of_name("announcement"), priority::BULK);
+        assert_eq!(priority_of_name("release_notes"), priority::BULK);
+        assert_eq!(priority_of_name("something_new"), priority::NORMAL);
+        assert!(is_code_template("email_verification_code"));
+        assert!(!is_code_template("welcome"));
     }
 }

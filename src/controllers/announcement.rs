@@ -91,6 +91,15 @@ async fn with_stats(
 // Staff
 // ---------------------------------------------------------------------
 
+/// Announcements that go out by e-mail reach every user's inbox from
+/// the platform's own domain: only admins may create, edit or publish
+/// them.
+fn require_admin_to_email(access: &AccessControl) -> Result<(), ApiError> {
+    access.require_admin().map_err(|_| {
+        ApiError::insufficient_role("Only admins can manage announcements sent by e-mail.")
+    })
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/admin/announcements",
@@ -144,6 +153,10 @@ pub async fn admin_create(
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_staff()?;
     payload.validate()?;
+    // Announcements that mail the whole user base are admin-only.
+    if payload.send_email {
+        require_admin_to_email(&access)?;
+    }
     let draft = AnnouncementDraft {
         title: payload.title,
         body: payload.body,
@@ -277,6 +290,9 @@ pub async fn admin_update(
         starts_at: payload.starts_at.unwrap_or(current.starts_at),
         ends_at: payload.ends_at.unwrap_or(current.ends_at),
     };
+    if draft.send_email {
+        require_admin_to_email(&access)?;
+    }
     check_draft(&state, &draft).await?;
     let updated = state
         .announcement_repo
@@ -348,6 +364,11 @@ pub async fn admin_publish(
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_staff()?;
+    // Publishing reaches every user (banner, modal, notifications and
+    // possibly e-mail): admin-only.
+    access
+        .require_admin()
+        .map_err(|_| ApiError::insufficient_role("Only admins can publish announcements."))?;
     let current = load(&state, id).await?;
     if current.archived_at.is_some() {
         return Err(ApiError::rule(

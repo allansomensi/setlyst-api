@@ -27,6 +27,13 @@ const DEFAULT_CACHE: Duration = Duration::from_secs(3600);
 /// Minimum time between two key refreshes triggered by unknown key ids,
 /// so forged tokens can't make us hammer Google.
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+/// How long keys fetched earlier keep being used while Google's key
+/// endpoint can't be reached (Google publishes keys well before signing
+/// with them and keeps retired ones for days), so an outage there doesn't
+/// stop every Google sign-in.
+const MAX_STALE: Duration = Duration::from_secs(24 * 3600);
+/// While serving stale keys, how long to wait before trying Google again.
+const STALE_RETRY: Duration = Duration::from_secs(300);
 
 /// What a verified token says about its owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +44,28 @@ pub struct GoogleIdentity {
     pub name: Option<String>,
     pub given_name: Option<String>,
     pub family_name: Option<String>,
+    /// The Google Workspace domain of the account (`hd` claim), if any.
+    pub hosted_domain: Option<String>,
+}
+
+impl GoogleIdentity {
+    /// Whether Google is authoritative for the address, so it can be
+    /// trusted to link an existing account by e-mail: a Gmail address, or
+    /// a Workspace account whose domain is the address's domain. For any
+    /// other address `email_verified` only means Google checked it once,
+    /// when the Google account was created (a lapsed domain or a recycled
+    /// mailbox could have changed hands since).
+    pub fn is_authoritative_for_email(&self) -> bool {
+        let email = self.email.trim().to_ascii_lowercase();
+        let Some((_, domain)) = email.rsplit_once('@') else {
+            return false;
+        };
+        matches!(domain, "gmail.com" | "googlemail.com")
+            || self
+                .hosted_domain
+                .as_deref()
+                .is_some_and(|hd| hd.trim().eq_ignore_ascii_case(domain))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +121,7 @@ struct GoogleClaims {
     name: Option<String>,
     given_name: Option<String>,
     family_name: Option<String>,
+    hd: Option<String>,
 }
 
 struct KeyCache {
@@ -99,6 +129,21 @@ struct KeyCache {
     keys: HashMap<String, (String, String)>,
     expires_at: Instant,
     fetched_at: Instant,
+}
+
+impl KeyCache {
+    /// Key `kid` from an expired cache when refreshing failed: known and
+    /// fetched less than [`MAX_STALE`] ago. The cache then counts as fresh
+    /// for [`STALE_RETRY`], so a Google outage isn't retried on every
+    /// sign-in.
+    fn stale_key(&mut self, kid: &str, now: Instant) -> Option<(String, String)> {
+        if now.saturating_duration_since(self.fetched_at) >= MAX_STALE {
+            return None;
+        }
+        let key = self.keys.get(kid).cloned()?;
+        self.expires_at = now + STALE_RETRY;
+        Some(key)
+    }
 }
 
 /// Production verifier: Google's JWKS over HTTPS.
@@ -178,7 +223,19 @@ impl GoogleJwksVerifier {
             return Ok(key.clone());
         }
         debug!("Refreshing Google signing keys");
-        let fresh = self.fetch_keys().await?;
+        let fresh = match self.fetch_keys().await {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                if let Some(key) = cache
+                    .as_mut()
+                    .and_then(|existing| existing.stale_key(kid, Instant::now()))
+                {
+                    warn!(error = ?e, "Could not refresh Google's signing keys; using the previous ones");
+                    return Ok(key);
+                }
+                return Err(e);
+            }
+        };
         let key = fresh.keys.get(kid).cloned();
         *cache = Some(fresh);
         key.ok_or_else(|| GoogleVerifyError::Invalid(format!("unknown key id {kid}")))
@@ -261,11 +318,13 @@ fn identity_from_claims(claims: GoogleClaims) -> Result<GoogleIdentity, GoogleVe
         name: claims.name,
         given_name: claims.given_name,
         family_name: claims.family_name,
+        hosted_domain: claims.hd.filter(|hd| !hd.trim().is_empty()),
     })
 }
 
 /// Test double: accepts tokens of the form `fake:<sub>:<email>[:<name>]`
-/// and anything registered with [`FakeGoogleVerifier::with`].
+/// and anything registered with [`FakeGoogleVerifier::with`]. A name
+/// ending in `@hd=<domain>` sets the Workspace domain.
 #[derive(Default)]
 pub struct FakeGoogleVerifier {
     identities: std::sync::Mutex<HashMap<String, GoogleIdentity>>,
@@ -303,12 +362,23 @@ impl GoogleTokenVerifier for FakeGoogleVerifier {
         let mut parts = id_token.splitn(4, ':');
         match (parts.next(), parts.next(), parts.next()) {
             (Some("fake"), Some(sub), Some(email)) if !sub.is_empty() && email.contains('@') => {
+                let (name, hosted_domain) = match parts.next() {
+                    Some(rest) => match rest.split_once("@hd=") {
+                        Some((name, hd)) => (
+                            (!name.is_empty()).then(|| name.to_string()),
+                            Some(hd.to_string()),
+                        ),
+                        None => (Some(rest.to_string()), None),
+                    },
+                    None => (None, None),
+                };
                 Ok(GoogleIdentity {
                     subject: sub.to_string(),
                     email: email.to_string(),
-                    name: parts.next().map(str::to_string),
+                    name,
                     given_name: None,
                     family_name: None,
+                    hosted_domain,
                 })
             }
             _ => Err(GoogleVerifyError::Invalid(
@@ -321,6 +391,24 @@ impl GoogleTokenVerifier for FakeGoogleVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_keys_are_served_for_a_day_then_dropped() {
+        let fetched = Instant::now();
+        let mut cache = KeyCache {
+            keys: HashMap::from([("k1".to_string(), ("n".to_string(), "e".to_string()))]),
+            expires_at: fetched + Duration::from_secs(60),
+            fetched_at: fetched,
+        };
+        let later = fetched + Duration::from_secs(3 * 3600);
+        assert_eq!(cache.stale_key("unknown", later), None);
+        assert_eq!(
+            cache.stale_key("k1", later),
+            Some(("n".to_string(), "e".to_string()))
+        );
+        assert_eq!(cache.expires_at, later + STALE_RETRY, "retried later");
+        assert_eq!(cache.stale_key("k1", fetched + MAX_STALE), None);
+    }
 
     #[test]
     fn cache_control_max_age() {
@@ -340,6 +428,7 @@ mod tests {
             name: Some("Ana".into()),
             given_name: None,
             family_name: None,
+            hd: None,
         };
         assert!(identity_from_claims(claims(Some(BoolOrString::Bool(true)))).is_ok());
         assert!(identity_from_claims(claims(Some(BoolOrString::String("true".into())))).is_ok());
@@ -357,6 +446,33 @@ mod tests {
         assert_eq!(identity.subject, "sub-1");
         assert_eq!(identity.name.as_deref(), Some("Ana Maria"));
         assert!(fake.verify("real-looking-token").await.is_err());
+        let workspace = fake
+            .verify("fake:sub-2:ceo@startup.example:@hd=startup.example")
+            .await
+            .unwrap();
+        assert_eq!(workspace.hosted_domain.as_deref(), Some("startup.example"));
+        assert!(workspace.name.is_none());
+    }
+
+    #[test]
+    fn only_gmail_or_a_matching_workspace_domain_is_authoritative() {
+        let identity = |email: &str, hd: Option<&str>| GoogleIdentity {
+            subject: "s".into(),
+            email: email.into(),
+            name: None,
+            given_name: None,
+            family_name: None,
+            hosted_domain: hd.map(str::to_string),
+        };
+        assert!(identity("ana@gmail.com", None).is_authoritative_for_email());
+        assert!(identity("Ana@GoogleMail.com", None).is_authoritative_for_email());
+        assert!(
+            identity("ceo@startup.example", Some("startup.example")).is_authoritative_for_email()
+        );
+        assert!(!identity("ceo@startup.example", None).is_authoritative_for_email());
+        assert!(
+            !identity("ceo@startup.example", Some("other.example")).is_authoritative_for_email()
+        );
     }
 
     #[tokio::test]

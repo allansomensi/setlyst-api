@@ -48,7 +48,6 @@ pub struct Band {
     pub slug: String,
     pub description: Option<String>,
     pub logo_url: Option<String>,
-    pub members_can_manage_setlists: bool,
     /// The account that created the band — `None` once that account is
     /// deleted. Ownership is tracked by the `owner` membership, not here.
     pub created_by: Option<Uuid>,
@@ -70,7 +69,6 @@ pub struct BandWithMembership {
     pub slug: String,
     pub description: Option<String>,
     pub logo_url: Option<String>,
-    pub members_can_manage_setlists: bool,
     pub created_by: Option<Uuid>,
     #[sqlx(default)]
     pub updated_by: Option<Uuid>,
@@ -121,7 +119,6 @@ impl Band {
             slug,
             description,
             logo_url: None,
-            members_can_manage_setlists: true,
             created_by: Some(created_by),
             updated_by: None,
             created_at: now,
@@ -150,7 +147,6 @@ pub struct UpdateBandPayload {
     #[serde(default, deserialize_with = "crate::models::patch::double_option")]
     #[validate(custom(function = "validate_logo_url"))]
     pub logo_url: Option<Option<String>>,
-    pub members_can_manage_setlists: Option<bool>,
     /// Up-votes that accept a song suggestion automatically (1 to 100);
     /// `null` turns automatic acceptance off.
     #[serde(default, deserialize_with = "crate::models::patch::double_option")]

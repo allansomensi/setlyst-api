@@ -1,14 +1,22 @@
 use crate::{
     controllers::{account, user},
     database::AppState,
+    routes::governor_presets,
 };
 use axum::{
     Router,
-    routing::{delete, get, patch, post},
+    routing::{get, patch, post},
 };
 
 pub fn create_routes(state: AppState) -> Router {
+    // Re-authentication codes: per IP on top of the per-account limits
+    // (one a minute, 5 an hour) enforced with the code itself.
+    let reauth_routes = Router::new()
+        .route("/me/reauth/code", post(account::send_reauth_code))
+        .layer(client_governor!(governor_presets::REAUTH_CODE));
+
     Router::new()
+        .merge(reauth_routes)
         .route("/", get(user::find_all_users).post(user::create_user))
         .route(
             "/me",
@@ -27,6 +35,7 @@ pub fn create_routes(state: AppState) -> Router {
             get(user::get_current_user_preferences).patch(user::update_current_user_preferences),
         )
         .route("/me/security", get(account::get_security))
+        .route("/me/data-export", get(account::export_personal_data))
         .route("/me/sessions/revoke", post(account::revoke_my_sessions))
         .route(
             "/me/email/verification",
@@ -48,7 +57,7 @@ pub fn create_routes(state: AppState) -> Router {
         .route("/me/identities", get(account::list_identities))
         .route(
             "/me/identities/{provider}",
-            delete(account::unlink_identity),
+            post(account::link_google).delete(account::unlink_identity),
         )
         .route(
             "/me/communication",

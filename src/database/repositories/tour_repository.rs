@@ -1,3 +1,4 @@
+use crate::database::repositories::quota_repository::QuotaGuard;
 use crate::{
     errors::api_error::ApiError,
     models::{
@@ -61,7 +62,14 @@ pub trait TourRepository: Send + Sync {
     async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Tour>, ApiError>;
     /// Any live tour (no access filter).
     async fn find_any(&self, id: Uuid) -> Result<Option<Tour>, ApiError>;
-    async fn create(&self, payload: &CreateTourPayload, user_id: Uuid) -> Result<Tour, ApiError>;
+    /// Creates a tour. `quota` is enforced inside the insert's transaction
+    /// (see [`QuotaGuard`]).
+    async fn create(
+        &self,
+        payload: &CreateTourPayload,
+        user_id: Uuid,
+        quota: &[QuotaGuard],
+    ) -> Result<Tour, ApiError>;
     async fn update(
         &self,
         id: Uuid,
@@ -222,7 +230,12 @@ impl TourRepository for TourRepositoryImpl {
         Ok(tour)
     }
 
-    async fn create(&self, payload: &CreateTourPayload, user_id: Uuid) -> Result<Tour, ApiError> {
+    async fn create(
+        &self,
+        payload: &CreateTourPayload,
+        user_id: Uuid,
+        quota: &[QuotaGuard],
+    ) -> Result<Tour, ApiError> {
         let id = Uuid::new_v4();
         let now = Utc::now().naive_utc();
         let description = payload
@@ -231,6 +244,8 @@ impl TourRepository for TourRepositoryImpl {
             .map(str::trim)
             .filter(|d| !d.is_empty());
 
+        let mut tx = self.db.begin().await?;
+        QuotaGuard::enforce_all(quota, &mut tx).await?;
         sqlx::query(
             "INSERT INTO tours (id, user_id, band_id, name, description, start_date, end_date, created_at, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)",
@@ -243,8 +258,9 @@ impl TourRepository for TourRepositoryImpl {
         .bind(payload.start_date)
         .bind(payload.end_date)
         .bind(now)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         self.find_any(id).await?.ok_or(ApiError::NotFound)
     }

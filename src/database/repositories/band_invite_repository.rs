@@ -10,6 +10,10 @@ use uuid::Uuid;
 
 #[async_trait::async_trait]
 pub trait BandInviteRepository: Send + Sync {
+    /// Creates an invite. Under the band row lock, the creator's current
+    /// role is re-checked (`admin`+ and above the invite's role:
+    /// `Forbidden` otherwise, e.g. after a concurrent demotion) and the
+    /// band's usable invites are capped at [`MAX_ACTIVE_INVITES_PER_BAND`].
     async fn create(
         &self,
         band_id: Uuid,
@@ -46,6 +50,10 @@ pub trait BandInviteRepository: Send + Sync {
 
 /// Invites expire after this many hours unless the creator chose otherwise.
 pub const DEFAULT_INVITE_EXPIRY_HOURS: i64 = 7 * 24;
+
+/// Usable (not revoked, expired or used up) invites a band may have at
+/// once (`QUOTA_EXCEEDED`, resource `band_invites`).
+pub const MAX_ACTIVE_INVITES_PER_BAND: i64 = 50;
 
 /// Limits enforced while redeeming an invite (`None` = unlimited).
 #[derive(Debug, Clone, Copy, Default)]
@@ -114,6 +122,40 @@ impl BandInviteRepository for BandInviteRepositoryImpl {
             created_at: Utc::now().naive_utc(),
         };
 
+        let mut tx = self.db.begin().await?;
+        sqlx::query("SELECT id FROM bands WHERE id = $1 FOR UPDATE")
+            .bind(band_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        let creator_role: Option<BandRole> =
+            sqlx::query_scalar("SELECT role FROM band_members WHERE band_id = $1 AND user_id = $2")
+                .bind(band_id)
+                .bind(created_by)
+                .fetch_optional(&mut *tx)
+                .await?;
+        match creator_role {
+            Some(creator) if creator.satisfies(BandRole::Admin) && role < creator => {}
+            Some(_) => return Err(ApiError::Forbidden),
+            None => return Err(ApiError::NotFound),
+        }
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM band_invites
+             WHERE band_id = $1 AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > $2)
+               AND (max_uses IS NULL OR uses_count < max_uses)",
+        )
+        .bind(band_id)
+        .bind(invite.created_at)
+        .fetch_one(&mut *tx)
+        .await?;
+        if active >= MAX_ACTIVE_INVITES_PER_BAND {
+            return Err(ApiError::quota_exceeded(
+                "band_invites",
+                MAX_ACTIVE_INVITES_PER_BAND,
+            ));
+        }
+
         sqlx::query(
             "INSERT INTO band_invites (id, band_id, code, role, created_by, max_uses, uses_count, expires_at, revoked_at, created_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
@@ -128,8 +170,9 @@ impl BandInviteRepository for BandInviteRepositoryImpl {
         .bind(invite.expires_at)
         .bind(invite.revoked_at)
         .bind(invite.created_at)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(invite)
     }

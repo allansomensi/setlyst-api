@@ -24,7 +24,7 @@ pub struct Config {
     pub impersonation_expiration_time: i64,
     pub cors_allowed_origins: Vec<HeaderValue>,
     /// Public web origin used to build links in e-mails
-    /// (`https://setlyst.app`), without a trailing slash.
+    /// (`https://www.setlyst.com.br`), without a trailing slash.
     pub app_base_url: String,
     /// AES-256-GCM key for secrets stored in the database (TOTP seeds).
     /// `None` = derived from `JWT_SECRET` (see `utils::crypto`), which
@@ -54,6 +54,27 @@ pub struct Config {
     pub trash_retention_days: i64,
     /// Serve the Swagger UI and the OpenAPI document.
     pub enable_swagger: bool,
+    /// Public origin of this API (`https://api.setlyst.com.br`), without a
+    /// trailing slash. Used for the one-click `List-Unsubscribe` link in
+    /// e-mails; `None` = only the web unsubscribe page is advertised.
+    pub api_public_url: Option<String>,
+    /// Non-security e-mails sent per hour, process-wide, before the worker
+    /// holds the rest back (codes and security notices are never held).
+    pub email_hourly_cap: i64,
+    /// Release builds refuse to start without `TRUSTED_PROXIES` or
+    /// `INTERNAL_API_SECRET` (behind a proxy every client would share one
+    /// rate-limit bucket) unless this is set (`ALLOW_DIRECT_CLIENTS`).
+    pub allow_direct_clients: bool,
+    /// Accept test-mode payment keys in a release build without logging an
+    /// error (`ALLOW_TEST_PAYMENTS`, for staging).
+    pub allow_test_payments: bool,
+    /// Don't set the per-session timeouts on new database connections
+    /// (`DATABASE_SKIP_SESSION_SETTINGS`), for transaction-mode poolers
+    /// that reject or leak session state; set them on the role instead.
+    pub database_skip_session_settings: bool,
+    /// Image classifications (Google Vision calls) allowed per UTC day;
+    /// past it, new images are queued for manual review instead.
+    pub vision_daily_budget: i64,
 }
 
 /// How the SMTP connection is secured.
@@ -74,7 +95,7 @@ pub struct SmtpConfig {
     pub username: Option<String>,
     pub password: Option<String>,
     pub tls: SmtpTls,
-    /// `Setlyst <no-reply@setlyst.app>`.
+    /// `Setlyst <no-reply@setlyst.com.br>`.
     pub from: String,
     pub reply_to: Option<String>,
 }
@@ -108,6 +129,37 @@ impl StripeConfig {
     pub fn is_test_mode(&self) -> bool {
         self.secret_key.contains("_test_")
     }
+
+    /// `true` for live-mode keys (real money).
+    pub fn is_live_mode(&self) -> bool {
+        self.secret_key.starts_with("sk_live_") || self.secret_key.starts_with("rk_live_")
+    }
+}
+
+/// The only API base a live payment key may be sent to.
+pub const STRIPE_OFFICIAL_API_BASE: &str = "https://api.stripe.com";
+
+/// Guard rails for real money: a live key only ever talks to Stripe itself
+/// (never to a mock or a proxy someone left configured), and the web
+/// origin the checkout returns to must be `https`.
+pub fn check_live_payments(
+    stripe: Option<&StripeConfig>,
+    app_base_url: &str,
+) -> Result<(), ConfigError> {
+    let Some(stripe) = stripe.filter(|s| s.is_live_mode()) else {
+        return Ok(());
+    };
+    if stripe.api_base != STRIPE_OFFICIAL_API_BASE {
+        return Err(ConfigError::Invalid(format!(
+            "STRIPE_API_BASE must be {STRIPE_OFFICIAL_API_BASE} with a live STRIPE_SECRET_KEY"
+        )));
+    }
+    if !app_base_url.starts_with("https://") {
+        return Err(ConfigError::Invalid(
+            "APP_BASE_URL must be https:// with a live STRIPE_SECRET_KEY".into(),
+        ));
+    }
+    Ok(())
 }
 
 // Hand-written so the keys never end up in a log line.
@@ -147,6 +199,12 @@ impl Default for Config {
             moderation_vision_api_key: None,
             trash_retention_days: 30,
             enable_swagger: true,
+            api_public_url: None,
+            email_hourly_cap: 500,
+            allow_direct_clients: false,
+            allow_test_payments: false,
+            database_skip_session_settings: false,
+            vision_daily_budget: 2_000,
         }
     }
 }
@@ -261,7 +319,8 @@ fn smtp_from_env() -> Result<Option<SmtpConfig>, ConfigError> {
         username: env_opt("SMTP_USERNAME"),
         password: env_opt("SMTP_PASSWORD"),
         tls,
-        from: env_opt("SMTP_FROM").unwrap_or_else(|| "Setlyst <no-reply@setlyst.app>".to_string()),
+        from: env_opt("SMTP_FROM")
+            .unwrap_or_else(|| "Setlyst <no-reply@setlyst.com.br>".to_string()),
         reply_to: env_opt("SMTP_REPLY_TO"),
     }))
 }
@@ -353,6 +412,17 @@ impl Config {
             .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
             .unwrap_or(true);
 
+        let app_base_url = env_opt("APP_BASE_URL")
+            .unwrap_or_else(|| "http://localhost:3000".to_string())
+            .trim_end_matches('/')
+            .to_string();
+        let stripe = parse_stripe(
+            env_opt("STRIPE_SECRET_KEY"),
+            env_opt("STRIPE_WEBHOOK_SECRET"),
+            env_opt("STRIPE_API_BASE"),
+        )?;
+        check_live_payments(stripe.as_ref(), &app_base_url)?;
+
         Ok(Config {
             host,
             database_url: std::env::var("DATABASE_URL")?,
@@ -363,10 +433,7 @@ impl Config {
             jwt_expiration_time: env_or("JWT_EXPIRATION_TIME", 86_400i64)?,
             impersonation_expiration_time: env_or("IMPERSONATION_EXPIRATION_TIME", 3_600i64)?,
             cors_allowed_origins,
-            app_base_url: env_opt("APP_BASE_URL")
-                .unwrap_or_else(|| "http://localhost:3000".to_string())
-                .trim_end_matches('/')
-                .to_string(),
+            app_base_url,
             data_encryption_key: resolve_data_key(
                 env_opt("DATA_ENCRYPTION_KEY").as_deref(),
                 env_bool("ALLOW_DERIVED_DATA_KEY", false),
@@ -378,15 +445,17 @@ impl Config {
             internal_api_secret: env_opt("INTERNAL_API_SECRET"),
             google_client_ids: split_list(&std::env::var("GOOGLE_CLIENT_IDS").unwrap_or_default()),
             smtp: smtp_from_env()?,
-            stripe: parse_stripe(
-                env_opt("STRIPE_SECRET_KEY"),
-                env_opt("STRIPE_WEBHOOK_SECRET"),
-                env_opt("STRIPE_API_BASE"),
-            )?,
+            stripe,
             email_worker_interval_secs: env_or("EMAIL_WORKER_INTERVAL_SECS", 10u64)?.max(1),
             moderation_vision_api_key: env_opt("MODERATION_VISION_API_KEY"),
             trash_retention_days: env_or("TRASH_RETENTION_DAYS", 30i64)?.clamp(1, 3650),
-            enable_swagger: env_bool("ENABLE_SWAGGER", true),
+            enable_swagger: env_bool("ENABLE_SWAGGER", cfg!(debug_assertions)),
+            api_public_url: env_opt("API_PUBLIC_URL").map(|u| u.trim_end_matches('/').to_string()),
+            email_hourly_cap: env_or("EMAIL_HOURLY_CAP", 500i64)?.max(0),
+            allow_direct_clients: env_bool("ALLOW_DIRECT_CLIENTS", false),
+            allow_test_payments: env_bool("ALLOW_TEST_PAYMENTS", false),
+            database_skip_session_settings: env_bool("DATABASE_SKIP_SESSION_SETTINGS", false),
+            vision_daily_budget: env_or("MODERATION_VISION_DAILY_BUDGET", 2_000i64)?.max(0),
         })
     }
 
@@ -470,6 +539,29 @@ mod tests {
             .unwrap();
         assert_eq!(live.api_base, "http://localhost:12111");
         assert!(!live.is_test_mode());
+    }
+
+    #[test]
+    fn live_payment_keys_only_talk_to_stripe_over_https() {
+        let s = |v: &str| Some(v.to_string());
+        let live = parse_stripe(s("sk_live_1"), s("whsec_1"), None)
+            .unwrap()
+            .unwrap();
+        assert!(live.is_live_mode() && !live.is_test_mode());
+        assert!(check_live_payments(Some(&live), "https://www.setlyst.com.br").is_ok());
+        assert!(check_live_payments(Some(&live), "http://www.setlyst.com.br").is_err());
+
+        let mocked = parse_stripe(s("rk_live_1"), s("whsec_1"), s("http://localhost:12111"))
+            .unwrap()
+            .unwrap();
+        assert!(check_live_payments(Some(&mocked), "https://www.setlyst.com.br").is_err());
+
+        // Test keys and no payments at all are never refused here.
+        let test = parse_stripe(s("sk_test_1"), s("whsec_1"), s("http://localhost:12111"))
+            .unwrap()
+            .unwrap();
+        assert!(check_live_payments(Some(&test), "http://localhost:3000").is_ok());
+        assert!(check_live_payments(None, "http://localhost:3000").is_ok());
     }
 
     #[test]

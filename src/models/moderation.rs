@@ -235,6 +235,9 @@ pub struct ResolveFlagPayload {
 /// `POST /admin/moderation/rescan`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RescanResponse {
-    /// New flags raised by the scan.
+    /// New flags raised by the username scan.
     pub flagged: i64,
+    /// Whether the (slower) avatar and logo scan was started in the
+    /// background; `false` when one was already running.
+    pub images_in_background: bool,
 }

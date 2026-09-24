@@ -2,22 +2,30 @@
 //! e-mail unsubscribe.
 
 use crate::{
-    database::AppState,
+    database::{
+        AppState,
+        repositories::audit_repository::{AuditEvent, record_legal_acceptances},
+    },
     email::unsubscribe,
     errors::api_error::ApiError,
     models::{
+        audit::{LegalAcceptance, actions, legal_documents},
+        auth::access::ClientIp,
         billing::PublicPlan,
-        communication::{UnsubscribeInfo, UnsubscribePayload, UnsubscribeQuery},
+        communication::{Category, UnsubscribeInfo, UnsubscribePayload, UnsubscribeQuery},
         release_note::ReleaseNote,
         user::CURRENT_TERMS_VERSION,
     },
+    services::account::user_agent,
 };
 use axum::{
     Json,
     extract::{Query, State},
+    http::HeaderMap,
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tracing::info;
 use utoipa::ToSchema;
 use validator::Validate;
@@ -137,21 +145,66 @@ pub async fn inspect_unsubscribe(Query(query): Query<UnsubscribeQuery>) -> impl 
 )]
 pub async fn unsubscribe(
     State(state): State<AppState>,
+    ip: ClientIp,
+    headers: HeaderMap,
     Json(payload): Json<UnsubscribePayload>,
 ) -> Result<impl IntoResponse, ApiError> {
     payload.validate()?;
-    let Some((user_id, category)) = unsubscribe::parse(&payload.token) else {
-        return Err(ApiError::BadRequest(
-            "This unsubscribe link is not valid.".into(),
-        ));
-    };
-    if state.user_repo.find_by_id(user_id).await?.is_none() {
-        return Err(ApiError::BadRequest(
-            "This unsubscribe link is not valid.".into(),
-        ));
+    Ok(Json(
+        apply_unsubscribe(&state, &payload.token, ip, &headers).await?,
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/public/email/unsubscribe/one-click",
+    tags = ["Public"],
+    summary = "One-click unsubscribe (RFC 8058).",
+    description = "The target of the `List-Unsubscribe` header of e-mails that can be unsubscribed from: mail providers POST `List-Unsubscribe=One-Click` (form-encoded) here when the recipient uses their own unsubscribe button. The token is taken from the query string; any body is ignored. Same effect as `POST /public/email/unsubscribe`. Invalid tokens answer `BAD_REQUEST`. Rate-limited per IP.",
+    params(UnsubscribeQuery),
+    responses(
+        (status = 200, description = "Unsubscribed.", body = UnsubscribeInfo),
+        (status = 400, description = "Invalid token."),
+    )
+)]
+pub async fn unsubscribe_one_click(
+    State(state): State<AppState>,
+    ip: ClientIp,
+    headers: HeaderMap,
+    Query(query): Query<UnsubscribeQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    if query.token.len() > 200 {
+        return Err(invalid_unsubscribe_link());
     }
+    Ok(Json(
+        apply_unsubscribe(&state, &query.token, ip, &headers).await?,
+    ))
+}
+
+fn invalid_unsubscribe_link() -> ApiError {
+    ApiError::BadRequest("This unsubscribe link is not valid.".into())
+}
+
+/// Switches e-mails of the token's category off for its account (the
+/// in-app setting is kept). A change is audited as
+/// `user.communication_changed` (source `unsubscribe_link`), and turning
+/// marketing e-mail off is recorded in the consent ledger as a withdrawal
+/// of the `marketing_email` consent (LGPD art. 8, § 5).
+async fn apply_unsubscribe(
+    state: &AppState,
+    token: &str,
+    ip: ClientIp,
+    headers: &HeaderMap,
+) -> Result<UnsubscribeInfo, ApiError> {
+    let Some((user_id, category)) = unsubscribe::parse(token) else {
+        return Err(invalid_unsubscribe_link());
+    };
+    let Some(user) = state.user_repo.find_by_id(user_id).await? else {
+        return Err(invalid_unsubscribe_link());
+    };
     let (mut prefs, _) = state.user_prefs_repo.get_communication(user_id).await?;
     let mut channel = prefs.get(category);
+    let was_on = channel.email;
     channel.email = false;
     prefs.set(category, channel);
     state
@@ -159,8 +212,33 @@ pub async fn unsubscribe(
         .set_communication(user_id, &prefs)
         .await?;
     info!(%user_id, category = category.key(), "Unsubscribed from e-mails");
-    Ok(Json(UnsubscribeInfo {
+
+    if was_on {
+        AuditEvent::new(actions::USER_COMMUNICATION_CHANGED)
+            .actor(user_id, &user.username)
+            .target("user", user_id, &user.username)
+            .meta(json!({ "categories": [category.key()], "source": "unsubscribe_link" }))
+            .ip(&ip.0)
+            .record(&*state.audit_repo)
+            .await;
+        if category == Category::Marketing {
+            record_legal_acceptances(
+                &*state.audit_repo,
+                &[LegalAcceptance {
+                    user_id,
+                    document: legal_documents::MARKETING_EMAIL,
+                    version: CURRENT_TERMS_VERSION.to_string(),
+                    accepted: false,
+                    source: "unsubscribe_link",
+                    ip_address: ip.0,
+                    user_agent: user_agent(headers),
+                }],
+            )
+            .await;
+        }
+    }
+    Ok(UnsubscribeInfo {
         category: Some(category),
         valid: true,
-    }))
+    })
 }

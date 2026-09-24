@@ -1,8 +1,10 @@
 //! Staff console endpoints (`/admin/...`).
 //!
-//! Reads, public-link moderation and the audit log are open to every
-//! staff member (moderators and admins). Anything that changes someone
-//! else's content, memberships or the platform limits is admin-only.
+//! Reads and public-link moderation are open to every staff member
+//! (moderators and admins); reads of private content are recorded in the
+//! audit log. The audit log itself (IP addresses, billing metadata) and
+//! anything that changes someone else's content, memberships or the
+//! platform limits are admin-only.
 
 use crate::{
     database::{AppState, repositories::audit_repository::AuditEvent},
@@ -17,11 +19,13 @@ use crate::{
         audit::{AuditLogEntry, AuditLogQuery, actions},
         auth::access::{AccessControl, ClientIp},
         band::{AdminAddBandMemberPayload, BandRole, UpdateBandPayload},
+        billing::{StaffRefundPayload, WithdrawResponse},
         notification::Notification,
         quota::QuotaLimits,
         setlist::UpdateSetlistPayload,
         song::{SongWithArtist, UpdateSongPayload},
     },
+    services::payments,
     validations::tag::normalize_tags,
 };
 use axum::{
@@ -453,6 +457,7 @@ pub async fn list_songs(
 pub async fn get_song(
     State(state): State<AppState>,
     access: AccessControl,
+    ip: ClientIp,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_staff()?;
@@ -461,7 +466,15 @@ pub async fn get_song(
         state.admin_repo.find_song(id),
     )?;
     match (song, summary) {
-        (Some(song), Some(summary)) => Ok(Json(AdminSongDetail { song, summary })),
+        (Some(song), Some(summary)) => {
+            // Staff reading private lyrics is recorded (LGPD
+            // accountability).
+            AuditEvent::by(&access, actions::STAFF_CONTENT_VIEWED)
+                .target("song", id, &song.title)
+                .ip(&ip.0)
+                .spawn(state.audit_repo.clone());
+            Ok(Json(AdminSongDetail { song, summary }))
+        }
         _ => Err(ApiError::NotFound),
     }
 }
@@ -592,6 +605,7 @@ pub async fn list_setlists(
 pub async fn get_setlist(
     State(state): State<AppState>,
     access: AccessControl,
+    ip: ClientIp,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_staff()?;
@@ -601,6 +615,10 @@ pub async fn get_setlist(
         .await?
         .ok_or(ApiError::NotFound)?;
     let items = state.setlist_repo.get_items(id).await?;
+    AuditEvent::by(&access, actions::STAFF_CONTENT_VIEWED)
+        .target("setlist", id, &setlist.title)
+        .ip(&ip.0)
+        .spawn(state.audit_repo.clone());
     Ok(Json(AdminSetlistDetail { setlist, items }))
 }
 
@@ -907,7 +925,7 @@ pub async fn unlock_gig_share(
     get,
     path = "/api/v1/admin/audit-logs",
     tags = ["Admin"],
-    summary = "The audit log, newest first.",
+    summary = "The audit log, newest first. Admin only.",
     params(AuditLogQuery),
     security(("jwt_token" = [])),
     responses((status = 200, description = "Entries.", body = PaginatedResponse<AuditLogEntry>))
@@ -917,7 +935,9 @@ pub async fn list_audit_logs(
     access: AccessControl,
     Query(query): Query<AuditLogQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    access.require_staff()?;
+    // IP addresses and billing metadata of every account: not for
+    // moderators.
+    access.require_admin()?;
     let (page, per_page) = crate::models::resolve_page(query.page, query.per_page, 50);
     let (entries, total) = state.audit_repo.list(&query, page, per_page).await?;
     Ok(Json(PaginatedResponse::new(entries, total, page, per_page)))
@@ -970,4 +990,45 @@ pub async fn update_quota_defaults(
         .await;
 
     Ok(Json(payload))
+}
+
+// ---------------------------------------------------------------------
+// Subscriptions
+// ---------------------------------------------------------------------
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/users/{id}/subscription/refund",
+    tags = ["Billing admin"],
+    summary = "Refund and cancel a user's paid subscription now (admin).",
+    description = "Cancels the account's paid subscription at the payment provider immediately and refunds it: every charge inside the 7-day withdrawal window when it is still open, otherwise the latest charge in full. The account loses the plan at once, gets a `withdrawal_confirmed` e-mail and the action is audited as `billing.subscription_refunded` (with `reason`). Admins only. Errors: `NO_PAID_SUBSCRIPTION` (409), `PAYMENTS_UNAVAILABLE`, `PAYMENT_PROVIDER_ERROR` (502, nothing changed: repeat the request).",
+    params(("id" = Uuid, Path, description = "User UUID")),
+    request_body = StaffRefundPayload,
+    security(("jwt_token" = [])),
+    responses(
+        (status = 200, description = "Refunded and canceled.", body = WithdrawResponse),
+        (status = 403, description = "Not an admin."),
+        (status = 404, description = "No such user."),
+        (status = 409, description = "No paid subscription."),
+        (status = 502, description = "The payment provider failed."),
+    )
+)]
+pub async fn refund_user_subscription(
+    State(state): State<AppState>,
+    access: AccessControl,
+    ip: ClientIp,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<StaffRefundPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    access.require_admin()?;
+    payload.validate()?;
+    let reason = payload.reason.trim();
+    if reason.is_empty() {
+        return Err(ApiError::BadRequest("A reason is required.".into()));
+    }
+    if state.user_repo.find_by_id(id).await?.is_none() {
+        return Err(ApiError::NotFound);
+    }
+    let refunded = payments::refund_and_cancel(&state, id, access.user_id(), reason, ip.0).await?;
+    Ok(Json(refunded))
 }

@@ -1,7 +1,7 @@
 use crate::{
     errors::api_error::ApiError,
     models::{
-        audit::{AuditLogEntry, AuditLogQuery},
+        audit::{AuditLogEntry, AuditLogQuery, LegalAcceptance},
         auth::access::AccessControl,
     },
 };
@@ -118,6 +118,16 @@ pub trait AuditRepository: Send + Sync {
         page: i64,
         per_page: i64,
     ) -> Result<(Vec<AuditLogEntry>, i64), ApiError>;
+    /// Records consents given or withdrawn (the legal acceptance ledger).
+    async fn record_legal_acceptances(&self, rows: &[LegalAcceptance]) -> Result<(), ApiError>;
+}
+
+/// Records `rows` in the legal acceptance ledger without failing the
+/// request (like audit entries: a ledger hiccup is logged loudly).
+pub async fn record_legal_acceptances(repo: &dyn AuditRepository, rows: &[LegalAcceptance]) {
+    if let Err(e) = repo.record_legal_acceptances(rows).await {
+        error!(error = %e, "Failed to record legal acceptances");
+    }
 }
 
 pub struct AuditRepositoryImpl {
@@ -226,5 +236,37 @@ impl AuditRepository for AuditRepositoryImpl {
         .await?;
 
         Ok((entries, count))
+    }
+
+    async fn record_legal_acceptances(&self, rows: &[LegalAcceptance]) -> Result<(), ApiError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let timestamp = chrono::Utc::now().naive_utc();
+        let mut tx = self.db.begin().await?;
+        for row in rows {
+            sqlx::query(
+                "INSERT INTO legal_acceptances (id, user_id, document, version, accepted, source,
+                                                ip_address, user_agent, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(row.user_id)
+            .bind(row.document)
+            .bind(&row.version)
+            .bind(row.accepted)
+            .bind(row.source)
+            .bind(&row.ip_address)
+            .bind(
+                row.user_agent
+                    .as_deref()
+                    .map(|ua| ua.chars().take(255).collect::<String>()),
+            )
+            .bind(timestamp)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 }

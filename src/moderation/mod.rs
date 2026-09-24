@@ -18,8 +18,69 @@ use crate::{
 };
 use image::ImageVerdict;
 use serde_json::json;
-use tracing::{error, info};
+use sqlx::PgPool;
+use std::{
+    sync::{
+        LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+use tokio::sync::Semaphore;
+use tracing::{error, info, warn};
 use uuid::Uuid;
+
+/// Image classifications (Vision calls) in flight at once, process-wide.
+/// Checks run in background tasks; without a bound, a burst of avatar or
+/// logo changes becomes thousands of concurrent 15-second HTTP calls.
+pub const VISION_CONCURRENCY: usize = 4;
+/// How long a check waits for a classification slot before giving up and
+/// queueing the image for manual review instead.
+const VISION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
+
+static VISION_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(VISION_CONCURRENCY));
+
+/// `platform_settings` key of the daily classification budget
+/// (`{ "day": "YYYY-MM-DD", "used": n }`, UTC days).
+const VISION_BUDGET_KEY: &str = "vision_budget";
+
+/// The verdict for an image that couldn't be classified automatically (the
+/// daily budget is spent, or every classification slot stayed busy): a
+/// flag with reason `review_pending` puts it in front of a moderator.
+pub fn review_pending(why: &'static str) -> ImageVerdict {
+    ImageVerdict {
+        reasons: vec!["review_pending"],
+        score: None,
+        details: json!({ "pending": why }),
+    }
+}
+
+/// Takes one classification from today's budget. `false` when the budget
+/// (`limit` per UTC day) is spent. Atomic across API instances: the
+/// counter lives in `platform_settings` and is bumped by a single
+/// conditional upsert.
+pub async fn take_vision_budget(pool: &PgPool, limit: i64) -> Result<bool, ApiError> {
+    let today = chrono::Utc::now().date_naive().to_string();
+    let taken: Option<i32> = sqlx::query_scalar(
+        "INSERT INTO platform_settings (key, value, updated_at)
+         VALUES ($1, jsonb_build_object('day', $2::text, 'used', 1), NOW())
+         ON CONFLICT (key) DO UPDATE SET
+             value = CASE WHEN platform_settings.value->>'day' = $2
+                          THEN jsonb_build_object('day', $2::text,
+                                   'used', COALESCE((platform_settings.value->>'used')::bigint, 0) + 1)
+                          ELSE jsonb_build_object('day', $2::text, 'used', 1) END,
+             updated_at = NOW()
+         WHERE platform_settings.value->>'day' IS DISTINCT FROM $2
+            OR COALESCE((platform_settings.value->>'used')::bigint, 0) < $3
+         RETURNING 1",
+    )
+    .bind(VISION_BUDGET_KEY)
+    .bind(&today)
+    .bind(limit)
+    .fetch_optional(pool)
+    .await?;
+    Ok(taken.is_some() && limit > 0)
+}
 
 /// The outcome of checking a piece of text.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -64,9 +125,14 @@ pub trait ModerationService: Send + Sync {
 }
 
 /// Production implementation: word list, URL heuristics and, when
-/// `MODERATION_VISION_API_KEY` is set, Google Cloud Vision SafeSearch.
+/// `MODERATION_VISION_API_KEY` is set, Google Cloud Vision SafeSearch —
+/// at most [`VISION_CONCURRENCY`] calls at once and
+/// `Config::vision_daily_budget` per UTC day (with a pool to keep the
+/// count in; without one, the budget isn't enforced). Past either, the
+/// image is flagged `review_pending` for a human instead.
 pub struct DefaultModerationService {
     http: reqwest::Client,
+    budget_pool: Option<PgPool>,
 }
 
 impl DefaultModerationService {
@@ -76,7 +142,41 @@ impl DefaultModerationService {
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .unwrap_or_default(),
+            budget_pool: None,
         }
+    }
+
+    /// Enforces the daily classification budget, counted in `pool`.
+    pub fn with_budget(mut self, pool: PgPool) -> Self {
+        self.budget_pool = Some(pool);
+        self
+    }
+
+    async fn classify(&self, key: &str, url: &str) -> ImageVerdict {
+        let Ok(Ok(_slot)) =
+            tokio::time::timeout(VISION_ACQUIRE_TIMEOUT, VISION_SLOTS.acquire()).await
+        else {
+            warn!("Image classification is saturated; queued for manual review");
+            return review_pending("classifier_busy");
+        };
+        if let Some(pool) = &self.budget_pool {
+            let limit = Config::try_get().map_or(2_000, |c| c.vision_daily_budget);
+            match take_vision_budget(pool, limit).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        limit,
+                        "Daily image classification budget spent; queued for manual review"
+                    );
+                    return review_pending("daily_budget_spent");
+                }
+                Err(e) => {
+                    error!(error = %e, "Could not read the image classification budget");
+                    return review_pending("budget_unavailable");
+                }
+            }
+        }
+        image::classify_with_vision(&self.http, key, url).await
     }
 }
 
@@ -94,7 +194,7 @@ impl ModerationService for DefaultModerationService {
             return verdict;
         }
         match Config::try_get().and_then(|c| c.moderation_vision_api_key.as_deref()) {
-            Some(key) => image::classify_with_vision(&self.http, key, url).await,
+            Some(key) => self.classify(key, url).await,
             None => verdict,
         }
     }
@@ -231,37 +331,148 @@ pub fn spawn_band_logo_review(state: &AppState, band_id: Uuid, url: &str) {
     });
 }
 
-/// Re-checks every username, avatar and band logo on the platform.
-/// Returns how many new flags were raised.
-pub async fn rescan_all(state: &AppState) -> Result<i64, ApiError> {
+/// Users (or bands) read per page by the rescans.
+const RESCAN_PAGE: i64 = 500;
+
+/// Re-checks every username (word list only, no network) and returns how
+/// many new flags were raised. Pages through the users by id, so memory
+/// stays bounded however many accounts there are.
+pub async fn rescan_usernames(state: &AppState) -> Result<i64, ApiError> {
+    let mut flagged = 0i64;
+    let mut cursor = Uuid::nil();
+    loop {
+        let page: Vec<(Uuid, String)> =
+            sqlx::query_as("SELECT id, username FROM users WHERE id > $1 ORDER BY id LIMIT $2")
+                .bind(cursor)
+                .bind(RESCAN_PAGE)
+                .fetch_all(&state.db)
+                .await?;
+        let Some(last) = page.last() else {
+            break;
+        };
+        cursor = last.0;
+        for (id, username) in &page {
+            if review_username(state, *id, username).await? {
+                flagged += 1;
+            }
+        }
+        if (page.len() as i64) < RESCAN_PAGE {
+            break;
+        }
+    }
+    Ok(flagged)
+}
+
+/// Whether this exact image was already looked at (a flag of any status,
+/// open or resolved, for the same owner and URL): re-classifying it would
+/// only bill the same answer again.
+async fn already_reviewed(
+    state: &AppState,
+    target: ModerationTarget,
+    user_id: Option<Uuid>,
+    band_id: Option<Uuid>,
+    url: &str,
+) -> Result<bool, ApiError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM moderation_flags
+                        WHERE target_type = $1::moderation_target AND value = $2
+                          AND ($3::uuid IS NULL OR user_id = $3)
+                          AND ($4::uuid IS NULL OR band_id = $4))",
+    )
+    .bind(target.key())
+    .bind(url)
+    .bind(user_id)
+    .bind(band_id)
+    .fetch_one(&state.db)
+    .await?)
+}
+
+/// Re-checks every avatar and band logo, paging with an id cursor and
+/// skipping images already reviewed. Returns how many new flags were
+/// raised. Slow (network-bound): run it through [`spawn_image_rescan`].
+pub async fn rescan_images(state: &AppState) -> Result<i64, ApiError> {
     let mut flagged = 0i64;
 
-    let users: Vec<(Uuid, String, Option<String>)> =
-        sqlx::query_as("SELECT id, username, avatar_url FROM users ORDER BY created_at")
-            .fetch_all(&state.db)
-            .await?;
-    for (id, username, avatar_url) in users {
-        if review_username(state, id, &username).await? {
-            flagged += 1;
+    let mut cursor = Uuid::nil();
+    loop {
+        let page: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT id, avatar_url FROM users
+             WHERE id > $1 AND avatar_url IS NOT NULL ORDER BY id LIMIT $2",
+        )
+        .bind(cursor)
+        .bind(RESCAN_PAGE)
+        .fetch_all(&state.db)
+        .await?;
+        let Some(last) = page.last() else {
+            break;
+        };
+        cursor = last.0;
+        for (id, url) in &page {
+            if !already_reviewed(state, ModerationTarget::Avatar, Some(*id), None, url).await?
+                && review_avatar(state, *id, url).await?
+            {
+                flagged += 1;
+            }
         }
-        if let Some(url) = avatar_url
-            && review_avatar(state, id, &url).await?
-        {
-            flagged += 1;
+        if (page.len() as i64) < RESCAN_PAGE {
+            break;
         }
     }
 
-    let bands: Vec<(Uuid, String)> =
-        sqlx::query_as("SELECT id, logo_url FROM bands WHERE logo_url IS NOT NULL")
-            .fetch_all(&state.db)
-            .await?;
-    for (id, url) in bands {
-        if review_band_logo(state, id, &url).await? {
-            flagged += 1;
+    let mut cursor = Uuid::nil();
+    loop {
+        let page: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT id, logo_url FROM bands
+             WHERE id > $1 AND logo_url IS NOT NULL ORDER BY id LIMIT $2",
+        )
+        .bind(cursor)
+        .bind(RESCAN_PAGE)
+        .fetch_all(&state.db)
+        .await?;
+        let Some(last) = page.last() else {
+            break;
+        };
+        cursor = last.0;
+        for (id, url) in &page {
+            if !already_reviewed(state, ModerationTarget::BandLogo, None, Some(*id), url).await?
+                && review_band_logo(state, *id, url).await?
+            {
+                flagged += 1;
+            }
+        }
+        if (page.len() as i64) < RESCAN_PAGE {
+            break;
         }
     }
 
     Ok(flagged)
+}
+
+/// Set while an image rescan runs, so repeated clicks don't start (and
+/// bill) the same scan twice.
+static IMAGE_RESCAN_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Starts [`rescan_images`] in the background unless one is already
+/// running in this process. Returns whether a scan was started.
+pub fn spawn_image_rescan(state: &AppState) -> bool {
+    if IMAGE_RESCAN_RUNNING.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        match rescan_images(&state).await {
+            Ok(flagged) => info!(flagged, "Image rescan finished"),
+            Err(e) => error!(error = %e, "Image rescan failed"),
+        }
+        IMAGE_RESCAN_RUNNING.store(false, Ordering::SeqCst);
+    });
+    true
+}
+
+/// Re-checks every username, avatar and band logo on the platform, in the
+/// calling task. Returns how many new flags were raised.
+pub async fn rescan_all(state: &AppState) -> Result<i64, ApiError> {
+    Ok(rescan_usernames(state).await? + rescan_images(state).await?)
 }
 
 #[cfg(test)]

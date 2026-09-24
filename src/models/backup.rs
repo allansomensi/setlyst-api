@@ -3,7 +3,7 @@ use crate::models::link::LinkInput;
 use crate::models::song::{
     Genre, Tonality, validate_performance_notes, validate_time_signature, validate_tuning,
 };
-use crate::validations::link::MAX_LINKS;
+use crate::validations::{link::MAX_LINKS, tag::MAX_TAGS_PER_SONG};
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -130,10 +130,17 @@ pub struct ImportSummary {
     pub gigs_imported: usize,
     #[serde(default)]
     pub tours_imported: usize,
+    /// Tours in the file left out because the plan doesn't include the
+    /// `tours` feature (their gigs are imported without a tour).
+    #[serde(default)]
+    pub skipped_tours: usize,
 }
 
 /// Largest number of records of each kind a single backup may carry.
 pub const MAX_BACKUP_RECORDS: usize = 20_000;
+
+/// Largest song position accepted inside a backed-up setlist.
+pub const MAX_BACKUP_POSITION: i32 = 1_000_000;
 
 impl BackupFile {
     /// Structural validation run before anything touches the database, so
@@ -221,6 +228,9 @@ impl BackupFile {
             if song.links.len() > MAX_LINKS {
                 return Err(format!("\"{}\" has too many links.", song.title));
             }
+            if song.tags.len() > MAX_TAGS_PER_SONG {
+                return Err(format!("\"{}\" has too many tags.", song.title));
+            }
         }
         for setlist in &self.setlists {
             if !bounded(&setlist.title, 255) {
@@ -241,6 +251,18 @@ impl BackupFile {
             }
             if setlist.songs.len() > MAX_BACKUP_RECORDS {
                 return Err(format!("\"{}\" has too many songs.", setlist.title));
+            }
+            // Positions are appended to (`MAX(position) + 1`) later on; a
+            // value near `i32::MAX` would make every later add overflow.
+            if setlist
+                .songs
+                .iter()
+                .any(|entry| !(0..=MAX_BACKUP_POSITION).contains(&entry.position))
+            {
+                return Err(format!(
+                    "\"{}\" has a song position outside 0..={MAX_BACKUP_POSITION}.",
+                    setlist.title
+                ));
             }
         }
         for gig in &self.gigs {

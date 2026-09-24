@@ -25,6 +25,12 @@ pub const ISSUE_MISSING_DIGIT: &str = "missing_digit";
 pub const ISSUE_MISSING_SYMBOL: &str = "missing_symbol";
 pub const ISSUE_CONTAINS_USERNAME: &str = "contains_username";
 pub const ISSUE_TOO_COMMON: &str = "too_common";
+/// The password appears in a public breach corpus (Have I Been Pwned).
+pub const ISSUE_BREACHED: &str = "breached";
+
+/// How long the breach check may take before it is skipped.
+const BREACH_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const BREACH_RANGE_URL: &str = "https://api.pwnedpasswords.com/range/";
 
 /// A small list of the most commonly breached passwords (and trivial
 /// variants that would otherwise satisfy the character-class rules).
@@ -140,6 +146,89 @@ pub fn is_password_compliant(password: &str, username: Option<&str>) -> bool {
     password_issues(password, username).is_empty()
 }
 
+/// Whether the breach check runs: on unless `DISABLE_BREACHED_PASSWORD_CHECK`
+/// is truthy, and never in test runs (`TEST_DATABASE_URL` set, or unit
+/// tests), which must not reach the network.
+fn breach_check_enabled() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    let disabled = std::env::var("DISABLE_BREACHED_PASSWORD_CHECK").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    });
+    !disabled && std::env::var_os("TEST_DATABASE_URL").is_none()
+}
+
+/// `true` when a Pwned Passwords range answer (`SUFFIX:COUNT` lines)
+/// lists `suffix` (upper-case hex, the SHA-1 minus its first 5 chars) with
+/// a non-zero count (padding entries have a count of 0).
+pub fn range_lists_suffix(body: &str, suffix: &str) -> bool {
+    body.lines().any(|line| {
+        let mut parts = line.trim().splitn(2, ':');
+        matches!(
+            (parts.next(), parts.next().map(|c| c.trim().parse::<u64>())),
+            (Some(candidate), Some(Ok(count))) if count > 0 && candidate.eq_ignore_ascii_case(suffix)
+        )
+    })
+}
+
+/// Checks `password` against Have I Been Pwned with k-anonymity: only the
+/// first 5 hex characters of its SHA-1 leave the server. Fails open: any
+/// network problem (or more than 2 seconds) counts as "not breached", so
+/// an outage never blocks sign-ups.
+pub async fn is_breached(password: &str) -> bool {
+    use sha1::{Digest, Sha1};
+    use std::sync::LazyLock;
+
+    static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(BREACH_CHECK_TIMEOUT)
+            .build()
+            .unwrap_or_default()
+    });
+
+    if !breach_check_enabled() {
+        return false;
+    }
+    let normalized = crate::utils::hashing::normalize_password(password);
+    let digest = crate::utils::crypto::hex(&Sha1::digest(normalized.as_bytes())).to_uppercase();
+    let (prefix, suffix) = digest.split_at(5);
+    let request = CLIENT
+        .get(format!("{BREACH_RANGE_URL}{prefix}"))
+        .header("Add-Padding", "true")
+        .send();
+    let body = match tokio::time::timeout(BREACH_CHECK_TIMEOUT, async {
+        request.await?.error_for_status()?.text().await
+    })
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "Breached-password check unavailable; skipped");
+            return false;
+        }
+        Err(_) => {
+            tracing::warn!("Breached-password check timed out; skipped");
+            return false;
+        }
+    };
+    range_lists_suffix(&body, suffix)
+}
+
+/// [`password_issues`] plus the breach check ([`is_breached`]), for the
+/// places a password is chosen: sign-up, change and recovery. The breach
+/// check only runs when every local rule passes.
+pub async fn password_issues_checked(password: &str, username: Option<&str>) -> Vec<&'static str> {
+    let mut issues = password_issues(password, username);
+    if issues.is_empty() && is_breached(password).await {
+        issues.push(ISSUE_BREACHED);
+    }
+    issues
+}
+
 /// `validator` adapter for payload fields. Cannot see the username, so
 /// handlers that know it must additionally call [`password_issues`] with
 /// it (see the call sites in `controllers::user` and `controllers::auth`).
@@ -211,6 +300,25 @@ mod tests {
     fn rejects_common_passwords_even_when_they_satisfy_the_classes() {
         let issues = password_issues("P@ssw0rd1", None);
         assert_eq!(issues, vec![ISSUE_TOO_COMMON]);
+    }
+
+    #[test]
+    fn breach_ranges_are_parsed_with_padding() {
+        let body =
+            "0018A45C4D1DEF81644B54AB7F969B88D65:1\r\n00D4F6E8FA6EECAD2A3AA415EEC418D38EC:0\r\n";
+        assert!(range_lists_suffix(
+            body,
+            "0018a45c4d1def81644b54ab7f969b88d65"
+        ));
+        assert!(!range_lists_suffix(
+            body,
+            "00D4F6E8FA6EECAD2A3AA415EEC418D38EC"
+        ));
+        assert!(!range_lists_suffix(body, "FFFF"));
+        assert!(
+            !breach_check_enabled(),
+            "never reaches the network in tests"
+        );
     }
 
     #[test]

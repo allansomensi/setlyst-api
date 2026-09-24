@@ -6,7 +6,9 @@ use crate::{
     models::{
         auth::access::AccessControl,
         band::BandRole,
-        band_note::{BandNote, CreateBandNotePayload, MAX_BAND_NOTES, UpdateBandNotePayload},
+        band_note::{
+            BandNote, BandNoteRow, CreateBandNotePayload, MAX_BAND_NOTES, UpdateBandNotePayload,
+        },
     },
 };
 use axum::{
@@ -19,8 +21,14 @@ use tracing::info;
 use uuid::Uuid;
 use validator::Validate;
 
-fn can_edit(role: BandRole, author: Option<Uuid>, user_id: Uuid) -> bool {
-    role.satisfies(BandRole::Moderator) || author == Some(user_id)
+/// Its author, or a moderator or above acting on a note whose author ranks
+/// below them (or has left the band); the owner may edit any note.
+fn can_edit(role: BandRole, row: &BandNoteRow, user_id: Uuid) -> bool {
+    if row.author_id == Some(user_id) {
+        return true;
+    }
+    role.satisfies(BandRole::Moderator)
+        && (role == BandRole::Owner || row.author_role.is_none_or(|author| author < role))
 }
 
 #[utoipa::path(
@@ -28,7 +36,7 @@ fn can_edit(role: BandRole, author: Option<Uuid>, user_id: Uuid) -> bool {
     path = "/api/v1/bands/{id}/notes",
     tags = ["Bands"],
     summary = "A band's reminders.",
-    description = "Any member. Pinned first, then newest. `can_edit` tells whether the caller may change each one (its author, or a moderator or above).",
+    description = "Any member. Pinned first, then newest. `can_edit` tells whether the caller may change each one (its author, or a moderator or above ranking higher than the author; the owner always).",
     params(("id" = Uuid, Path, description = "The ID of the band")),
     security(("jwt_token" = [])),
     responses((status = 200, description = "Reminders.", body = [BandNote]))
@@ -49,7 +57,7 @@ pub async fn list_notes(
         .await?
         .into_iter()
         .map(|row| {
-            let editable = can_edit(role, row.author_id, user_id);
+            let editable = can_edit(role, &row, user_id);
             row.into_note(editable)
         })
         .collect();
@@ -134,7 +142,7 @@ pub async fn update_note(
         .find(id, band_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if !can_edit(role, row.author_id, user_id)
+    if !can_edit(role, &row, user_id)
         || (payload.is_pinned.is_some() && !role.satisfies(BandRole::Moderator))
     {
         return Err(ApiError::Forbidden);
@@ -156,7 +164,7 @@ pub async fn update_note(
     path = "/api/v1/bands/{id}/notes/{nid}",
     tags = ["Bands"],
     summary = "Delete a reminder.",
-    description = "Its author, or a moderator or above.",
+    description = "Its author, or a moderator or above whose role is higher than the author's (the owner may delete any reminder).",
     params(
         ("id" = Uuid, Path, description = "The ID of the band"),
         ("nid" = Uuid, Path, description = "The reminder ID")
@@ -183,7 +191,7 @@ pub async fn delete_note(
         .find(id, band_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if !can_edit(role, row.author_id, user_id) {
+    if !can_edit(role, &row, user_id) {
         return Err(ApiError::Forbidden);
     }
     state.band_note_repo.delete(id, band_id).await?;

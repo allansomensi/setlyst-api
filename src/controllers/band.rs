@@ -12,11 +12,13 @@ use crate::{
         notification::Notification,
         quota::QuotaResource,
     },
+    moderation::image::normalize_image_url,
+    services::account::{require_verified_email, too_many_attempts},
     services::{
         entitlements::{Feature, ensure_feature},
         notifier::notify,
     },
-    utils::share_token::token_fingerprint,
+    utils::{rate_limit::SlidingWindowLimiter, share_token::token_fingerprint},
 };
 use axum::{
     Json,
@@ -24,9 +26,15 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header::LOCATION},
     response::IntoResponse,
 };
+use std::{sync::LazyLock, time::Duration};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 use validator::Validate;
+
+/// Logo changes per band per day: each new picture costs an image
+/// classification.
+static BAND_LOGO_LIMITER: LazyLock<SlidingWindowLimiter<Uuid>> =
+    LazyLock::new(|| SlidingWindowLimiter::new(10, Duration::from_secs(24 * 3600)));
 
 // ---------------------------------------------------------------------
 // Bands
@@ -89,7 +97,7 @@ pub async fn find_band_by_id(
     path = "/api/v1/bands",
     tags = ["Bands"],
     summary = "Create a new band.",
-    description = "The creator automatically becomes the band's owner. The band's repertoire is created with it. Requires the plan feature `create_bands`.",
+    description = "The creator automatically becomes the band's owner. The band's repertoire is created with it. Requires a verified e-mail address (`EMAIL_NOT_VERIFIED`, 403) and the plan feature `create_bands`.",
     request_body = CreateBandPayload,
     security((), ("jwt_token" = [])),
     responses(
@@ -106,18 +114,22 @@ pub async fn create_band(
     debug!(%user_id, band_name = %payload.name, "Processing request to create a new band");
 
     payload.validate()?;
+    require_verified_email(&state, user_id).await?;
     ensure_feature(&state, user_id, Feature::CreateBands).await?;
 
-    state
+    let owned = state
         .quota_repo
-        .ensure_user(user_id, QuotaResource::BandsOwned, 1)
+        .user_guard(user_id, QuotaResource::BandsOwned, 1)
         .await?;
-    state
+    let memberships = state
         .quota_repo
-        .ensure_user(user_id, QuotaResource::BandMemberships, 1)
+        .user_guard(user_id, QuotaResource::BandMemberships, 1)
         .await?;
 
-    let new_band = state.band_repo.create(&payload, user_id).await?;
+    let new_band = state
+        .band_repo
+        .create(&payload, user_id, &[owned, memberships])
+        .await?;
 
     info!(%user_id, band_id = %new_band.id, "Band created successfully");
 
@@ -135,7 +147,7 @@ pub async fn create_band(
     path = "/api/v1/bands/{id}",
     tags = ["Bands"],
     summary = "Update a band's details.",
-    description = "Requires the `admin` band role or higher. A new `logo_url` must be a public `https` image link (`INVALID_IMAGE_URL`) and is reviewed by the automatic moderation in the background. `suggestion_auto_accept_votes` (1..100, `null` = off) sets how many up-votes accept a song suggestion automatically.",
+    description = "Requires the `admin` band role or higher. A new `logo_url` must be a public `https` image link (`INVALID_IMAGE_URL`) and is reviewed by the automatic moderation in the background; at most 10 logo changes per band per day (`TOO_MANY_ATTEMPTS`, 429). Re-sending the current logo (even with another query string) doesn't count. Setting a new logo needs a verified e-mail address (`EMAIL_NOT_VERIFIED`, 403). `suggestion_auto_accept_votes` (1..100, `null` = off) sets how many up-votes accept a song suggestion automatically.",
     params(("id" = Uuid, Path, description = "The ID of the band")),
     request_body = UpdateBandPayload,
     security((), ("jwt_token" = [])),
@@ -171,9 +183,30 @@ pub async fn update_band(
         _ => None,
     };
 
+    // Only a different picture is reviewed (and counted): re-sending the
+    // same logo, or the same URL with another query string, is free.
+    let logo_changed = match &new_logo {
+        Some(url) => {
+            let previous = state
+                .band_repo
+                .find_any(id)
+                .await?
+                .and_then(|band| band.logo_url);
+            previous.as_deref().map(normalize_image_url) != Some(normalize_image_url(url))
+        }
+        None => false,
+    };
+    if logo_changed {
+        // A new picture is published under the band's name.
+        require_verified_email(&state, user_id).await?;
+        BAND_LOGO_LIMITER
+            .check(&id)
+            .map_err(|retry| too_many_attempts(retry.as_secs() as i64))?;
+    }
+
     let band_id = state.band_repo.update(id, &payload, user_id).await?;
 
-    if let Some(url) = new_logo {
+    if let (Some(url), true) = (new_logo, logo_changed) {
         crate::moderation::spawn_band_logo_review(&state, band_id, &url);
     }
 
@@ -275,7 +308,7 @@ pub async fn unfavorite_band(
     path = "/api/v1/bands/{id}/transfer-ownership",
     tags = ["Bands"],
     summary = "Transfer band ownership to another member.",
-    description = "The caller must currently be the `owner`. The caller becomes an `admin`.",
+    description = "The caller must currently be the `owner`. The caller becomes an `admin`. The new owner's `bands_owned` quota applies (`QUOTA_EXCEEDED`). A concurrent change of ownership answers 409.",
     params(("id" = Uuid, Path, description = "The ID of the band")),
     request_body = TransferOwnershipPayload,
     security((), ("jwt_token" = [])),
@@ -305,9 +338,16 @@ pub async fn transfer_ownership(
         return Err(ApiError::NotModified);
     }
 
+    // The recipient takes on the band's quota burden: their own
+    // `bands_owned` limit applies (checked again under the band lock).
+    let owned_limit = state
+        .quota_repo
+        .effective_limits(payload.new_owner_id)
+        .await?
+        .map(|limits| limits.bands_owned);
     state
         .band_member_repo
-        .transfer_ownership(id, user_id, payload.new_owner_id)
+        .transfer_ownership_within(id, user_id, payload.new_owner_id, owned_limit)
         .await?;
 
     info!(%user_id, band_id = %id, new_owner_id = %payload.new_owner_id, "Band ownership transferred successfully");
@@ -386,31 +426,12 @@ pub async fn update_band_member_role(
         return Err(ApiError::Forbidden);
     }
 
-    let caller_role = state
-        .band_repo
-        .require_role(band_id, user_id, BandRole::Admin)
-        .await?;
-
+    // The hierarchy (caller `admin`+, target below the caller, only the
+    // owner grants `admin`) is checked under the band lock, together with
+    // the write.
     let target_role = state
-        .band_repo
-        .role_of(band_id, target_user_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-
-    if target_role >= caller_role {
-        error!(%user_id, %target_user_id, "Cannot manage a member with an equal or higher role.");
-        return Err(ApiError::Forbidden);
-    }
-
-    // Nobody but the owner can hand out a role as high as their own.
-    if payload.role >= caller_role && caller_role != BandRole::Owner {
-        error!(%user_id, %target_user_id, "Cannot grant a role equal to or higher than the caller's own.");
-        return Err(ApiError::Forbidden);
-    }
-
-    state
         .band_member_repo
-        .update_role(band_id, target_user_id, payload.role)
+        .change_role(band_id, user_id, target_user_id, payload.role)
         .await?;
 
     if let Some(band) = state.band_repo.find_by_id(band_id, user_id).await? {
@@ -437,7 +458,7 @@ pub async fn update_band_member_role(
     path = "/api/v1/bands/{id}/members/{user_id}/title",
     tags = ["Bands"],
     summary = "Set or clear a band member's free-text title/function.",
-    description = "Purely cosmetic (e.g. \"Guitarrista\", \"Baixista\") — never affects permissions. A member may set their own title; an `admin` or higher may set anyone's.",
+    description = "Purely cosmetic (e.g. \"Guitarrista\", \"Baixista\") — never affects permissions. A member may set their own title; an `admin` or higher may set the title of members ranking below them.",
     params(
         ("id" = Uuid, Path, description = "The ID of the band"),
         ("user_id" = Uuid, Path, description = "The ID of the member to update")
@@ -462,10 +483,21 @@ pub async fn update_band_member_title(
     payload.validate()?;
 
     if target_user_id != user_id {
-        state
+        let caller_role = state
             .band_repo
             .require_role(band_id, user_id, BandRole::Admin)
             .await?;
+        // Like every other member action: only on members below oneself
+        // (an admin can't relabel the owner or another admin).
+        let target_role = state
+            .band_repo
+            .role_of(band_id, target_user_id)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        if target_role >= caller_role {
+            error!(%user_id, %target_user_id, "Cannot set the title of a member with an equal or higher role.");
+            return Err(ApiError::Forbidden);
+        }
     } else {
         // Still ensure the caller is actually a member of this band.
         state
@@ -508,39 +540,11 @@ pub async fn remove_band_member(
     let user_id = access.user_id();
     debug!(%user_id, %band_id, %target_user_id, "Processing request to remove band member");
 
-    let caller_role = state
-        .band_repo
-        .role_of(band_id, user_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-
-    if target_user_id == user_id {
-        // Leaving the band. The owner must transfer ownership first so the
-        // band is never left without one.
-        if caller_role == BandRole::Owner {
-            error!(%user_id, %band_id, "Band owner attempted to leave without transferring ownership first.");
-            return Err(ApiError::Forbidden);
-        }
-    } else {
-        if !caller_role.satisfies(BandRole::Admin) {
-            return Err(ApiError::Forbidden);
-        }
-
-        let target_role = state
-            .band_repo
-            .role_of(band_id, target_user_id)
-            .await?
-            .ok_or(ApiError::NotFound)?;
-
-        if target_role >= caller_role {
-            error!(%user_id, %target_user_id, "Cannot remove a member with an equal or higher role.");
-            return Err(ApiError::Forbidden);
-        }
-    }
-
+    // Leaving, or removing someone ranking below the caller: checked under
+    // the band lock, together with the delete.
     state
         .band_member_repo
-        .remove(band_id, target_user_id)
+        .remove_as(band_id, user_id, target_user_id)
         .await?;
 
     // Only notify when someone else removed the member — voluntarily
@@ -568,7 +572,7 @@ pub async fn remove_band_member(
     path = "/api/v1/bands/{id}/invites",
     tags = ["Bands"],
     summary = "Create an invite link for a band.",
-    description = "Requires `admin` or higher. Codes are 16 characters long; invites expire after 7 days unless `expires_in_hours` says otherwise (up to one year).",
+    description = "Requires `admin` or higher. Codes are 16 characters long; invites expire after 7 days unless `expires_in_hours` says otherwise (up to one year). A band has at most 50 usable invites at once (`QUOTA_EXCEEDED`, `meta.resource` = `band_invites`); revoke unused ones to make room.",
     params(("id" = Uuid, Path, description = "The ID of the band")),
     request_body = CreateBandInvitePayload,
     security((), ("jwt_token" = [])),

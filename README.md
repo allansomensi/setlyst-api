@@ -121,40 +121,46 @@ Swagger UI: `http://127.0.0.1:8000/swagger-ui`
 | `JWT_SECRET` | Secret key for JWT signing (min. 32 chars) | — |
 | `JWT_EXPIRATION_TIME` | Token expiration in seconds | `86400` |
 | `IMPERSONATION_EXPIRATION_TIME` | Lifetime of a staff "view as" session, in seconds | `3600` |
+| `DISABLE_BREACHED_PASSWORD_CHECK` | Skip the Have I Been Pwned check of new passwords (it fails open after 2 s; never runs in tests) | `false` |
+| `ANNOUNCEMENT_CTA_HOSTS` | Comma-separated hosts announcement buttons may link to over `https`, besides app paths | empty (app paths only) |
 | `DATABASE_URL` | Full PostgreSQL connection URL | — |
 | `DATABASE_MAX_CONNECTIONS` | Connection pool size | `10` |
+| `DATABASE_SKIP_SESSION_SETTINGS` | Don't set `statement_timeout=15s`, `idle_in_transaction_session_timeout=30s` and `lock_timeout=5s` on new connections. For transaction-mode poolers (Neon `-pooler`, PgBouncer); set the three on the role instead (`ALTER ROLE app SET ...`) | `false` |
 | `RUN_MIGRATIONS` | Apply pending migrations on startup | `true` |
-| `POSTGRES_HOST` | Database host | `localhost` |
-| `POSTGRES_PORT` | Database port | `5432` |
-| `POSTGRES_USER` | Database user | `postgres` |
-| `POSTGRES_PASSWORD` | Database password | `postgres` |
-| `POSTGRES_DB` | Database name | `local_db` |
-| `HOST` | Server bind address | `127.0.0.1:8000` |
+| `POSTGRES_DB` | **Required.** Name of the database in `DATABASE_URL` (used by the status page) | — |
+| `POSTGRES_HOST` / `POSTGRES_PORT` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | Only used by the local Docker Compose setup | — |
+| `PORT` | Port to listen on (all interfaces). Hosting platforms such as Render set it | `8000` |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated allowed origins | `http://localhost:3000` |
-| `RUST_LOG_CONSOLE` | Console log level | `info` |
+| `RUST_LOG_CONSOLE` | Console log filter (the access log — method, route, status, latency — is at `info`) | `info,sqlx=warn,tower_governor=warn` |
 | `RUST_LOG_FILE` | File log level | `trace` |
 | `LOG_TO_FILE` | Enable rolling file logs | `false` |
-| `APP_BASE_URL` | Public web origin used in e-mail links | `http://localhost:3000` |
+| `LOG_FORMAT` | Console log format: `pretty` (multi-line, coloured) or `compact` (one plain line per event) | `pretty` in debug builds, `compact` in release builds |
+| `APP_BASE_URL` | Public web origin used in e-mail links and Stripe redirects. A release build logs an error at startup while it points to localhost; with a live Stripe key it must be `https` | `http://localhost:3000` |
+| `API_PUBLIC_URL` | Public origin of this API. Enables the RFC 8058 one-click `List-Unsubscribe` header (`POST /api/v1/public/email/unsubscribe/one-click`) | — |
 | `DATA_ENCRYPTION_KEY` | **Required.** 32-byte key (base64) for AES-256-GCM encryption of secrets at rest (TOTP seeds). Generate with `openssl rand -base64 32` and never change it (stored 2FA secrets become unreadable). The server refuses to start without it | — |
 | `ALLOW_DERIVED_DATA_KEY` | Local development only: `true` derives the data key from `JWT_SECRET` when `DATA_ENCRYPTION_KEY` is unset (a warning is logged; rotating `JWT_SECRET` then breaks every 2FA account) | `false` |
 | `ASSETS_DIR` | Directory containing `fonts/` (Inter TTFs used by PDF export). Missing fonts are reported at startup | `./assets`, else the source tree's `assets` |
 | `PDF_FONTS_DIR` | Overrides the font directory itself (legacy; prefer `ASSETS_DIR`) | `<ASSETS_DIR>/fonts` |
-| `TRUSTED_PROXIES` | Comma-separated CIDRs whose `X-Forwarded-For` is trusted. Empty = forwarding headers are ignored | empty |
+| `TRUSTED_PROXIES` | Comma-separated CIDRs whose `X-Forwarded-For` is trusted (`10.0.0.0/8` on Render). Empty = forwarding headers are ignored | empty |
 | `INTERNAL_API_SECRET` | Shared secret the web server sends as `X-Setlyst-Internal`, with the visitor's address in `X-Setlyst-Client-IP` | — |
+| `ALLOW_DIRECT_CLIENTS` | A release build refuses to start with neither `TRUSTED_PROXIES` nor `INTERNAL_API_SECRET` (behind a proxy every client would share one rate-limit bucket) unless this is `true` | `false` |
 | `GOOGLE_CLIENT_IDS` | Comma-separated OAuth client IDs accepted for Google sign-in. Empty = disabled | empty |
-| `SMTP_HOST` | SMTP server. When unset, e-mails are rendered and logged only | — |
+| `SMTP_HOST` | SMTP server. When unset, no e-mail is sent (debug builds print them to the log). A release build refuses to start with an invalid SMTP configuration | — |
 | `SMTP_PORT` | SMTP port. Hosts that block the standard ports (Render's free instances block 25, 465 and 587) need an alternative such as Resend's `2465` with `SMTP_TLS=tls` | `587` / `465` / `25` by `SMTP_TLS` |
 | `SMTP_USERNAME` / `SMTP_PASSWORD` | SMTP credentials | — |
 | `SMTP_TLS` | `starttls`, `tls` or `none` | `starttls` |
-| `SMTP_FROM` | Sender, e.g. `Setlyst <no-reply@setlyst.app>` | `Setlyst <no-reply@setlyst.app>` |
+| `SMTP_FROM` | Sender, e.g. `Setlyst <no-reply@setlyst.com.br>` | `Setlyst <no-reply@setlyst.com.br>` |
 | `SMTP_REPLY_TO` | Optional reply-to address | — |
 | `EMAIL_WORKER_INTERVAL_SECS` | E-mail outbox polling interval | `10` |
-| `STRIPE_SECRET_KEY` | Stripe secret (`sk_...`) or restricted (`rk_...`) key. With `STRIPE_WEBHOOK_SECRET`, turns paid checkout on | — |
-| `STRIPE_WEBHOOK_SECRET` | Signing secret (`whsec_...`) of the webhook endpoint `/api/v1/webhooks/stripe` | — |
-| `STRIPE_API_BASE` | Stripe API origin (only for stripe-mock or a proxy) | `https://api.stripe.com` |
+| `EMAIL_HOURLY_CAP` | Non-security e-mails sent per hour; past it only codes and security notices go out (an error is logged) | `500` |
+| `STRIPE_SECRET_KEY` | Stripe secret (`sk_...`) or restricted (`rk_...`) key. With `STRIPE_WEBHOOK_SECRET`, turns paid checkout on. Required restricted-key permissions: see [Paid subscriptions](#paid-subscriptions-stripe) | — |
+| `STRIPE_WEBHOOK_SECRET` | Signing secret (`whsec_...`) of the webhook endpoint `/api/v1/webhooks/stripe`. The events to subscribe it to are listed in `.env.example` | — |
+| `STRIPE_API_BASE` | Stripe API origin (only for stripe-mock or a proxy; a live key refuses anything but the default) | `https://api.stripe.com` |
+| `ALLOW_TEST_PAYMENTS` | Don't log an error at startup for a test-mode Stripe key in a release build (staging) | `false` |
 | `MODERATION_VISION_API_KEY` | Google Cloud Vision key for image classification. Unset = URL heuristics only | — |
+| `MODERATION_VISION_DAILY_BUDGET` | Classifications per UTC day (shared by all instances); past it, images are queued for manual review. At most 4 run at once | `2000` |
 | `TRASH_RETENTION_DAYS` | Days before trashed items are purged | `30` |
-| `ENABLE_SWAGGER` | Serve `/swagger-ui` and `/api-docs/openapi.json` | `true` |
+| `ENABLE_SWAGGER` | Serve `/swagger-ui` and `/api-docs/openapi.json` | `true` in debug builds, `false` in release builds |
 | `TEST_DATABASE_URL` | PostgreSQL server used by the integration tests (tests are skipped when unset) | — |
 
 ---
@@ -175,14 +181,13 @@ Full interactive documentation is available via Swagger UI at `/swagger-ui` when
 | Setlists | `/api/v1/setlists` | Setlist management, song ordering, PDF export |
 | Metrics | `/api/v1/metrics` | User and admin dashboard metrics |
 | Backup | `/api/v1/backup` | Data export and import |
-| Status | `/api/v1/status` | Health and version (details for staff at `/status/details`) |
+| Status | `/api/v1/status` | Overall health, cached 10 s (version and details for staff at `/status/details`) |
 | Public | `/api/v1/public` | Legal version, plans, release notes, e-mail unsubscribe |
-| Billing | `/api/v1/billing` | The caller's plan, credits, promo codes, referrals, checkout, plan changes and the billing portal |
+| Billing | `/api/v1/billing` | The caller's plan, credits, promo codes, referrals, checkout, plan changes, the 7-day withdrawal and the billing portal |
 | Webhooks | `/api/v1/webhooks` | Stripe events (signature-verified, no auth) |
 | Announcements | `/api/v1/announcements` | Announcements for the caller |
 | Admin | `/api/v1/admin` | Staff console (content, audit log, limits, announcements, release notes, plans, promo codes, moderation) |
-| Health | `/api/v1/health` | API health |
-| Migrations | `/api/v1/migrations` | Admin-only migration runner |
+| Health | `/api/v1/health` | API health without touching the database — use it for the load balancer's health check |
 
 ### Authentication
 
@@ -238,6 +243,8 @@ Every option is optional. Content: `show_title`, `subtitle`, `show_description`,
 
 Supported locales: `en`, `pt-BR`, `es`. The file name is sent RFC 5987-encoded, so non-ASCII titles survive.
 
+Size limits: at most 200 items, and a songbook of at most 250 000 characters of lyrics and notes (`PDF_TOO_LARGE`, 413). At most 3 PDFs render at once (`SERVICE_BUSY`, 503) and a signed-in account may export 30 per minute. The public share export (`/public/setlists/{token}/export/pdf`) never includes the songbook.
+
 ---
 
 ## Staff, Limits & Audit
@@ -251,6 +258,43 @@ Supported locales: `en`, `pt-BR`, `es`. The file name is sent RFC 5987-encoded, 
 - **Errors** carry a stable machine-readable `code` (see `src/errors/api_error.rs`) for clients to translate.
 
 ---
+
+## Paid subscriptions (Stripe)
+
+Stripe is the source of truth: every webhook event is only a hint, and the subscription it names is fetched again and mirrored into `subscriptions` under a per-subscription lock. Plans and prices live in the database and are created in Stripe on demand.
+
+- **One subscription per account.** Checkout is refused while Stripe has a live subscription for the customer. A new checkout expires the pages of earlier ones. A second subscription that gets through anyway is canceled, its first charge is refunded, and an error is logged.
+- **Checkout.** Cards only. The buyer must accept the Subscription Terms (the Terms of Service URL is set in the Dashboard). The accepted version is stored on the subscription.
+- **Withdrawal (CDC art. 49).** `POST /billing/withdraw` refunds in full and cancels immediately. It works within 7 days of the first paid invoice, or of a yearly renewal charge. `GET /billing/me` exposes `withdrawal_eligible_until`. A full refund made in the Dashboard also cancels the subscription. A card dispute cancels it and is subtracted from revenue.
+- **Failed renewals.** A `past_due` subscription keeps its plan for 14 days (`past_due_since`). After that the account has no plan and the subscription is canceled at Stripe.
+- **Reconciliation.** A subscription whose period ended is checked with Stripe before it expires. It is only expired when Stripe no longer has it. When Stripe can't be reached, the check is retried hourly. Once a day, every Stripe subscription is compared with its local copy.
+- **Billing e-mails** can't be switched off:
+  - purchase confirmation (price, next charge, terms, how to cancel, 7-day right);
+  - cancellation, withdrawal and dispute notices;
+  - the reminder 7 days before a card-on-file trial is first charged;
+  - the yearly renewal reminder;
+  - price changes (`services::billing::notify_price_change`).
+- **Finance report.**
+  - MRR uses the price each subscriber pays, and excludes trials not yet charged.
+  - Refunds are counted in the month they were made; failed refunds stop counting.
+  - "Net" is gross − refunds − disputes, before Stripe fees (fees are shown when known).
+
+- **Staff refunds.** `POST /admin/users/{id}/subscription/refund` (admins, body `{ "reason" }`) cancels the paid subscription now and refunds the charges of the withdrawal window, or the latest charge once it is over. Audited as `billing.subscription_refunded`.
+- **Customer e-mail.** A confirmed e-mail change (self-service or by staff) is copied to the Stripe customer.
+- **Public links follow the plan.** A shared setlist or gig answers 404 once its owner's plan loses `public_sharing` (for band content, when neither the creator's nor the band owner's plan has it); the hourly job also clears personal links.
+
+**Restricted key (`rk_live_...`) permissions:**
+- Write: Customers, Products, Prices, Coupons, Checkout Sessions, Subscriptions, Customer portal, Refunds.
+- Read: Invoices, Invoice Payments, Charges, Disputes, Payment Intents, Refunds.
+- The read scopes are probed at startup. A scope Stripe refuses with a live key stops the server; with a test key, or when Stripe can't be reached, it is only logged.
+
+**Stripe Dashboard settings:**
+- Checkout: cards only, and "limit customers to one subscription".
+- Terms of Service and Privacy URLs in the public details.
+- Smart Retries of up to 2 weeks, then "cancel the subscription".
+- "Upcoming renewal events" at 7 days or more.
+- Customer e-mails for successful payments and refunds turned on.
+- Customer portal: cancellation at period end, no plan switching, no promotion codes.
 
 ## Testing
 
@@ -271,10 +315,23 @@ STRIPE_MOCK_URL=http://localhost:12111 cargo test --test stripe_mock
 
 ## Rate Limiting
 
+Per-client limits are keyed by the resolved client address (see `TRUSTED_PROXIES` / `INTERNAL_API_SECRET`); IPv6 clients by their /64.
+
 | Scope | Limit |
 |---|---|
-| Global (all endpoints) | 60 req/burst, 1 req/200ms per IP |
-| Auth (login, register) | 5 req/burst, 1 req/2s per IP |
+| Global (all endpoints) | 300 req/burst, 1 req/25ms per client |
+| Auth (login, 2FA) | 5 req/burst, 2 req/s per client |
+| Sign-up (`/auth/register`) | 5 per hour and 20 per day per client |
+| Password recovery | 5 per minute and 20 per hour per client |
+| Re-authentication codes (`/users/me/reauth/code`) | 1 per minute and 5 per hour per account; 5 req/burst, 1 per 12 s per client |
+| Backup import | 3 per account per hour, one at a time (`IMPORT_IN_PROGRESS`) |
+| Backup, ChordPro library and personal data exports | 10 per account per hour each |
+| PDF exports (signed in) | 30 per account per minute |
+| Bulk imports/exports | 2 at once, platform-wide |
+| Band logo changes | 10 per band per day |
+| Song suggestions | 20 per member per band per day |
+
+Request bodies are limited to 256 KB, except songs (1 MB) and the backup import (10 MB). Requests time out after 30 s (503).
 
 ## Contributing
 

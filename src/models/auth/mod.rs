@@ -106,6 +106,11 @@ pub struct GoogleSignInPayload {
     /// Required (`true`) to create a new account.
     #[serde(default)]
     pub accept_terms: bool,
+    /// Required (`true`) to create a new account
+    /// (`AGE_CONFIRMATION_REQUIRED`): the age declaration. Ignored for
+    /// existing accounts.
+    #[serde(default)]
+    pub age_confirmed: bool,
     #[serde(default)]
     pub marketing_opt_in: bool,
     #[validate(length(max = 10))]

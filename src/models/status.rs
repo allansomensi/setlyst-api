@@ -43,10 +43,10 @@ pub struct Status {
     pub dependencies: Dependencies,
 }
 
-/// The public status: health and version only. Infrastructure details
-/// are staff-only (see [`Status`]).
+/// The public status: overall health only. The exact version and the
+/// infrastructure details are staff-only (see [`Status`]): they only help
+/// someone match the deployment against known vulnerabilities.
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct PublicStatus {
     pub status: ServiceHealth,
-    pub version: String,
 }

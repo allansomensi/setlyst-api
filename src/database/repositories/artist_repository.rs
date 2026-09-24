@@ -1,3 +1,4 @@
+use crate::database::repositories::quota_repository::QuotaGuard;
 use crate::{
     errors::api_error::ApiError,
     models::artist::{Artist, CreateArtistPayload, UpdateArtistPayload},
@@ -16,10 +17,13 @@ pub trait ArtistRepository: Send + Sync {
         size: i64,
     ) -> Result<(Vec<Artist>, i64), ApiError>;
     async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Artist>, ApiError>;
+    /// Creates a personal artist. `quota` is enforced inside the insert's
+    /// transaction (see [`QuotaGuard`]).
     async fn create(
         &self,
         payload: &CreateArtistPayload,
         user_id: Uuid,
+        quota: &[QuotaGuard],
     ) -> Result<Artist, ApiError>;
     async fn update(
         &self,
@@ -135,8 +139,11 @@ impl ArtistRepository for ArtistRepositoryImpl {
         &self,
         payload: &CreateArtistPayload,
         user_id: Uuid,
+        quota: &[QuotaGuard],
     ) -> Result<Artist, ApiError> {
         let new_artist = Artist::new(payload.name.trim(), user_id);
+        let mut tx = self.db.begin().await?;
+        QuotaGuard::enforce_all(quota, &mut tx).await?;
         sqlx::query(
             "INSERT INTO artists (id, name, user_id, band_id, forked_from, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
@@ -147,8 +154,9 @@ impl ArtistRepository for ArtistRepositoryImpl {
         .bind(new_artist.forked_from)
         .bind(new_artist.created_at)
         .bind(new_artist.updated_at)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(new_artist)
     }
 

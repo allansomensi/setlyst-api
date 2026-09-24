@@ -1,3 +1,4 @@
+use crate::database::repositories::quota_repository::QuotaGuard;
 use crate::{
     errors::api_error::ApiError,
     models::band::{
@@ -24,7 +25,14 @@ pub trait BandRepository: Send + Sync {
 
     /// Creates a new band and makes `owner_id` its first member with the
     /// `owner` role, together with the band's repertoire (same transaction).
-    async fn create(&self, payload: &CreateBandPayload, owner_id: Uuid) -> Result<Band, ApiError>;
+    /// Creates a band owned by `owner_id`, with its repertoire. `quota` is
+    /// enforced inside the insert's transaction (see [`QuotaGuard`]).
+    async fn create(
+        &self,
+        payload: &CreateBandPayload,
+        owner_id: Uuid,
+        quota: &[QuotaGuard],
+    ) -> Result<Band, ApiError>;
 
     async fn update(
         &self,
@@ -133,7 +141,7 @@ impl BandRepository for BandRepositoryImpl {
         let bands = sqlx::query_as::<_, BandWithMembership>(
             r#"
             SELECT
-                b.id, b.name, b.slug, b.description, b.logo_url, b.members_can_manage_setlists,
+                b.id, b.name, b.slug, b.description, b.logo_url,
                 b.created_by, b.updated_by,
                 (SELECT u.username FROM users u WHERE u.id = b.updated_by) AS updated_by_username,
                 b.created_at, b.updated_at,
@@ -170,7 +178,7 @@ impl BandRepository for BandRepositoryImpl {
         let band = sqlx::query_as::<_, BandWithMembership>(
             r#"
             SELECT
-                b.id, b.name, b.slug, b.description, b.logo_url, b.members_can_manage_setlists,
+                b.id, b.name, b.slug, b.description, b.logo_url,
                 b.created_by, b.updated_by,
                 (SELECT u.username FROM users u WHERE u.id = b.updated_by) AS updated_by_username,
                 b.created_at, b.updated_at,
@@ -199,7 +207,12 @@ impl BandRepository for BandRepositoryImpl {
         Ok(band)
     }
 
-    async fn create(&self, payload: &CreateBandPayload, owner_id: Uuid) -> Result<Band, ApiError> {
+    async fn create(
+        &self,
+        payload: &CreateBandPayload,
+        owner_id: Uuid,
+        quota: &[QuotaGuard],
+    ) -> Result<Band, ApiError> {
         let name = payload.name.trim();
         let slug = self.generate_unique_slug(name).await?;
         let description = payload
@@ -211,17 +224,17 @@ impl BandRepository for BandRepositoryImpl {
         let new_band = Band::new(name, slug, description, owner_id);
 
         let mut tx = self.db.begin().await?;
+        QuotaGuard::enforce_all(quota, &mut tx).await?;
 
         sqlx::query(
-            "INSERT INTO bands (id, name, slug, description, logo_url, members_can_manage_setlists, created_by, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            "INSERT INTO bands (id, name, slug, description, logo_url, created_by, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(new_band.id)
         .bind(&new_band.name)
         .bind(&new_band.slug)
         .bind(&new_band.description)
         .bind(&new_band.logo_url)
-        .bind(new_band.members_can_manage_setlists)
         .bind(new_band.created_by)
         .bind(new_band.created_at)
         .bind(new_band.updated_at)
@@ -321,15 +334,6 @@ impl BandRepository for BandRepositoryImpl {
             updated = true;
         }
 
-        if let Some(members_can_manage_setlists) = payload.members_can_manage_setlists {
-            sqlx::query("UPDATE bands SET members_can_manage_setlists = $1 WHERE id = $2")
-                .bind(members_can_manage_setlists)
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-            updated = true;
-        }
-
         if let Some(threshold) = payload.suggestion_auto_accept_votes {
             sqlx::query("UPDATE bands SET suggestion_auto_accept_votes = $1 WHERE id = $2")
                 .bind(threshold)
@@ -356,7 +360,7 @@ impl BandRepository for BandRepositoryImpl {
 
     async fn find_any(&self, id: Uuid) -> Result<Option<Band>, ApiError> {
         let band = sqlx::query_as::<_, Band>(
-            "SELECT id, name, slug, description, logo_url, members_can_manage_setlists,
+            "SELECT id, name, slug, description, logo_url,
                     created_by, updated_by, created_at, updated_at
              FROM bands WHERE id = $1",
         )

@@ -10,7 +10,6 @@ pub mod billing;
 pub mod gig;
 pub mod health;
 pub mod metrics;
-pub mod migrations;
 pub mod moderation;
 pub mod notification;
 pub mod pin;

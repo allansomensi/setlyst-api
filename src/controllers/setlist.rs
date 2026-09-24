@@ -1,9 +1,9 @@
 use crate::{
     controllers::pin::{mark_one, mark_pinned},
-    database::AppState,
+    database::{AppState, repositories::quota_repository::QuotaGuard},
     errors::api_error::ApiError,
     export::{
-        limiter::render_pdf,
+        limiter::{MAX_PDF_ITEMS, ensure_pdf_fits, render_pdf},
         pdf::{
             ExportQuery, PdfExportOptions, SetlistPdfData, content_disposition,
             generate_setlist_pdf, pdf_filename,
@@ -23,7 +23,7 @@ use crate::{
         },
         song::PublicSong,
     },
-    services::entitlements::{Feature, ensure_feature, has_feature},
+    services::entitlements::{Feature, ensure_feature, has_feature, shared_content_visible},
     utils::share_token::token_fingerprint,
 };
 use axum::{
@@ -187,7 +187,7 @@ pub async fn create_setlist(
 
     payload.validate()?;
 
-    match payload.band_id {
+    let quota = match payload.band_id {
         Some(band_id) => {
             // Same rule as editing a band setlist: the band's configurable
             // `manage_setlists` permission (admin/owner always pass).
@@ -207,23 +207,23 @@ pub async fn create_setlist(
 
             state
                 .quota_repo
-                .ensure_band(band_id, QuotaResource::BandSetlists, 1)
-                .await?;
+                .band_guard(band_id, QuotaResource::BandSetlists, 1)
+                .await?
         }
         None => {
             state
                 .quota_repo
-                .ensure_user(user_id, QuotaResource::Setlists, 1)
-                .await?;
+                .user_guard(user_id, QuotaResource::Setlists, 1)
+                .await?
         }
-    }
+    };
 
     state
         .setlist_repo
         .is_unique(payload.title.trim(), user_id, payload.band_id, None)
         .await?;
 
-    match state.setlist_repo.create(&payload, user_id).await {
+    match state.setlist_repo.create(&payload, user_id, &[quota]).await {
         Ok(new_setlist) => {
             info!(
                 %user_id,
@@ -256,7 +256,7 @@ pub async fn create_setlist(
     path = "/api/v1/setlists/{id}/duplicate",
     tags = ["Setlists"],
     summary = "Duplicate a setlist.",
-    description = "Creates an independent personal copy of a setlist the caller can view, including all of its songs, blocks, breaks and links. If the title is not provided (or already taken), a suffix such as \" (copy)\" or \" (2)\" is appended automatically.\n\nA band setlist's songs are never referenced by the copy: each becomes a song of the caller's own library (an existing song with the same title and artist is reused, otherwise the artist and song are created). Songs that would take the caller over their song or artist quota are left out and counted in `skipped_band_songs`. The answer is the new `Setlist` plus `skipped_band_songs`.",
+    description = "Creates an independent personal copy of a setlist the caller can view, including all of its songs, blocks, breaks and links. If the title is not provided (or already taken), a suffix such as \" (copy)\" or \" (2)\" is appended automatically.\n\nA band setlist's songs are never referenced by the copy: each becomes a song of the caller's own library (an existing song with the same title and artist is reused, otherwise the artist and song are created). Songs that would take the caller over their song or artist quota are left out and counted in `skipped_band_songs`. The answer is the new `Setlist` plus `skipped_band_songs`.\n\nDuplicating a band setlist requires the band's `export_pdf` permission (403 otherwise).",
     params(("id" = Uuid, Path, description = "The ID of the setlist to duplicate")),
     request_body = DuplicateSetlistPayload,
     security((), ("jwt_token" = [])),
@@ -277,20 +277,28 @@ pub async fn duplicate_setlist(
 
     payload.validate()?;
 
-    // Viewing the setlist is enough to duplicate it — the copy always
-    // lands in the caller's own personal setlists, so no write access to
-    // the original (e.g. a band setlist) is required.
-    state.setlist_repo.exists(id, user_id).await?;
-    state
+    // Viewing a personal setlist is enough to duplicate it — the copy
+    // always lands in the caller's own personal setlists. A band setlist's
+    // copy takes every chart (lyrics included) out of the band, so it needs
+    // the band's `export_pdf` permission, like exporting it.
+    let original = state
+        .setlist_repo
+        .find_by_id(id, user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if original.band_id.is_some() {
+        state.setlist_repo.can_export_pdf(id, user_id).await?;
+    }
+    let quota = state
         .quota_repo
-        .ensure_user(user_id, QuotaResource::Setlists, 1)
+        .user_guard(user_id, QuotaResource::Setlists, 1)
         .await?;
 
     let limits = state.quota_repo.effective_limits(user_id).await?;
 
     match state
         .setlist_repo
-        .duplicate(id, user_id, payload.title, limits)
+        .duplicate(id, user_id, payload.title, limits, &[quota])
         .await
     {
         Ok((new_setlist, skipped_band_songs)) => {
@@ -472,9 +480,11 @@ pub async fn add_song_to_setlist(
         .ok_or(ApiError::NotFound)?;
 
     // The repertoire is bounded by the band's song quota instead.
-    if !setlist.is_repertoire {
-        state.quota_repo.ensure_setlist_items(setlist_id, 1).await?;
-    }
+    let quota = if setlist.is_repertoire {
+        None
+    } else {
+        Some(state.quota_repo.setlist_items_guard(setlist_id, 1).await?)
+    };
 
     // Band setlists never link directly to a member's personal song. If the
     // song isn't already a copy owned by this band, fork it into one first:
@@ -513,7 +523,7 @@ pub async fn add_song_to_setlist(
 
     state
         .setlist_repo
-        .add_song(setlist_id, song_id_to_link)
+        .add_song(setlist_id, song_id_to_link, quota.as_slice())
         .await?;
     state.setlist_repo.touch(setlist_id, user_id).await?;
 
@@ -802,11 +812,11 @@ pub async fn create_setlist_block(
 
     state.setlist_repo.can_manage(setlist_id, user_id).await?;
 
-    ensure_item_room(&state, setlist_id, user_id).await?;
+    let quota = item_room(&state, setlist_id, user_id).await?;
 
     let marker = state
         .setlist_repo
-        .create_block(setlist_id, payload.name.trim())
+        .create_block(setlist_id, payload.name.trim(), quota.as_slice())
         .await?;
     state.setlist_repo.touch(setlist_id, user_id).await?;
 
@@ -884,11 +894,16 @@ pub async fn create_setlist_break(
 
     state.setlist_repo.can_manage(setlist_id, user_id).await?;
 
-    ensure_item_room(&state, setlist_id, user_id).await?;
+    let quota = item_room(&state, setlist_id, user_id).await?;
 
     let marker = state
         .setlist_repo
-        .create_break(setlist_id, payload.label, payload.duration_minutes)
+        .create_break(
+            setlist_id,
+            payload.label,
+            payload.duration_minutes,
+            quota.as_slice(),
+        )
         .await?;
     state.setlist_repo.touch(setlist_id, user_id).await?;
 
@@ -984,7 +999,7 @@ pub async fn delete_setlist_marker(
     path = "/api/v1/setlists/{id}/export/pdf",
     tags = ["Setlists"],
     summary = "Export a setlist to PDF.",
-    description = "Generates and returns a PDF file containing the setlist's songs, blocks and breaks. Supports localization via query params.\n\n**Advanced options** (plan feature `advanced_pdf`, `FEATURE_NOT_IN_PLAN` otherwise): `columns=2`, the songbook (`include_lyrics=true`, with `page_break_per_song`), `watermark=false` and `margins` other than `normal`. Everything else (what to show, `compact`, `font_scale`, paper, orientation, chord mode, language, page numbers, subtitle) is available to every plan.\n\nAt most 3 PDFs render at once; when busy for 10 s the answer is `SERVICE_BUSY` (503, `meta.retry_after_seconds`).",
+    description = "Generates and returns a PDF file containing the setlist's songs, blocks and breaks. Supports localization via query params.\n\n**Advanced options** (plan feature `advanced_pdf`, `FEATURE_NOT_IN_PLAN` otherwise): `columns=2`, the songbook (`include_lyrics=true`, with `page_break_per_song`), `watermark=false` and `margins` other than `normal`. Everything else (what to show, `compact`, `font_scale`, paper, orientation, chord mode, language, page numbers, subtitle) is available to every plan.\n\nAt most 200 items, and a songbook of at most 250 000 characters of lyrics and notes (`PDF_TOO_LARGE`, 413, `meta.reason` = `items` | `songbook`). At most 3 PDFs render at once; when busy for 10 s the answer is `SERVICE_BUSY` (503, `meta.retry_after_seconds`). Refused under impersonation (`IMPERSONATION_READ_ONLY`).",
     params(
         ("id" = Uuid, Path, description = "The ID of the setlist to export"),
         ExportQuery
@@ -997,6 +1012,7 @@ pub async fn delete_setlist_marker(
         (status = 200, description = "PDF exported successfully", content_type = "application/pdf"),
         (status = 403, description = "The caller is not allowed to export this setlist to PDF."),
         (status = 404, description = "Setlist not found"),
+        (status = 413, description = "The setlist is too large to export (`PDF_TOO_LARGE`)."),
         (status = 500, description = "An error occurred while exporting the setlist")
     )
 )]
@@ -1010,6 +1026,15 @@ pub async fn export_setlist_pdf(
 
     debug!(%user_id, setlist_id = %id, "Processing request to export setlist to PDF");
 
+    // Staff viewing an account read-only never walk away with its content.
+    if access.impersonator().is_some() {
+        return Err(ApiError::impersonation_read_only());
+    }
+
+    crate::utils::rate_limit::presets::limit(
+        &crate::utils::rate_limit::presets::PDF_EXPORT,
+        user_id,
+    )?;
     state.setlist_repo.can_export_pdf(id, user_id).await?;
 
     let setlist = state
@@ -1022,7 +1047,11 @@ pub async fn export_setlist_pdf(
     if options.is_advanced() {
         ensure_feature(&state, user_id, Feature::AdvancedPdf).await?;
     }
-    let items = state.setlist_repo.get_items(id).await?;
+    let items = state
+        .setlist_repo
+        .get_items_capped(id, MAX_PDF_ITEMS)
+        .await?;
+    ensure_pdf_fits(&items, options.include_lyrics)?;
 
     render_setlist_pdf(&state, &setlist, items, options).await
 }
@@ -1044,22 +1073,27 @@ pub(crate) fn pdf_response(bytes: Vec<u8>, filename: &str) -> axum::response::Re
     (StatusCode::OK, headers, bytes).into_response()
 }
 
-/// Fails with `QUOTA_EXCEEDED` when the setlist is full. The repertoire is
-/// bounded by the band's song quota instead.
-async fn ensure_item_room(
+/// Fails with `QUOTA_EXCEEDED` when the setlist is full, and otherwise
+/// returns the guard that enforces the limit again in the insert's
+/// transaction. A repertoire's songs are bounded by the band's song quota
+/// instead, and its blocks and breaks by `MAX_REPERTOIRE_MARKERS` (checked
+/// in the insert).
+async fn item_room(
     state: &AppState,
     setlist_id: Uuid,
     user_id: Uuid,
-) -> Result<(), ApiError> {
+) -> Result<Option<QuotaGuard>, ApiError> {
     let setlist = state
         .setlist_repo
         .find_by_id(setlist_id, user_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    if !setlist.is_repertoire {
-        state.quota_repo.ensure_setlist_items(setlist_id, 1).await?;
+    if setlist.is_repertoire {
+        return Ok(None);
     }
-    Ok(())
+    Ok(Some(
+        state.quota_repo.setlist_items_guard(setlist_id, 1).await?,
+    ))
 }
 
 /// The band's copy of `source` for `band_id`, forking the caller's personal
@@ -1302,7 +1336,7 @@ pub async fn unfavorite_setlist(
     path = "/api/v1/setlists/{id}/share",
     tags = ["Setlists"],
     summary = "Enable (or rotate) a public read-only share link for a setlist.",
-    description = "Generates a fresh, unguessable share token, replacing any previous one — so re-sharing invalidates links that were already handed out. Requires the same permission as editing the setlist and the plan feature `public_sharing`.",
+    description = "Generates a fresh, unguessable share token, replacing any previous one — so re-sharing invalidates links that were already handed out. Requires the same permission as editing the setlist, a verified e-mail address (`EMAIL_NOT_VERIFIED`, 403) and the plan feature `public_sharing`.",
     params(("id" = Uuid, Path, description = "The ID of the setlist")),
     security((), ("jwt_token" = [])),
     responses(
@@ -1320,6 +1354,7 @@ pub async fn enable_setlist_sharing(
     debug!(%user_id, setlist_id = %id, "Processing request to enable public sharing for setlist");
 
     state.setlist_repo.can_manage(id, user_id).await?;
+    crate::services::account::require_verified_email(&state, user_id).await?;
     ensure_feature(&state, user_id, Feature::PublicSharing).await?;
 
     let setlist = state.setlist_repo.enable_sharing(id).await?;
@@ -1362,7 +1397,7 @@ pub async fn disable_setlist_sharing(
     path = "/api/v1/public/setlists/{token}",
     tags = ["Setlists"],
     summary = "View a publicly shared setlist.",
-    description = "No authentication required. The token itself is the only access control — anyone who has it can view the setlist read-only.",
+    description = "No authentication required. The token itself is the only access control — anyone who has it can view the setlist read-only. Answers 404 as well once the owner's plan no longer includes `public_sharing` (for band content: neither the creator's nor the band owner's plan).",
     params(("token" = String, Path, description = "The setlist's public share token")),
     responses(
         (status = 200, description = "Setlist retrieved successfully.", body = PublicSetlist),
@@ -1375,14 +1410,25 @@ pub async fn get_public_setlist(
 ) -> Result<impl IntoResponse, ApiError> {
     debug!(share = %token_fingerprint(&token), "Processing request to view a public setlist");
 
-    let setlist = state
-        .setlist_repo
-        .find_by_share_token(&token)
-        .await?
-        .ok_or(ApiError::NotFound)?;
+    let setlist = shared_setlist(&state, &token).await?;
 
     let public = public_setlist(&state, setlist).await?;
     Ok(Json(public))
+}
+
+/// The setlist shared under `token`, or 404 when there is none or its
+/// owner's plan no longer includes public sharing.
+async fn shared_setlist(state: &AppState, token: &str) -> Result<Setlist, ApiError> {
+    let setlist = state
+        .setlist_repo
+        .find_by_share_token(token)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if !shared_content_visible(state, setlist.user_id, setlist.band_id).await? {
+        debug!(setlist_id = %setlist.id, "Public setlist hidden: the owner's plan lost public sharing");
+        return Err(ApiError::NotFound);
+    }
+    Ok(setlist)
 }
 
 /// The public (anonymous) view of a setlist: dedicated DTOs only.
@@ -1414,7 +1460,7 @@ pub(crate) async fn public_setlist(
     path = "/api/v1/public/setlists/{token}/export/pdf",
     tags = ["Setlists"],
     summary = "Export a publicly shared setlist to PDF.",
-    description = "No authentication required — same access model as viewing it. Supports the same query params as the authenticated export endpoint; advanced options are only applied when the setlist's owner has the `advanced_pdf` plan feature (otherwise they fall back to the defaults). Rate limited per client IP (1 per second, bursts of 5) and subject to the global PDF limit (`SERVICE_BUSY`).",
+    description = "No authentication required — same access model as viewing it. Supports the same query params as the authenticated export endpoint, except that the songbook is never included: `include_lyrics`, `page_break_per_song` and `chords` are ignored (a share link never exposes lyrics). Other advanced options are only applied when the setlist's owner has the `advanced_pdf` plan feature (otherwise they fall back to the defaults). At most 200 items (`PDF_TOO_LARGE`, 413). 404 once the owner's plan no longer includes `public_sharing`. Rate limited per client IP (1 per second, bursts of 5) and subject to the global PDF limit (`SERVICE_BUSY`).",
     params(
         ("token" = String, Path, description = "The setlist's public share token"),
         ExportQuery
@@ -1431,17 +1477,18 @@ pub async fn export_public_setlist_pdf(
 ) -> Result<axum::response::Response, ApiError> {
     debug!(share = %token_fingerprint(&token), "Processing request to export a public setlist to PDF");
 
-    let setlist = state
-        .setlist_repo
-        .find_by_share_token(&token)
-        .await?
-        .ok_or(ApiError::NotFound)?;
+    let setlist = shared_setlist(&state, &token).await?;
 
-    let mut options = PdfExportOptions::from(query);
+    // A share link never yields the lyrics, whatever the query says.
+    let mut options = PdfExportOptions::from(query).for_public_share();
     if options.is_advanced() && !has_feature(&state, setlist.user_id, Feature::AdvancedPdf).await? {
         options = options.to_basic();
     }
-    let items = state.setlist_repo.get_items(setlist.id).await?;
+    let items = state
+        .setlist_repo
+        .get_items_capped(setlist.id, MAX_PDF_ITEMS)
+        .await?;
+    ensure_pdf_fits(&items, options.include_lyrics)?;
 
     render_setlist_pdf(&state, &setlist, items, options).await
 }

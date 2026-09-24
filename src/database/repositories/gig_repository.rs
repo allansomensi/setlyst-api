@@ -1,3 +1,4 @@
+use crate::database::repositories::quota_repository::QuotaGuard;
 use crate::{
     errors::api_error::{ApiError, codes},
     models::{
@@ -50,7 +51,14 @@ pub trait GigRepository: Send + Sync {
     async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Gig>, ApiError>;
     /// Any gig by ID, without an access filter (staff tooling).
     async fn find_any(&self, id: Uuid) -> Result<Option<Gig>, ApiError>;
-    async fn create(&self, payload: &CreateGigPayload, user_id: Uuid) -> Result<Gig, ApiError>;
+    /// Creates a gig. `quota` is enforced inside the insert's transaction
+    /// (see [`QuotaGuard`]).
+    async fn create(
+        &self,
+        payload: &CreateGigPayload,
+        user_id: Uuid,
+        quota: &[QuotaGuard],
+    ) -> Result<Gig, ApiError>;
     async fn update(
         &self,
         id: Uuid,
@@ -200,7 +208,12 @@ impl GigRepository for GigRepositoryImpl {
         Ok(gig)
     }
 
-    async fn create(&self, payload: &CreateGigPayload, user_id: Uuid) -> Result<Gig, ApiError> {
+    async fn create(
+        &self,
+        payload: &CreateGigPayload,
+        user_id: Uuid,
+        quota: &[QuotaGuard],
+    ) -> Result<Gig, ApiError> {
         let mut new_gig = Gig::new(payload.clone(), user_id);
         new_gig.venue = new_gig.venue.trim().to_string();
         new_gig.location = new_gig
@@ -212,6 +225,8 @@ impl GigRepository for GigRepositoryImpl {
             .map(|n| n.trim().to_string())
             .filter(|n| !n.is_empty());
 
+        let mut tx = self.db.begin().await?;
+        QuotaGuard::enforce_all(quota, &mut tx).await?;
         sqlx::query(
             "INSERT INTO gigs (id, user_id, band_id, setlist_id, venue, location, scheduled_at, status, notes, tour_id, created_at, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
@@ -228,8 +243,9 @@ impl GigRepository for GigRepositoryImpl {
         .bind(new_gig.tour_id)
         .bind(new_gig.created_at)
         .bind(new_gig.updated_at)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(new_gig)
     }

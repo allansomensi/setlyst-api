@@ -9,8 +9,9 @@ use crate::{
     models::billing::{
         BILLING_SETTINGS_KEY, BillingOverview, BillingSettings, CreatePromoCodePayload,
         CreatePromotionPayload, CreditEntry, PAYMENT_GRACE_DAYS, Plan, PlanPromotion, PlanRow,
-        PromoCode, PromoRedemption, Promotion, ReferralEntry, Subscription, SubscriptionEvent,
-        UpdatePromoCodePayload, UpdatePromotionPayload, UpsertPlanPayload, trim_localized,
+        PromoCode, PromoRedemption, Promotion, RENEWAL_GRACE_DAYS, ReferralEntry, Subscription,
+        SubscriptionEvent, UpdatePromoCodePayload, UpdatePromotionPayload, UpsertPlanPayload,
+        trim_localized,
     },
 };
 use chrono::{Duration, NaiveDateTime, Utc};
@@ -35,7 +36,7 @@ macro_rules! plan_columns {
 macro_rules! subscription_columns {
     () => {
         "plan_code, status, source, started_at, current_period_end, trial_ends_at, cancel_at_period_end,
-         billing_interval"
+         billing_interval, past_due_since"
     };
 }
 
@@ -66,8 +67,10 @@ pub async fn load_settings<'e, E: PgExecutor<'e>>(
 
 /// The plan in effect for `user_id` (a live subscription whose period has
 /// not ended), if any. Paid subscriptions keep their plan for
-/// [`PAYMENT_GRACE_DAYS`] past the period end, so a renewal webhook that
-/// arrives late never locks a paying customer out.
+/// [`RENEWAL_GRACE_DAYS`] past the period end, so a renewal webhook that
+/// arrives late never locks a paying customer out, and a failed renewal
+/// (`past_due`) keeps it for [`PAYMENT_GRACE_DAYS`] while the charge is
+/// retried.
 pub async fn load_effective_plan<'e, E: PgExecutor<'e>>(
     executor: E,
     user_id: Uuid,
@@ -80,12 +83,14 @@ pub async fn load_effective_plan<'e, E: PgExecutor<'e>>(
          JOIN plans p ON p.code = s.plan_code
          WHERE s.user_id = $1
            AND s.status IN ('trialing', 'active', 'past_due')
+           AND (s.status <> 'past_due' OR s.past_due_since IS NULL OR s.past_due_since > $4)
            AND (s.current_period_end IS NULL
                 OR s.current_period_end > $2
                 OR (s.source = 'payment' AND s.current_period_end > $3))",
     )
     .bind(user_id)
     .bind(now)
+    .bind(now - Duration::days(RENEWAL_GRACE_DAYS))
     .bind(now - Duration::days(PAYMENT_GRACE_DAYS))
     .fetch_optional(executor)
     .await?;

@@ -22,7 +22,7 @@ fn s<'a>(data: &'a Value, key: &str) -> &'a str {
 
 fn band_role(l: Locale, role: &str) -> String {
     match role {
-        "owner" => l.pick("Owner", "Dono", "Propietario"),
+        "owner" => l.pick("Lead", "Responsável", "Responsable"),
         "admin" => l.pick("Admin", "Administrador", "Administrador"),
         "moderator" => l.pick("Moderator", "Moderador", "Moderador"),
         "member" => l.pick("Member", "Integrante", "Integrante"),

@@ -76,7 +76,8 @@ pub trait SuggestionRepository: Send + Sync {
     /// the same song is already open for the same setlist.
     async fn create(&self, new: &NewSuggestion<'_>) -> Result<Uuid, ApiError>;
     /// Casts or changes a vote on an open suggestion (`SUGGESTION_CLOSED`
-    /// otherwise). Returns the new `(up, down)` counts.
+    /// otherwise). Returns the `(up, down)` counts that decide automatic
+    /// acceptance: votes of current members other than the suggester.
     async fn vote(&self, id: Uuid, user_id: Uuid, value: i16) -> Result<(i64, i64), ApiError>;
     async fn remove_vote(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
     /// Closes an open suggestion with `status` (`SUGGESTION_CLOSED` when it
@@ -219,9 +220,15 @@ impl SuggestionRepository for SuggestionRepositoryImpl {
         .bind(now)
         .execute(&mut *tx)
         .await?;
+        // The votes that decide automatic acceptance: current members
+        // other than the suggester (whose own up-vote would otherwise let
+        // a threshold of 1 accept anything a member suggests).
         let counts: (i64, i64) = sqlx::query_as(
-            "SELECT COUNT(*) FILTER (WHERE value = 1), COUNT(*) FILTER (WHERE value = -1)
-             FROM band_song_suggestion_votes WHERE suggestion_id = $1",
+            "SELECT COUNT(*) FILTER (WHERE v.value = 1), COUNT(*) FILTER (WHERE v.value = -1)
+             FROM band_song_suggestion_votes v
+             INNER JOIN band_song_suggestions bs ON bs.id = v.suggestion_id
+             INNER JOIN band_members m ON m.band_id = bs.band_id AND m.user_id = v.user_id
+             WHERE v.suggestion_id = $1 AND v.user_id IS DISTINCT FROM bs.suggested_by",
         )
         .bind(id)
         .fetch_one(&mut *tx)

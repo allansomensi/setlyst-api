@@ -16,6 +16,7 @@ use crate::{
         },
     },
     services::{
+        account::too_many_attempts,
         entitlements::{Feature, ensure_feature},
         notifier::notify,
     },
@@ -29,6 +30,10 @@ use axum::{
 use tracing::{error, info, warn};
 use uuid::Uuid;
 use validator::Validate;
+
+/// Suggestions one member may make to one band in 24 hours (each one
+/// notifies every member).
+pub const MAX_SUGGESTIONS_PER_DAY: i64 = 20;
 
 fn clean_note(note: Option<&str>) -> Option<String> {
     note.map(str::trim)
@@ -140,18 +145,29 @@ async fn add_suggested_song(
         .await?
         .filter(|s| s.band_id == Some(row.band_id))
         .ok_or(ApiError::NotFound)?;
-    let source = state
+    let mut source = state
         .song_repo
         .find_with_artist_name(song_id)
         .await?
         .ok_or(ApiError::NotFound)?;
+    // A suggested personal song is forked for the band without its
+    // performance notes: they're the suggester's private notes, and the
+    // whole band can read the copy.
+    if source.band_id.is_none() {
+        source.performance_notes = None;
+    }
 
     let band_song = band_song_for(state, row.band_id, &source, actor_id).await?;
     if !state.setlist_repo.has_song(setlist.id, band_song).await? {
-        if !setlist.is_repertoire {
-            state.quota_repo.ensure_setlist_items(setlist.id, 1).await?;
-        }
-        state.setlist_repo.add_song(setlist.id, band_song).await?;
+        let quota = if setlist.is_repertoire {
+            None
+        } else {
+            Some(state.quota_repo.setlist_items_guard(setlist.id, 1).await?)
+        };
+        state
+            .setlist_repo
+            .add_song(setlist.id, band_song, quota.as_slice())
+            .await?;
         state.setlist_repo.touch(setlist.id, actor_id).await?;
     }
     Ok(())
@@ -197,7 +213,7 @@ pub async fn list_suggestions(
     path = "/api/v1/bands/{id}/suggestions",
     tags = ["Bands"],
     summary = "Suggest a song to the band.",
-    description = "Any member, plan feature `song_suggestions`. The song must be one of the caller's personal songs or a song the band already owns; the target setlist must be one of the band's (default: the repertoire). `SONG_ALREADY_IN_SETLIST` (409) when the target already has it, `ALREADY_EXISTS` (409) when the same song is already open for that setlist. The suggester's up-vote is counted and the other members are notified.",
+    description = "Any member, plan feature `song_suggestions`. The song must be one of the caller's personal songs or a song the band already owns; the target setlist must be one of the band's (default: the repertoire). `SONG_ALREADY_IN_SETLIST` (409) when the target already has it, `ALREADY_EXISTS` (409) when the same song is already open for that setlist. The suggester's up-vote is recorded (shown in `votes_up`, but never counted towards automatic acceptance) and the other members are notified. At most 20 suggestions per member and band in 24 hours (`TOO_MANY_ATTEMPTS`, 429).",
     params(("id" = Uuid, Path, description = "The ID of the band")),
     request_body = CreateSuggestionPayload,
     security(("jwt_token" = [])),
@@ -263,6 +279,20 @@ pub async fn create_suggestion(
         ));
     }
 
+    // Each suggestion notifies every member: bounded per member and band.
+    let recent: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM band_song_suggestions
+         WHERE band_id = $1 AND suggested_by = $2 AND created_at > $3",
+    )
+    .bind(band_id)
+    .bind(user_id)
+    .bind(chrono::Utc::now().naive_utc() - chrono::Duration::hours(24))
+    .fetch_one(&state.db)
+    .await?;
+    if recent >= MAX_SUGGESTIONS_PER_DAY {
+        return Err(too_many_attempts(3600));
+    }
+
     let note = clean_note(payload.note.as_deref());
     let id = state
         .suggestion_repo
@@ -300,15 +330,8 @@ pub async fn create_suggestion(
         }
     }
 
-    // A threshold of 1 accepts right away (the suggester's own vote).
-    let row = load(&state, band_id, id, user_id).await?;
-    let threshold = state.band_repo.suggestion_threshold(band_id).await?;
-    if reaches_auto_accept(threshold, row.votes_up, row.votes_down)
-        && let Err(e) = accept(&state, &row, user_id, None, None).await
-    {
-        warn!(suggestion_id = %id, error = %e, "Automatic acceptance failed; the suggestion stays open");
-    }
-
+    // Never accepted on creation: the suggester's own up-vote doesn't
+    // count towards automatic acceptance (see `vote_suggestion`).
     let row = load(&state, band_id, id, user_id).await?;
     Ok((StatusCode::CREATED, Json(Suggestion::from(row))))
 }
@@ -318,7 +341,7 @@ pub async fn create_suggestion(
     path = "/api/v1/bands/{id}/suggestions/{sid}/vote",
     tags = ["Bands"],
     summary = "Vote on a suggestion.",
-    description = "Any member; `value` 1 or -1 (replaces the caller's previous vote). Open suggestions only (`SUGGESTION_CLOSED`). When the band's `suggestion_auto_accept_votes` is set and the up-votes reach it (with more up than down), the suggestion is accepted automatically. Returns the suggestion.",
+    description = "Any member; `value` 1 or -1 (replaces the caller's previous vote). Open suggestions only (`SUGGESTION_CLOSED`). When the band's `suggestion_auto_accept_votes` is set and the up-votes of current members other than the suggester reach it (with more up than down), the suggestion is accepted automatically. Returns the suggestion.",
     params(
         ("id" = Uuid, Path, description = "The ID of the band"),
         ("sid" = Uuid, Path, description = "The suggestion ID")

@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 macro_rules! admin_band_columns {
     () => {
-        "b.id, b.name, b.slug, b.description, b.logo_url, b.members_can_manage_setlists, b.created_by,
+        "b.id, b.name, b.slug, b.description, b.logo_url, b.created_by,
          (SELECT bm.user_id FROM band_members bm WHERE bm.band_id = b.id AND bm.role = 'owner' LIMIT 1) AS owner_id,
          (SELECT u.username FROM band_members bm INNER JOIN users u ON u.id = bm.user_id
             WHERE bm.band_id = b.id AND bm.role = 'owner' LIMIT 1) AS owner_username,

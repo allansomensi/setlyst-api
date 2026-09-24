@@ -109,7 +109,7 @@ pub async fn create_tour(
     payload.validate()?;
     ensure_feature(&state, user_id, Feature::Tours).await?;
 
-    match payload.band_id {
+    let quota = match payload.band_id {
         Some(band_id) => {
             state
                 .band_repo
@@ -117,18 +117,18 @@ pub async fn create_tour(
                 .await?;
             state
                 .quota_repo
-                .ensure_band(band_id, QuotaResource::BandTours, 1)
-                .await?;
+                .band_guard(band_id, QuotaResource::BandTours, 1)
+                .await?
         }
         None => {
             state
                 .quota_repo
-                .ensure_user(user_id, QuotaResource::Tours, 1)
-                .await?;
+                .user_guard(user_id, QuotaResource::Tours, 1)
+                .await?
         }
-    }
+    };
 
-    let tour = state.tour_repo.create(&payload, user_id).await?;
+    let tour = state.tour_repo.create(&payload, user_id, &[quota]).await?;
     info!(%user_id, tour_id = %tour.id, "Tour created");
 
     let mut headers = HeaderMap::new();

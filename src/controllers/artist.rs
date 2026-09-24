@@ -186,12 +186,12 @@ pub async fn create_artist(
         .artist_repo
         .is_unique(payload.name.trim(), user_id, None)
         .await?;
-    state
+    let quota = state
         .quota_repo
-        .ensure_user(user_id, QuotaResource::Artists, 1)
+        .user_guard(user_id, QuotaResource::Artists, 1)
         .await?;
 
-    match state.artist_repo.create(&payload, user_id).await {
+    match state.artist_repo.create(&payload, user_id, &[quota]).await {
         Ok(new_artist) => {
             info!(
                 %user_id,

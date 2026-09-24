@@ -80,6 +80,14 @@ pub mod codes {
     pub const SUBSCRIPTION_CANCELING: &str = "SUBSCRIPTION_CANCELING";
     pub const PAYMENT_DECLINED: &str = "PAYMENT_DECLINED";
     pub const PAYMENT_PROVIDER_ERROR: &str = "PAYMENT_PROVIDER_ERROR";
+    /// Outside the 7-day withdrawal window (`meta.eligible_until`).
+    pub const WITHDRAWAL_NOT_ELIGIBLE: &str = "WITHDRAWAL_NOT_ELIGIBLE";
+    /// A plan change's charge needs the customer's authentication (3-D
+    /// Secure) on `meta.hosted_invoice_url`.
+    pub const PAYMENT_ACTION_REQUIRED: &str = "PAYMENT_ACTION_REQUIRED";
+    /// Plans can't stop being enforced while paid subscriptions are live
+    /// (repeat with `?force=true`).
+    pub const BILLING_HAS_PAID_SUBSCRIPTIONS: &str = "BILLING_HAS_PAID_SUBSCRIPTIONS";
 
     // Content.
     pub const INVALID_LINK: &str = "INVALID_LINK";
@@ -97,6 +105,11 @@ pub mod codes {
 
     // Capacity.
     pub const SERVICE_BUSY: &str = "SERVICE_BUSY";
+    /// A PDF export would be too big to render safely (too many items, or
+    /// a songbook with too much text). 413.
+    pub const PDF_TOO_LARGE: &str = "PDF_TOO_LARGE";
+    /// Another backup import is still running for this account. 409.
+    pub const IMPORT_IN_PROGRESS: &str = "IMPORT_IN_PROGRESS";
 
     // Communications (platform, v0.12).
     /// An announcement that must stay visible (not dismissible, or waiting
@@ -106,6 +119,22 @@ pub mod codes {
     /// button, end and display flags while active; nothing once ended or
     /// archived).
     pub const ANNOUNCEMENT_LOCKED: &str = "ANNOUNCEMENT_LOCKED";
+
+    // Account security (launch hardening).
+    /// A sensitive action needs a fresh proof of identity: the password,
+    /// or (accounts without one) a code e-mailed by
+    /// `POST /users/me/reauth/code`. 403, `meta.method` is `password` or
+    /// `email_code`.
+    pub const REAUTH_REQUIRED: &str = "REAUTH_REQUIRED";
+    /// Sign-up without the age declaration. 400.
+    pub const AGE_CONFIRMATION_REQUIRED: &str = "AGE_CONFIRMATION_REQUIRED";
+    /// Staff accounts must enable two-factor authentication before using
+    /// anything but their own account settings. 403.
+    pub const STAFF_TWO_FACTOR_REQUIRED: &str = "STAFF_TWO_FACTOR_REQUIRED";
+    /// A Google sign-in matched an existing account whose address Google
+    /// isn't authoritative for: sign in with the password and link Google
+    /// from the account settings. 409.
+    pub const ACCOUNT_LINK_REQUIRED: &str = "ACCOUNT_LINK_REQUIRED";
 }
 
 #[derive(Error, Debug)]
@@ -265,6 +294,40 @@ impl ApiError {
             codes::WEAK_PASSWORD,
             "The password does not meet the security requirements.",
             json!({ "issues": issues }),
+        )
+    }
+
+    /// `REAUTH_REQUIRED` (403): `method` is `password` or `email_code`.
+    pub fn reauth_required(method: &str) -> Self {
+        Self::rule_with_meta(
+            StatusCode::FORBIDDEN,
+            codes::REAUTH_REQUIRED,
+            "Confirm it's you to continue.",
+            json!({ "method": method }),
+        )
+    }
+
+    pub fn age_confirmation_required() -> Self {
+        Self::rule(
+            StatusCode::BAD_REQUEST,
+            codes::AGE_CONFIRMATION_REQUIRED,
+            "You must declare that you are 18 or older, or 16 or 17 with your guardian's authorization.",
+        )
+    }
+
+    pub fn staff_two_factor_required() -> Self {
+        Self::rule(
+            StatusCode::FORBIDDEN,
+            codes::STAFF_TWO_FACTOR_REQUIRED,
+            "Staff accounts must enable two-factor authentication before continuing.",
+        )
+    }
+
+    pub fn account_link_required() -> Self {
+        Self::rule(
+            StatusCode::CONFLICT,
+            codes::ACCOUNT_LINK_REQUIRED,
+            "An account with this e-mail already exists. Sign in with your password and link Google from your account settings.",
         )
     }
 

@@ -30,6 +30,8 @@ async fn offensive_usernames_and_avatars_are_flagged_and_slurs_refused() {
     assert_eq!(slur.code(), "VALIDATION_ERROR");
 
     let (rude_id, rude) = app.registered_user("fuuck.band", "rude@example.com").await;
+    // A new avatar needs a verified address.
+    app.verify_email(&rude, "rude@example.com").await;
     assert_eq!(app.wait_for_count(OPEN_FLAGS, rude_id, 1).await, 1);
 
     // Adult sites are refused outright; suspicious paths are flagged.

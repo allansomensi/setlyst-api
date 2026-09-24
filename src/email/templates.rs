@@ -8,7 +8,7 @@
 //! external resources. Every variable is HTML-escaped; only the fixed copy
 //! below is trusted.
 
-use crate::models::communication::Category;
+use crate::{models::communication::Category, services::billing::BILLING_NOTICE_KINDS};
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -169,8 +169,86 @@ pub enum EmailTemplate {
         plan_name: Value,
         current_period_end: Option<NaiveDateTime>,
     },
+    /// Confirmation of a paid subscription (the contract): plan, price,
+    /// period, next charge, the terms accepted, how to cancel and the
+    /// 7-day withdrawal right.
+    SubscriptionConfirmed {
+        username: String,
+        plan_name: Value,
+        /// Minor units per period.
+        amount_cents: Option<i64>,
+        /// ISO 4217.
+        currency: Option<String>,
+        /// `monthly` or `yearly`.
+        interval: Option<String>,
+        next_charge_at: Option<NaiveDateTime>,
+        /// Set while a card-on-file trial runs (the first charge is then).
+        trial_ends_at: Option<NaiveDateTime>,
+        terms_version: Option<String>,
+    },
+    /// A card-on-file trial ends and the first charge comes (7 days
+    /// ahead).
+    PaidTrialEnding {
+        username: String,
+        plan_name: Value,
+        amount_cents: Option<i64>,
+        currency: Option<String>,
+        interval: Option<String>,
+        charge_at: NaiveDateTime,
+    },
+    /// A yearly subscription renews soon.
+    RenewalReminder {
+        username: String,
+        plan_name: Value,
+        amount_cents: Option<i64>,
+        currency: Option<String>,
+        renews_at: NaiveDateTime,
+    },
+    /// A withdrawal (or a staff refund) was carried out: subscription
+    /// ended and money refunded.
+    WithdrawalConfirmed {
+        username: String,
+        plan_name: Value,
+        refunded_cents: i64,
+        currency: String,
+        requested_at: NaiveDateTime,
+        /// Ended by staff rather than at the buyer's request.
+        #[serde(default)]
+        by_staff: bool,
+    },
+    /// A card dispute (chargeback) canceled the subscription.
+    PaymentDisputed {
+        username: String,
+        plan_name: Value,
+    },
+    /// The subscription's price changes from `effective_at`.
+    PriceChange {
+        username: String,
+        plan_name: Value,
+        interval: Option<String>,
+        old_amount_cents: Option<i64>,
+        new_amount_cents: i64,
+        currency: Option<String>,
+        effective_at: NaiveDateTime,
+    },
     Welcome {
         username: String,
+    },
+    /// Step-up re-authentication code for an account without a password.
+    ReauthCode {
+        username: String,
+        code: String,
+        expires_minutes: i64,
+    },
+    /// A security event the owner must hear about. `kind`:
+    /// `email_change_started`, `email_in_use`, `google_linked`,
+    /// `google_unlinked`, `password_reset_by_staff`,
+    /// `email_changed_by_staff`, `login_locked`, `reauth_sessions_revoked`.
+    SecurityNotice {
+        username: String,
+        kind: String,
+        /// Masked address (or other short detail) the kind refers to.
+        detail: Option<String>,
     },
 }
 
@@ -183,6 +261,8 @@ enum FooterReason {
     Security,
     Deleted,
     Critical,
+    /// About a paid subscription: always sent, no unsubscribe link.
+    Billing,
     Preference(Category),
 }
 
@@ -203,7 +283,15 @@ impl EmailTemplate {
             EmailTemplate::ReleaseNotes { .. } => "release_notes",
             EmailTemplate::TrialEnding { .. } => "trial_ending",
             EmailTemplate::SubscriptionChanged { .. } => "subscription_changed",
+            EmailTemplate::SubscriptionConfirmed { .. } => "subscription_confirmed",
+            EmailTemplate::PaidTrialEnding { .. } => "paid_trial_ending",
+            EmailTemplate::RenewalReminder { .. } => "renewal_reminder",
+            EmailTemplate::WithdrawalConfirmed { .. } => "withdrawal_confirmed",
+            EmailTemplate::PaymentDisputed { .. } => "payment_disputed",
+            EmailTemplate::PriceChange { .. } => "price_change",
             EmailTemplate::Welcome { .. } => "welcome",
+            EmailTemplate::ReauthCode { .. } => "reauth_code",
+            EmailTemplate::SecurityNotice { .. } => "security_notice",
         }
     }
 
@@ -232,6 +320,7 @@ impl EmailTemplate {
             EmailTemplate::EmailVerificationCode { .. }
                 | EmailTemplate::PasswordResetCode { .. }
                 | EmailTemplate::EmailChangeCode { .. }
+                | EmailTemplate::ReauthCode { .. }
         )
     }
 
@@ -268,8 +357,29 @@ impl EmailTemplate {
             EmailTemplate::ReleaseNotes { .. } => {
                 FooterReason::Preference(Category::ProductUpdates)
             }
+            // Notices about a paid subscription are billing messages;
+            // plan grants, in-app trials and expiries stay optional.
+            EmailTemplate::SubscriptionChanged { kind, .. }
+                if BILLING_NOTICE_KINDS.contains(&kind.as_str()) =>
+            {
+                FooterReason::Billing
+            }
+            EmailTemplate::SubscriptionConfirmed { .. }
+            | EmailTemplate::PaidTrialEnding { .. }
+            | EmailTemplate::RenewalReminder { .. }
+            | EmailTemplate::WithdrawalConfirmed { .. }
+            | EmailTemplate::PaymentDisputed { .. }
+            | EmailTemplate::PriceChange { .. } => FooterReason::Billing,
             EmailTemplate::TrialEnding { .. } | EmailTemplate::SubscriptionChanged { .. } => {
                 FooterReason::Preference(Category::Account)
+            }
+            // Sent to an address that may belong to someone else's
+            // account (or to none): "typed into an account".
+            EmailTemplate::SecurityNotice { kind, .. } if kind == "email_in_use" => {
+                FooterReason::Address
+            }
+            EmailTemplate::ReauthCode { .. } | EmailTemplate::SecurityNotice { .. } => {
+                FooterReason::Security
             }
         }
     }
@@ -283,6 +393,7 @@ impl EmailTemplate {
             html: render_html(ctx, &subject, &content, &footer),
             text: render_text(&content, &footer),
             subject,
+            unsubscribe_url: footer.unsubscribe.as_ref().map(|(_, _, url)| url.clone()),
         }
     }
 
@@ -815,6 +926,377 @@ impl EmailTemplate {
                     ..Default::default()
                 }
             }
+            EmailTemplate::SubscriptionConfirmed {
+                username,
+                plan_name,
+                amount_cents,
+                currency,
+                interval,
+                next_charge_at,
+                trial_ends_at,
+                terms_version,
+            } => {
+                let plan = localized(plan_name, l);
+                let price = price_text(l, *amount_cents, currency.as_deref(), interval.as_deref());
+                let mut paragraphs = vec![
+                    greeting(l, username),
+                    match &price {
+                        Some(price) => l
+                            .pick(
+                                "Your subscription to the {p} plan is confirmed: {v}.",
+                                "Sua assinatura do plano {p} está confirmada: {v}.",
+                                "Tu suscripción al plan {p} está confirmada: {v}.",
+                            )
+                            .replace("{v}", price),
+                        None => l
+                            .pick(
+                                "Your subscription to the {p} plan is confirmed.",
+                                "Sua assinatura do plano {p} está confirmada.",
+                                "Tu suscripción al plan {p} está confirmada.",
+                            )
+                            .to_string(),
+                    }
+                    .replace("{p}", &plan),
+                ];
+                match (trial_ends_at, next_charge_at) {
+                    (Some(trial), _) => paragraphs.push(
+                        l.pick(
+                            "Your trial continues until {d}; the first charge is made automatically on that date. We will email you 7 days before it. If you cancel before then, nothing is charged.",
+                            "O período de teste continua até {d}; a primeira cobrança é feita automaticamente nessa data. Avisaremos você por e-mail 7 dias antes. Se cancelar antes, nada será cobrado.",
+                            "El periodo de prueba continúa hasta el {d}; el primer cobro se hace automáticamente en esa fecha. Te avisaremos por correo 7 días antes. Si cancelas antes, no se cobra nada.",
+                        )
+                        .replace("{d}", &l.format_datetime(*trial)),
+                    ),
+                    (None, Some(next)) => paragraphs.push(
+                        l.pick(
+                            "The next charge is on {d}.",
+                            "A próxima cobrança será em {d}.",
+                            "El próximo cobro será el {d}.",
+                        )
+                        .replace("{d}", &l.format_datetime(*next)),
+                    ),
+                    (None, None) => {}
+                }
+                paragraphs.push(
+                    l.pick(
+                        "The subscription renews automatically at the current price. You can cancel at any time under Settings > Subscription: the plan stays active until the end of the period already paid and nothing more is charged.",
+                        "A assinatura renova automaticamente pelo preço vigente. Você pode cancelar quando quiser em Configurações › Assinatura: o plano continua ativo até o fim do período já pago e não há novas cobranças.",
+                        "La suscripción se renueva automáticamente al precio vigente. Puedes cancelarla cuando quieras en Configuración › Suscripción: el plan sigue activo hasta el final del periodo ya pagado y no hay más cobros.",
+                    )
+                    .into(),
+                );
+                paragraphs.push(withdrawal_right(l));
+                paragraphs.push(
+                    l.pick(
+                        "Subscription Terms (version {v}): {s}\nTerms of Use: {t}",
+                        "Termos de Assinatura (versão {v}): {s}\nTermos de Uso: {t}",
+                        "Términos de Suscripción (versión {v}): {s}\nTérminos de Uso: {t}",
+                    )
+                    .replace("{v}", terms_version.as_deref().unwrap_or("-"))
+                    .replace("{s}", &app("/legal/subscription"))
+                    .replace("{t}", &app("/legal/terms")),
+                );
+                Content {
+                    subject: l
+                        .pick(
+                            "Your Setlyst subscription is confirmed",
+                            "Sua assinatura do Setlyst está confirmada",
+                            "Tu suscripción de Setlyst está confirmada",
+                        )
+                        .into(),
+                    heading: l
+                        .pick("Subscription confirmed", "Assinatura confirmada", "Suscripción confirmada")
+                        .into(),
+                    paragraphs,
+                    cta: Some((manage_label(l), app("/dashboard/settings#subscription"))),
+                    note: Some(
+                        l.pick(
+                            "Keep this email: it confirms your subscription. Payment receipts are sent by Stripe, our payment processor.",
+                            "Guarde este e-mail: ele confirma a contratação. Os recibos de pagamento são enviados pelo Stripe, nosso processador de pagamentos.",
+                            "Guarda este correo: confirma la contratación. Los recibos de pago los envía Stripe, nuestro procesador de pagos.",
+                        )
+                        .into(),
+                    ),
+                    ..Default::default()
+                }
+            }
+            EmailTemplate::PaidTrialEnding {
+                username,
+                plan_name,
+                amount_cents,
+                currency,
+                interval,
+                charge_at,
+            } => {
+                let plan = localized(plan_name, l);
+                let date = l.format_datetime(*charge_at);
+                let charge = match price_text(l, *amount_cents, currency.as_deref(), interval.as_deref()) {
+                    Some(price) => l
+                        .pick(
+                            "On {d} we will charge {v} for your {p} plan subscription to the card on file.",
+                            "Em {d} cobraremos {v} pela assinatura do plano {p} no cartão cadastrado.",
+                            "El {d} cobraremos {v} por la suscripción al plan {p} en la tarjeta registrada.",
+                        )
+                        .replace("{v}", &price),
+                    None => l
+                        .pick(
+                            "On {d} we will make the first charge for your {p} plan subscription to the card on file.",
+                            "Em {d} faremos a primeira cobrança da assinatura do plano {p} no cartão cadastrado.",
+                            "El {d} haremos el primer cobro de la suscripción al plan {p} en la tarjeta registrada.",
+                        )
+                        .to_string(),
+                };
+                Content {
+                    subject: l
+                        .pick(
+                            "Your first Setlyst charge is on {d}",
+                            "Sua primeira cobrança do Setlyst será em {d}",
+                            "Tu primer cobro de Setlyst será el {d}",
+                        )
+                        .replace("{d}", &date),
+                    heading: l
+                        .pick(
+                            "Your trial ends on {d}",
+                            "Seu período de teste termina em {d}",
+                            "Tu periodo de prueba termina el {d}",
+                        )
+                        .replace("{d}", &date),
+                    paragraphs: vec![
+                        greeting(l, username),
+                        charge.replace("{d}", &date).replace("{p}", &plan),
+                        l.pick(
+                            "To avoid being charged, cancel before {d} under Settings > Subscription. If you cancel before that date, nothing is charged.",
+                            "Para não ser cobrado, cancele até {d} em Configurações › Assinatura. Se cancelar antes dessa data, nada será cobrado.",
+                            "Para no recibir el cobro, cancela antes del {d} en Configuración › Suscripción. Si cancelas antes de esa fecha, no se cobra nada.",
+                        )
+                        .replace("{d}", &date),
+                        withdrawal_right(l),
+                    ],
+                    cta: Some((manage_label(l), app("/dashboard/settings#subscription"))),
+                    ..Default::default()
+                }
+            }
+            EmailTemplate::RenewalReminder {
+                username,
+                plan_name,
+                amount_cents,
+                currency,
+                renews_at,
+            } => {
+                let plan = localized(plan_name, l);
+                let date = l.format_datetime(*renews_at);
+                let renewal = match price_text(l, *amount_cents, currency.as_deref(), None) {
+                    Some(price) => l
+                        .pick(
+                            "On {d} your yearly {p} plan subscription renews automatically and we will charge {v} to the card on file.",
+                            "Em {d} sua assinatura anual do plano {p} será renovada automaticamente e cobraremos {v} no cartão cadastrado.",
+                            "El {d} tu suscripción anual al plan {p} se renovará automáticamente y cobraremos {v} en la tarjeta registrada.",
+                        )
+                        .replace("{v}", &price),
+                    None => l
+                        .pick(
+                            "On {d} your yearly {p} plan subscription renews automatically and is charged to the card on file.",
+                            "Em {d} sua assinatura anual do plano {p} será renovada automaticamente e cobrada no cartão cadastrado.",
+                            "El {d} tu suscripción anual al plan {p} se renovará automáticamente y se cobrará en la tarjeta registrada.",
+                        )
+                        .to_string(),
+                };
+                Content {
+                    subject: l
+                        .pick(
+                            "Your yearly Setlyst subscription renews on {d}",
+                            "Sua assinatura anual do Setlyst renova em {d}",
+                            "Tu suscripción anual de Setlyst se renueva el {d}",
+                        )
+                        .replace("{d}", &date),
+                    heading: l
+                        .pick("Upcoming renewal", "Renovação próxima", "Próxima renovación")
+                        .into(),
+                    paragraphs: vec![
+                        greeting(l, username),
+                        renewal.replace("{d}", &date).replace("{p}", &plan),
+                        l.pick(
+                            "If you don't want to renew, cancel before that date under Settings > Subscription; the plan stays active until the end of the period already paid.",
+                            "Se não quiser renovar, cancele antes dessa data em Configurações › Assinatura; o plano continua ativo até o fim do período já pago.",
+                            "Si no quieres renovar, cancela antes de esa fecha en Configuración › Suscripción; el plan sigue activo hasta el final del periodo ya pagado.",
+                        )
+                        .into(),
+                        withdrawal_right(l),
+                    ],
+                    cta: Some((manage_label(l), app("/dashboard/settings#subscription"))),
+                    ..Default::default()
+                }
+            }
+            EmailTemplate::WithdrawalConfirmed {
+                username,
+                plan_name,
+                refunded_cents,
+                currency,
+                requested_at,
+                by_staff,
+            } => {
+                let plan = localized(plan_name, l);
+                let ended = if *by_staff {
+                    l.pick(
+                        "Your {p} plan subscription was ended by the Setlyst team and will not be charged again.",
+                        "A assinatura do plano {p} foi encerrada pela equipe do Setlyst e não haverá novas cobranças.",
+                        "El equipo de Setlyst terminó tu suscripción al plan {p} y no habrá más cobros.",
+                    )
+                    .replace("{p}", &plan)
+                } else {
+                    l.pick(
+                        "We received your request to withdraw on {d}. Your {p} plan subscription has ended and will not be charged again.",
+                        "Recebemos seu pedido de desistência em {d}. A assinatura do plano {p} foi encerrada e não haverá novas cobranças.",
+                        "Recibimos tu solicitud de desistimiento el {d}. Tu suscripción al plan {p} terminó y no habrá más cobros.",
+                    )
+                    .replace("{d}", &l.format_datetime(*requested_at))
+                    .replace("{p}", &plan)
+                };
+                let refund = if *refunded_cents > 0 {
+                    l.pick(
+                        "We refunded {v} to the card used for the purchase. How long it takes to show on your statement depends on the card issuer.",
+                        "Estornamos {v} no cartão usado na compra. O prazo para o estorno aparecer na fatura depende do emissor do cartão.",
+                        "Reembolsamos {v} en la tarjeta usada en la compra. El plazo para que aparezca en el extracto depende del emisor de la tarjeta.",
+                    )
+                    .replace("{v}", &money(l, *refunded_cents, currency))
+                } else {
+                    l.pick(
+                        "There was nothing to refund.",
+                        "Não havia valores a estornar.",
+                        "No había importes que reembolsar.",
+                    )
+                    .into()
+                };
+                Content {
+                    subject: if *by_staff {
+                        l.pick(
+                            "Your Setlyst subscription was canceled and refunded",
+                            "Sua assinatura do Setlyst foi cancelada e estornada",
+                            "Tu suscripción de Setlyst fue cancelada y reembolsada",
+                        )
+                    } else {
+                        l.pick(
+                            "Your Setlyst withdrawal is confirmed",
+                            "Confirmação da desistência da sua assinatura do Setlyst",
+                            "Confirmación del desistimiento de tu suscripción de Setlyst",
+                        )
+                    }
+                    .into(),
+                    heading: l
+                        .pick("Subscription ended", "Assinatura encerrada", "Suscripción terminada")
+                        .into(),
+                    paragraphs: vec![
+                        greeting(l, username),
+                        ended,
+                        refund,
+                        l.pick(
+                            "Your account no longer has a plan; your songs, setlists and gigs stay saved.",
+                            "Sua conta passa a não ter plano; suas músicas, setlists e shows continuam salvos.",
+                            "Tu cuenta ya no tiene plan; tus canciones, setlists y conciertos siguen guardados.",
+                        )
+                        .into(),
+                    ],
+                    cta: Some((manage_label(l), app("/dashboard/settings#subscription"))),
+                    note: Some(
+                        l.pick(
+                            "If you have any questions, reply to this email.",
+                            "Se tiver dúvidas, responda a este e-mail.",
+                            "Si tienes dudas, responde a este correo.",
+                        )
+                        .into(),
+                    ),
+                    ..Default::default()
+                }
+            }
+            EmailTemplate::PaymentDisputed {
+                username,
+                plan_name,
+            } => Content {
+                subject: l
+                    .pick(
+                        "Your Setlyst subscription was canceled after a payment dispute",
+                        "Sua assinatura do Setlyst foi cancelada após uma contestação",
+                        "Tu suscripción de Setlyst fue cancelada tras una disputa de pago",
+                    )
+                    .into(),
+                heading: l
+                    .pick("Payment disputed", "Pagamento contestado", "Pago disputado")
+                    .into(),
+                paragraphs: vec![
+                    greeting(l, username),
+                    l.pick(
+                        "Your card issuer told us that a payment for your {p} plan subscription was disputed. The subscription was canceled and will not be charged again.",
+                        "A administradora do seu cartão nos informou uma contestação de um pagamento da assinatura do plano {p}. A assinatura foi cancelada e não haverá novas cobranças.",
+                        "El emisor de tu tarjeta nos informó una disputa de un pago de la suscripción al plan {p}. La suscripción fue cancelada y no habrá más cobros.",
+                    )
+                    .replace("{p}", &localized(plan_name, l)),
+                    l.pick(
+                        "Your songs, setlists and gigs stay saved. If you don't recognize this dispute, reply to this email.",
+                        "Suas músicas, setlists e shows continuam salvos. Se você não reconhece essa contestação, responda a este e-mail.",
+                        "Tus canciones, setlists y conciertos siguen guardados. Si no reconoces esta disputa, responde a este correo.",
+                    )
+                    .into(),
+                ],
+                ..Default::default()
+            },
+            EmailTemplate::PriceChange {
+                username,
+                plan_name,
+                interval,
+                old_amount_cents,
+                new_amount_cents,
+                currency,
+                effective_at,
+            } => {
+                let plan = localized(plan_name, l);
+                let date = l.format_datetime(*effective_at);
+                let currency = currency.as_deref().unwrap_or("BRL");
+                let new_price = money(l, *new_amount_cents, currency);
+                let change = match old_amount_cents {
+                    Some(old) => l
+                        .pick(
+                            "From {d}, the {i} price of your {p} plan subscription changes from {o} to {n}.",
+                            "A partir de {d}, o preço {i} da sua assinatura do plano {p} passa de {o} para {n}.",
+                            "A partir del {d}, el precio {i} de tu suscripción al plan {p} pasa de {o} a {n}.",
+                        )
+                        .replace("{o}", &money(l, *old, currency)),
+                    None => l
+                        .pick(
+                            "From {d}, the {i} price of your {p} plan subscription will be {n}.",
+                            "A partir de {d}, o preço {i} da sua assinatura do plano {p} passa a ser {n}.",
+                            "A partir del {d}, el precio {i} de tu suscripción al plan {p} será {n}.",
+                        )
+                        .to_string(),
+                };
+                Content {
+                    subject: l
+                        .pick(
+                            "The price of your Setlyst subscription is changing",
+                            "O preço da sua assinatura do Setlyst vai mudar",
+                            "El precio de tu suscripción de Setlyst va a cambiar",
+                        )
+                        .into(),
+                    heading: l
+                        .pick("Price change", "Mudança de preço", "Cambio de precio")
+                        .into(),
+                    paragraphs: vec![
+                        greeting(l, username),
+                        change
+                            .replace("{d}", &date)
+                            .replace("{i}", interval_label(l, interval.as_deref()))
+                            .replace("{p}", &plan)
+                            .replace("{n}", &new_price),
+                        l.pick(
+                            "The new price applies from your first renewal after that date. If you don't agree, you can cancel at any time under Settings > Subscription, with no fee; the plan stays active until the end of the period already paid.",
+                            "O novo preço vale a partir da primeira renovação após essa data. Se não concordar, você pode cancelar a qualquer momento em Configurações › Assinatura, sem multa; o plano continua ativo até o fim do período já pago.",
+                            "El nuevo precio se aplica desde tu primera renovación después de esa fecha. Si no estás de acuerdo, puedes cancelar en cualquier momento en Configuración › Suscripción, sin penalización; el plan sigue activo hasta el final del periodo ya pagado.",
+                        )
+                        .into(),
+                    ],
+                    cta: Some((manage_label(l), app("/dashboard/settings#subscription"))),
+                    ..Default::default()
+                }
+            }
             EmailTemplate::Welcome { username } => Content {
                 subject: l
                     .pick(
@@ -850,8 +1332,120 @@ impl EmailTemplate {
                 )),
                 ..Default::default()
             },
+            EmailTemplate::ReauthCode {
+                username,
+                code,
+                expires_minutes,
+            } => Content {
+                subject: l
+                    .pick(
+                        "Your Setlyst confirmation code",
+                        "Seu código de confirmação do Setlyst",
+                        "Tu código de confirmación de Setlyst",
+                    )
+                    .into(),
+                heading: l
+                    .pick(
+                        "Confirm it's you",
+                        "Confirme que é você",
+                        "Confirma que eres tú",
+                    )
+                    .into(),
+                paragraphs: vec![
+                    greeting(l, username),
+                    l.pick(
+                        "Use the code below to confirm a sensitive change in your Setlyst account. It is valid for {n} minutes.",
+                        "Use o código abaixo para confirmar uma alteração sensível na sua conta do Setlyst. Ele é válido por {n} minutos.",
+                        "Usa el código a continuación para confirmar un cambio sensible en tu cuenta de Setlyst. Es válido durante {n} minutos.",
+                    )
+                    .replace("{n}", &expires_minutes.to_string()),
+                ],
+                code: Some(code.clone()),
+                note: Some(security_hint(l)),
+                ..Default::default()
+            },
+            EmailTemplate::SecurityNotice {
+                username,
+                kind,
+                detail,
+            } => security_notice_content(l, username, kind, detail.as_deref(), &app),
         }
     }
+}
+
+/// An amount in minor units, as written in `l` (`R$ 39,90`).
+fn money(l: Locale, cents: i64, currency: &str) -> String {
+    let negative = cents < 0;
+    let cents = cents.unsigned_abs();
+    let (units, fraction) = (cents / 100, cents % 100);
+    let (thousands, decimal) = match l {
+        Locale::En => (',', '.'),
+        Locale::PtBr | Locale::Es => ('.', ','),
+    };
+    let digits = units.to_string();
+    let mut grouped = String::new();
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            grouped.push(thousands);
+        }
+        grouped.push(digit);
+    }
+    let number = format!(
+        "{}{grouped}{decimal}{fraction:02}",
+        if negative { "-" } else { "" }
+    );
+    match (currency.to_ascii_uppercase().as_str(), l) {
+        ("BRL", Locale::En) => format!("R${number}"),
+        ("BRL", _) => format!("R$ {number}"),
+        (other, _) => format!("{other} {number}"),
+    }
+}
+
+/// `monthly` / `yearly` in words.
+fn interval_label(l: Locale, interval: Option<&str>) -> &'static str {
+    match interval {
+        Some("yearly") => l.pick("yearly", "anual", "anual"),
+        _ => l.pick("monthly", "mensal", "mensual"),
+    }
+}
+
+/// "R$ 39,90 per month", when the amount is known.
+fn price_text(
+    l: Locale,
+    cents: Option<i64>,
+    currency: Option<&str>,
+    interval: Option<&str>,
+) -> Option<String> {
+    let amount = money(l, cents?, currency.unwrap_or("BRL"));
+    Some(match interval {
+        Some("yearly") => l
+            .pick("{v} per year", "{v} por ano", "{v} al año")
+            .replace("{v}", &amount),
+        Some(_) => l
+            .pick("{v} per month", "{v} por mês", "{v} al mes")
+            .replace("{v}", &amount),
+        None => amount,
+    })
+}
+
+/// The 7-day withdrawal right (CDC art. 49), as every billing e-mail
+/// states it.
+fn withdrawal_right(l: Locale) -> String {
+    l.pick(
+        "Right of withdrawal: you may withdraw within 7 days of a charge for a full refund, with the \"Withdraw from subscription\" button under Settings > Subscription or by replying to this email.",
+        "Direito de arrependimento: você pode desistir em até 7 dias da cobrança, com reembolso integral, pelo botão \"Desistir da assinatura\" em Configurações › Assinatura ou respondendo a este e-mail.",
+        "Derecho de desistimiento: puedes desistir dentro de los 7 días posteriores a un cobro con reembolso total, con el botón \"Desistir de la suscripción\" en Configuración › Suscripción o respondiendo a este correo.",
+    )
+    .into()
+}
+
+fn manage_label(l: Locale) -> String {
+    l.pick(
+        "Manage my subscription",
+        "Gerenciar minha assinatura",
+        "Gestionar mi suscripción",
+    )
+    .into()
 }
 
 fn greeting(l: Locale, username: &str) -> String {
@@ -897,6 +1491,9 @@ pub struct RenderedEmail {
     pub subject: String,
     pub html: String,
     pub text: String,
+    /// The unsubscribe link shown in the footer, when the message has one
+    /// (the worker turns it into `List-Unsubscribe` headers).
+    pub unsubscribe_url: Option<String>,
 }
 
 /// Content blocks shared by the HTML and text renderings. Plain text:
@@ -957,6 +1554,13 @@ fn footer(ctx: &RenderContext, reason: FooterReason) -> Footer {
                 "You are receiving this email because it is an important notice about the Setlyst service.",
                 "Você recebe este e-mail porque ele é um aviso importante sobre o serviço Setlyst.",
                 "Recibes este correo porque es un aviso importante sobre el servicio Setlyst.",
+            )
+            .to_string(),
+        FooterReason::Billing => l
+            .pick(
+                "You are receiving this email because it concerns your Setlyst subscription. Billing notices are always sent.",
+                "Você recebe este e-mail porque ele trata da sua assinatura no Setlyst. Avisos de cobrança são sempre enviados.",
+                "Recibes este correo porque trata sobre tu suscripción en Setlyst. Los avisos de cobro siempre se envían.",
             )
             .to_string(),
         FooterReason::Preference(category) => {
@@ -1176,6 +1780,162 @@ fn render_text(content: &Content, footer: &Footer) -> String {
     out
 }
 
+/// "Wasn't you?" advice closing every security message.
+fn security_hint(l: Locale) -> String {
+    l.pick(
+        "If this was not you, secure your account now: change your password (or reset it from the sign-in page), sign out everywhere and turn on two-step verification in the security settings.",
+        "Se não foi você, proteja sua conta agora: altere sua senha (ou redefina pela página de acesso), encerre todas as sessões e ative a verificação em duas etapas nas configurações de segurança.",
+        "Si no fuiste tú, protege tu cuenta ahora: cambia tu contraseña (o restablécela desde la página de acceso), cierra todas las sesiones y activa la verificación en dos pasos en la configuración de seguridad.",
+    )
+    .into()
+}
+
+/// Content of [`EmailTemplate::SecurityNotice`].
+fn security_notice_content(
+    l: Locale,
+    username: &str,
+    kind: &str,
+    detail: Option<&str>,
+    app: &dyn Fn(&str) -> String,
+) -> Content {
+    let detail = detail.unwrap_or("");
+    let fill = |text: &str| text.replace("{u}", username).replace("{d}", detail);
+    let (subject, heading, body) = match kind {
+        "email_change_started" => (
+            l.pick(
+                "A change of your Setlyst email was requested",
+                "Foi solicitada a troca do seu e-mail no Setlyst",
+                "Se solicitó cambiar tu correo en Setlyst",
+            ),
+            l.pick("Email change requested", "Troca de e-mail solicitada", "Cambio de correo solicitado"),
+            l.pick(
+                "Someone signed in to the account {u} asked to change its email address to {d}. The change only happens once the code sent to the new address is confirmed.",
+                "Alguém conectado à conta {u} pediu para trocar o endereço de e-mail para {d}. A troca só acontece depois que o código enviado ao novo endereço for confirmado.",
+                "Alguien con sesión en la cuenta {u} pidió cambiar su dirección de correo a {d}. El cambio solo ocurre cuando se confirme el código enviado a la nueva dirección.",
+            ),
+        ),
+        "email_in_use" => (
+            l.pick(
+                "Someone tried to use your email on Setlyst",
+                "Alguém tentou usar seu e-mail no Setlyst",
+                "Alguien intentó usar tu correo en Setlyst",
+            ),
+            l.pick("Your email is already in use", "Seu e-mail já está em uso", "Tu correo ya está en uso"),
+            l.pick(
+                "Someone asked to use this email address for another Setlyst account ({u}). It already belongs to an account, so nothing was changed.",
+                "Alguém pediu para usar este endereço de e-mail em outra conta do Setlyst ({u}). Ele já pertence a uma conta, então nada foi alterado.",
+                "Alguien pidió usar esta dirección de correo en otra cuenta de Setlyst ({u}). Ya pertenece a una cuenta, así que no se cambió nada.",
+            ),
+        ),
+        "google_linked" => (
+            l.pick(
+                "Google sign-in was linked to your Setlyst account",
+                "O acesso com Google foi vinculado à sua conta do Setlyst",
+                "Se vinculó el acceso con Google a tu cuenta de Setlyst",
+            ),
+            l.pick("Google account linked", "Conta Google vinculada", "Cuenta de Google vinculada"),
+            l.pick(
+                "The Google account {d} can now be used to sign in to the Setlyst account {u}.",
+                "A conta Google {d} agora pode ser usada para entrar na conta {u} do Setlyst.",
+                "La cuenta de Google {d} ahora puede usarse para iniciar sesión en la cuenta {u} de Setlyst.",
+            ),
+        ),
+        "google_unlinked" => (
+            l.pick(
+                "Google sign-in was removed from your Setlyst account",
+                "O acesso com Google foi removido da sua conta do Setlyst",
+                "Se quitó el acceso con Google de tu cuenta de Setlyst",
+            ),
+            l.pick("Google account unlinked", "Conta Google desvinculada", "Cuenta de Google desvinculada"),
+            l.pick(
+                "Google can no longer be used to sign in to the Setlyst account {u}.",
+                "O Google não pode mais ser usado para entrar na conta {u} do Setlyst.",
+                "Google ya no puede usarse para iniciar sesión en la cuenta {u} de Setlyst.",
+            ),
+        ),
+        "password_reset_by_staff" => (
+            l.pick(
+                "Setlyst support set a new password for your account",
+                "O suporte do Setlyst definiu uma nova senha para sua conta",
+                "El soporte de Setlyst definió una nueva contraseña para tu cuenta",
+            ),
+            l.pick("Password reset by support", "Senha redefinida pelo suporte", "Contraseña restablecida por soporte"),
+            l.pick(
+                "A member of the Setlyst team set a temporary password for the account {u} and signed out every session. Sign in with the password you received from support and choose a new one.",
+                "Um membro da equipe do Setlyst definiu uma senha temporária para a conta {u} e encerrou todas as sessões. Entre com a senha que você recebeu do suporte e escolha uma nova.",
+                "Un miembro del equipo de Setlyst definió una contraseña temporal para la cuenta {u} y cerró todas las sesiones. Inicia sesión con la contraseña que recibiste del soporte y elige una nueva.",
+            ),
+        ),
+        "email_changed_by_staff" => (
+            l.pick(
+                "Setlyst support changed your account email",
+                "O suporte do Setlyst alterou o e-mail da sua conta",
+                "El soporte de Setlyst cambió el correo de tu cuenta",
+            ),
+            l.pick("Email changed by support", "E-mail alterado pelo suporte", "Correo cambiado por soporte"),
+            l.pick(
+                "A member of the Setlyst team changed the email address of the account {u} to {d}. Messages about the account now go to the new address.",
+                "Um membro da equipe do Setlyst alterou o endereço de e-mail da conta {u} para {d}. As mensagens sobre a conta agora vão para o novo endereço.",
+                "Un miembro del equipo de Setlyst cambió la dirección de correo de la cuenta {u} a {d}. Los mensajes sobre la cuenta ahora van a la nueva dirección.",
+            ),
+        ),
+        "login_locked" => (
+            l.pick(
+                "Sign-in attempts to your Setlyst account were blocked",
+                "Tentativas de acesso à sua conta do Setlyst foram bloqueadas",
+                "Se bloquearon intentos de acceso a tu cuenta de Setlyst",
+            ),
+            l.pick("Sign-in attempts blocked", "Tentativas de acesso bloqueadas", "Intentos de acceso bloqueados"),
+            l.pick(
+                "There were several failed attempts to sign in to the account {u}, so further attempts were blocked for a while. Your password was not changed. If you are locked out, reset your password from the sign-in page: that lifts the block.",
+                "Houve várias tentativas de acesso sem sucesso à conta {u}, então novas tentativas foram bloqueadas por um tempo. Sua senha não foi alterada. Se você não conseguir entrar, redefina sua senha pela página de acesso: isso remove o bloqueio.",
+                "Hubo varios intentos fallidos de iniciar sesión en la cuenta {u}, así que se bloquearon nuevos intentos por un tiempo. Tu contraseña no se cambió. Si no puedes entrar, restablece tu contraseña desde la página de acceso: eso quita el bloqueo.",
+            ),
+        ),
+        _ => (
+            l.pick(
+                "Your Setlyst account was signed out everywhere",
+                "Sua conta do Setlyst foi desconectada de todos os dispositivos",
+                "Se cerró la sesión de tu cuenta de Setlyst en todas partes",
+            ),
+            l.pick("Signed out everywhere", "Sessões encerradas", "Sesiones cerradas"),
+            l.pick(
+                "Someone signed in to the account {u} typed the wrong password or confirmation code too many times, so every session was signed out as a precaution.",
+                "Alguém conectado à conta {u} digitou a senha ou o código de confirmação errado muitas vezes, então todas as sessões foram encerradas por precaução.",
+                "Alguien con sesión en la cuenta {u} escribió la contraseña o el código de confirmación incorrecto demasiadas veces, así que se cerraron todas las sesiones por precaución.",
+            ),
+        ),
+    };
+    let cta = (kind != "email_in_use").then(|| {
+        (
+            l.pick(
+                "Review your security settings",
+                "Revisar as configurações de segurança",
+                "Revisar la configuración de seguridad",
+            )
+            .to_string(),
+            app("/dashboard/settings?section=security"),
+        )
+    });
+    Content {
+        subject: subject.into(),
+        heading: heading.into(),
+        paragraphs: vec![fill(body)],
+        cta,
+        note: Some(if kind == "email_in_use" {
+            l.pick(
+                "If this was you, sign in to the account that already uses this address instead. If not, you can ignore this message.",
+                "Se foi você, entre na conta que já usa este endereço. Se não foi, pode ignorar esta mensagem.",
+                "Si fuiste tú, inicia sesión en la cuenta que ya usa esta dirección. Si no, puedes ignorar este mensaje.",
+            )
+            .into()
+        } else {
+            security_hint(l)
+        }),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1329,6 +2089,125 @@ mod tests {
         assert!(seen[4].contains("não haverá novas cobranças"));
     }
 
+    fn billing_samples() -> Vec<EmailTemplate> {
+        let when = NaiveDate::from_ymd_opt(2026, 10, 1)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let pro = json!({ "en": "Pro", "pt-BR": "Pro", "es": "Pro" });
+        vec![
+            EmailTemplate::SubscriptionConfirmed {
+                username: "ana".into(),
+                plan_name: pro.clone(),
+                amount_cents: Some(3990),
+                currency: Some("BRL".into()),
+                interval: Some("monthly".into()),
+                next_charge_at: Some(when),
+                trial_ends_at: Some(when),
+                terms_version: Some("2026-09-24".into()),
+            },
+            EmailTemplate::PaidTrialEnding {
+                username: "ana".into(),
+                plan_name: pro.clone(),
+                amount_cents: Some(39900),
+                currency: Some("BRL".into()),
+                interval: Some("yearly".into()),
+                charge_at: when,
+            },
+            EmailTemplate::RenewalReminder {
+                username: "ana".into(),
+                plan_name: pro.clone(),
+                amount_cents: Some(39900),
+                currency: Some("BRL".into()),
+                renews_at: when,
+            },
+            EmailTemplate::WithdrawalConfirmed {
+                username: "ana".into(),
+                plan_name: pro.clone(),
+                refunded_cents: 3990,
+                currency: "brl".into(),
+                requested_at: when,
+                by_staff: false,
+            },
+            EmailTemplate::PaymentDisputed {
+                username: "ana".into(),
+                plan_name: pro.clone(),
+            },
+            EmailTemplate::PriceChange {
+                username: "ana".into(),
+                plan_name: pro,
+                interval: Some("monthly".into()),
+                old_amount_cents: Some(3990),
+                new_amount_cents: 4490,
+                currency: Some("BRL".into()),
+                effective_at: when,
+            },
+        ]
+    }
+
+    #[test]
+    fn billing_templates_render_and_are_always_sent() {
+        for template in billing_samples() {
+            assert_eq!(template.unsubscribe_category(), None, "{}", template.name());
+            let (name, payload) = template.to_parts();
+            assert_eq!(
+                EmailTemplate::from_parts(name, &payload),
+                Some(template.clone())
+            );
+            for locale in Locale::ALL {
+                let rendered = template.render(&ctx(locale, false));
+                assert!(rendered.subject.chars().count() <= MAX_SUBJECT_CHARS);
+                assert!(!rendered.html.contains('—') && !rendered.text.contains('—'));
+                assert!(
+                    !rendered.text.contains('{'),
+                    "{}: {}",
+                    template.name(),
+                    rendered.text
+                );
+                assert!(rendered.text.contains("/legal/terms"));
+            }
+            let pt = template.render(&ctx(Locale::PtBr, false)).text;
+            assert!(
+                pt.contains("Avisos de cobrança são sempre enviados"),
+                "{pt}"
+            );
+        }
+        // The contract confirmation states price, terms, cancellation and
+        // the withdrawal right.
+        let confirmed = billing_samples()[0].render(&ctx(Locale::PtBr, false)).text;
+        assert!(confirmed.contains("R$ 39,90 por mês"), "{confirmed}");
+        assert!(confirmed.contains("/pt-BR/legal/subscription"));
+        assert!(confirmed.contains("versão 2026-09-24"));
+        assert!(confirmed.contains("7 dias"));
+        assert!(confirmed.contains("cancelar quando quiser"));
+        let reminder = billing_samples()[1].render(&ctx(Locale::PtBr, false)).text;
+        assert!(reminder.contains("R$ 399,00 por ano"), "{reminder}");
+        assert!(reminder.contains("01/10/2026"));
+        // Paid-subscription notices can't be unsubscribed from; plan
+        // grants still can.
+        let failed = EmailTemplate::SubscriptionChanged {
+            username: "ana".into(),
+            kind: "payment_failed".into(),
+            plan_name: json!({"en": "Pro"}),
+            current_period_end: None,
+        };
+        assert_eq!(failed.unsubscribe_category(), None);
+        let granted = EmailTemplate::SubscriptionChanged {
+            username: "ana".into(),
+            kind: "plan_granted".into(),
+            plan_name: json!({"en": "Pro"}),
+            current_period_end: None,
+        };
+        assert_eq!(granted.unsubscribe_category(), Some(Category::Account));
+    }
+
+    #[test]
+    fn money_is_written_per_locale() {
+        assert_eq!(money(Locale::PtBr, 3990, "BRL"), "R$ 39,90");
+        assert_eq!(money(Locale::En, 123_456, "brl"), "R$1,234.56");
+        assert_eq!(money(Locale::Es, 5, "USD"), "USD 0,05");
+    }
+
     #[test]
     fn templates_round_trip_through_the_outbox_columns() {
         for template in samples() {
@@ -1426,5 +2305,57 @@ mod tests {
                 .contains("https://setlyst.app/en/dashboard/announcements")
         );
         assert_eq!(localized(&json!({ "en": "A" }), Locale::Es), "A");
+    }
+
+    #[test]
+    fn account_security_templates_render_in_every_locale() {
+        let mut templates = vec![EmailTemplate::ReauthCode {
+            username: "ana".into(),
+            code: "246810".into(),
+            expires_minutes: 10,
+        }];
+        for kind in [
+            "email_change_started",
+            "email_in_use",
+            "google_linked",
+            "google_unlinked",
+            "password_reset_by_staff",
+            "email_changed_by_staff",
+            "login_locked",
+            "reauth_sessions_revoked",
+        ] {
+            templates.push(EmailTemplate::SecurityNotice {
+                username: "ana".into(),
+                kind: kind.into(),
+                detail: Some("n***@example.com".into()),
+            });
+        }
+        for template in &templates {
+            assert!(
+                template.unsubscribe_category().is_none(),
+                "{}",
+                template.name()
+            );
+            let parts = template.to_parts();
+            assert_eq!(
+                EmailTemplate::from_parts(parts.0, &parts.1).as_ref(),
+                Some(template)
+            );
+            for locale in Locale::ALL {
+                let rendered = template.render(&ctx(locale, false));
+                assert!(!rendered.subject.is_empty());
+                assert!(rendered.subject.chars().count() <= MAX_SUBJECT_CHARS);
+                assert!(!rendered.text.contains("{u}") && !rendered.text.contains("{d}"));
+                assert!(!rendered.html.contains('—') && !rendered.text.contains('—'));
+            }
+        }
+        assert!(templates[0].is_sensitive());
+        let started = templates[1].render(&ctx(Locale::PtBr, false));
+        assert!(started.text.contains("n***@example.com"));
+        assert!(
+            started
+                .text
+                .contains("/pt-BR/dashboard/settings?section=security")
+        );
     }
 }

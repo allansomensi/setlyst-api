@@ -9,7 +9,8 @@ use crate::{
 };
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use chrono::Utc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tracing::warn;
 
 /// Above this, the database is reported as degraded rather than operational.
@@ -82,26 +83,54 @@ fn http_status(health: ServiceHealth) -> StatusCode {
     }
 }
 
+/// How long the public status answer is reused.
+const PUBLIC_STATUS_TTL: Duration = Duration::from_secs(10);
+
+/// The last public probe: when it ran and what it found.
+static PUBLIC_STATUS: Mutex<Option<(Instant, ServiceHealth)>> = Mutex::const_new(None);
+
+/// The cheapest possible database check for the unauthenticated status:
+/// one `SELECT 1`, timed.
+async fn quick_probe(state: &AppState) -> ServiceHealth {
+    let started = Instant::now();
+    match sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&state.db)
+        .await
+    {
+        Ok(_) if started.elapsed().as_millis() as u64 > SLOW_QUERY_MS => ServiceHealth::Degraded,
+        Ok(_) => ServiceHealth::Operational,
+        Err(e) => {
+            warn!(error = %e, "Status probe: database unreachable");
+            ServiceHealth::Down
+        }
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/status",
     tags = ["Status"],
     summary = "Platform health.",
-    description = "Overall status and API version. Answers 503 when a dependency is down, with the same body. Infrastructure details (database version, connections, uptime) are only available to staff at `/status/details`.",
+    description = "Overall status only (`operational`, `degraded` or `down`), refreshed at most every 10 seconds. Answers 503 when a dependency is down, with the same body. The API version and infrastructure details (database version, connections, uptime) are only available to staff at `/status/details`. For a load balancer's health check use `/health`, which never touches the database.",
     responses(
         (status = 200, description = "Operational or degraded.", body = PublicStatus),
         (status = 503, description = "A dependency is down.", body = PublicStatus)
     )
 )]
 pub async fn show_status(State(state): State<AppState>) -> impl IntoResponse {
-    let database = probe_database(&state).await;
-    (
-        http_status(database.status),
-        Json(PublicStatus {
-            status: database.status,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-        }),
-    )
+    // Unauthenticated and cheap to call: one probe per 10 s per instance,
+    // however often it's hit (concurrent callers wait for the same probe).
+    let mut cached = PUBLIC_STATUS.lock().await;
+    let health = match *cached {
+        Some((at, health)) if at.elapsed() < PUBLIC_STATUS_TTL => health,
+        _ => {
+            let health = quick_probe(&state).await;
+            *cached = Some((Instant::now(), health));
+            health
+        }
+    };
+    drop(cached);
+    (http_status(health), Json(PublicStatus { status: health }))
 }
 
 #[utoipa::path(

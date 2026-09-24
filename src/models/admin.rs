@@ -59,7 +59,6 @@ pub struct AdminBandSummary {
     pub slug: String,
     pub description: Option<String>,
     pub logo_url: Option<String>,
-    pub members_can_manage_setlists: bool,
     pub created_by: Option<Uuid>,
     pub owner_id: Option<Uuid>,
     pub owner_username: Option<String>,

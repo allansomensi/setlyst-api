@@ -13,19 +13,23 @@ use crate::{
     errors::api_error::{ApiError, codes},
     models::{
         billing::{
-            BillingInterval, BillingMe, BillingSettings, CreditsSummary, PAYMENT_GRACE_DAYS,
-            PromoKind, RedemptionSummary, ReferralSummary, Subscription, SubscriptionSource,
-            SubscriptionStatus, subscription_in_effect,
+            BillingInterval, BillingMe, BillingSettings, CreditsSummary, PromoKind,
+            RedemptionSummary, ReferralSummary, Subscription, SubscriptionSource,
+            SubscriptionStatus, WITHDRAWAL_DAYS, subscription_in_effect,
         },
-        notification::Notification,
+        notification::{Notification, NotificationType},
     },
-    services::{entitlements, notifier::notify_all},
+    services::{
+        entitlements::{self, Feature},
+        notifier::notify_all,
+        payments,
+    },
 };
 use axum::http::StatusCode;
 use chrono::{Duration, NaiveDateTime, Utc};
 use serde_json::{Value, json};
 use sqlx::{FromRow, PgConnection};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 fn now() -> NaiveDateTime {
@@ -59,11 +63,20 @@ struct LockedSubscription {
     cancel_at_period_end: bool,
     external_ref: Option<String>,
     billing_interval: Option<String>,
+    past_due_since: Option<NaiveDateTime>,
+    provider_status: Option<String>,
+    unit_amount_cents: Option<i64>,
 }
 
 impl LockedSubscription {
     fn is_effective(&self, at: NaiveDateTime) -> bool {
-        subscription_in_effect(self.status, self.source, self.current_period_end, at)
+        subscription_in_effect(
+            self.status,
+            self.source,
+            self.current_period_end,
+            self.past_due_since,
+            at,
+        )
     }
 
     /// A paid subscription the payment provider is still charging for.
@@ -88,7 +101,7 @@ async fn lock_subscription(
 ) -> Result<Option<LockedSubscription>, ApiError> {
     Ok(sqlx::query_as::<_, LockedSubscription>(
         "SELECT plan_code, status, source, current_period_end, trial_ends_at, cancel_at_period_end,
-                external_ref, billing_interval
+                external_ref, billing_interval, past_due_since, provider_status, unit_amount_cents
          FROM subscriptions WHERE user_id = $1 FOR UPDATE",
     )
     .bind(user_id)
@@ -110,6 +123,18 @@ async fn ensure_plan_exists(conn: &mut PgConnection, plan_code: &str) -> Result<
             "This plan does not exist.",
         ))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn record_event_row(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    kind: &str,
+    to_plan: Option<&str>,
+    data: Value,
+    actor_id: Option<Uuid>,
+) -> Result<(), ApiError> {
+    record_event(conn, user_id, kind, None, to_plan, None, data, actor_id).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -228,7 +253,10 @@ pub async fn grant_plan_time(
              ON CONFLICT (user_id) DO UPDATE SET
                  plan_code = $2, status = 'active', source = $3, started_at = $4, current_period_end = $5,
                  trial_ends_at = NULL, cancel_at_period_end = FALSE, canceled_at = NULL,
-                 note = $6, updated_at = $4, updated_by = $7, trial_reminder_sent_at = NULL",
+                 note = $6, updated_at = $4, updated_by = $7, trial_reminder_sent_at = NULL,
+                 past_due_since = NULL, provider_status = NULL, unit_amount_cents = NULL, currency = NULL,
+                 paid_trial_reminder_sent_at = NULL, renewal_reminder_period_end = NULL,
+                 terms_version = NULL, terms_accepted_at = NULL",
         )
         .bind(user_id)
         .bind(plan_code)
@@ -289,7 +317,10 @@ pub async fn start_trial(
          ON CONFLICT (user_id) DO UPDATE SET
              plan_code = $2, status = 'trialing', source = 'trial', started_at = $3, current_period_end = $4,
              trial_ends_at = $4, cancel_at_period_end = FALSE, canceled_at = NULL,
-             updated_at = $3, updated_by = $5, trial_reminder_sent_at = NULL",
+             updated_at = $3, updated_by = $5, trial_reminder_sent_at = NULL,
+             past_due_since = NULL, provider_status = NULL, unit_amount_cents = NULL, currency = NULL,
+             paid_trial_reminder_sent_at = NULL, renewal_reminder_period_end = NULL,
+             terms_version = NULL, terms_accepted_at = NULL",
     )
     .bind(user_id)
     .bind(plan_code)
@@ -345,17 +376,54 @@ pub struct PaymentSnapshot {
     pub current_period_end: Option<NaiveDateTime>,
     pub cancel_at_period_end: bool,
     pub ended_at: Option<NaiveDateTime>,
+    /// End of a provider-side trial (card on file, first charge then).
+    pub trial_end: Option<NaiveDateTime>,
+    /// The price charged each period, minor units.
+    pub unit_amount: Option<i64>,
+    /// ISO 4217, upper case.
+    pub currency: Option<String>,
 }
 
 /// What mirroring a paid subscription changed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaymentChange {
     /// `subscribed`, `plan_changed`, `payment_failed`, `payment_recovered`,
-    /// `cancel_scheduled`, `resumed`, `renewed` or `canceled`.
+    /// `cancel_scheduled`, `resumed`, `renewed`, `updated`, `canceled`,
+    /// `withdrawn`, `refunded` (by staff) or `disputed`.
     pub kind: &'static str,
     pub plan_code: String,
     pub status: SubscriptionStatus,
     pub current_period_end: Option<NaiveDateTime>,
+    /// Extra fields for the notice (refunded amount...).
+    pub extra: Value,
+}
+
+/// Paid-subscription notices that are billing messages: they reach the
+/// inbox even when account e-mails are switched off (purchase and
+/// cancellation confirmations, charge reminders; Decreto 7.962 art. 4).
+pub const BILLING_NOTICE_KINDS: &[&str] = &[
+    "subscribed",
+    "plan_changed",
+    "payment_failed",
+    "cancel_scheduled",
+    "resumed",
+    "canceled",
+    "withdrawn",
+    "refunded",
+    "disputed",
+    "paid_trial_ending",
+    "renewal_reminder",
+    "price_change",
+];
+
+/// A billing notice about `user_id`'s paid subscription (`data` carries
+/// the fields of `kind`).
+pub fn billing_notice(user_id: Uuid, kind: &str, plan_code: &str, data: Value) -> Notification {
+    let mut body = json!({ "kind": kind, "plan_code": plan_code });
+    if let (Some(obj), Some(extra)) = (body.as_object_mut(), data.as_object()) {
+        obj.extend(extra.clone());
+    }
+    Notification::new(user_id, NotificationType::SubscriptionChanged, body)
 }
 
 impl PaymentChange {
@@ -370,34 +438,65 @@ impl PaymentChange {
                 | "cancel_scheduled"
                 | "resumed"
                 | "canceled"
+                | "withdrawn"
+                | "refunded"
+                | "disputed"
         )
         .then(|| {
-            Notification::subscription_changed(
+            let mut notification = Notification::subscription_changed(
                 user_id,
                 self.kind,
                 Some(&self.plan_code),
                 Some(self.status.key()),
                 self.current_period_end,
-            )
+            );
+            if let (Some(obj), Some(extra)) =
+                (notification.data.as_object_mut(), self.extra.as_object())
+            {
+                obj.extend(extra.clone());
+            }
+            notification
         })
+    }
+
+    /// The account lost a paid subscription.
+    pub fn ended(&self) -> bool {
+        matches!(
+            self.kind,
+            "canceled" | "withdrawn" | "refunded" | "disputed"
+        )
     }
 }
 
+/// What mirroring a paid subscription did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Applied {
+    Changed(PaymentChange),
+    /// Nothing to apply (no change, or an old subscription ending).
+    Unchanged,
+    /// The account already has another paid subscription in effect
+    /// (`current_ref`): this one is a second subscription and was not
+    /// applied. The caller decides which one survives.
+    Duplicate {
+        current_ref: String,
+    },
+}
+
 /// Mirrors a paid subscription into `subscriptions` (the provider is the
-/// source of truth for these). Returns what changed, or `None` when there
-/// was nothing to apply.
+/// source of truth for these).
 ///
 /// Idempotent: applying the same snapshot twice changes nothing the second
 /// time. A snapshot of a subscription that isn't the account's current one
-/// only matters while it is live (a newer purchase); an old subscription
-/// ending never touches the current row.
+/// only matters while it is live, and never replaces another paid
+/// subscription still in effect ([`Applied::Duplicate`]); an old
+/// subscription ending never touches the current row.
 pub async fn apply_payment_subscription(
     conn: &mut PgConnection,
     user_id: Uuid,
     snapshot: &PaymentSnapshot,
-) -> Result<Option<PaymentChange>, ApiError> {
+) -> Result<Applied, ApiError> {
     let Some(status) = snapshot.status else {
-        return Ok(None);
+        return Ok(Applied::Unchanged);
     };
     ensure_plan_exists(conn, &snapshot.plan_code).await?;
     let current = lock_subscription(conn, user_id).await?;
@@ -408,7 +507,15 @@ pub async fn apply_payment_subscription(
             && c.external_ref.as_deref() == Some(snapshot.external_ref.as_str())
     });
     if !same && !live {
-        return Ok(None);
+        return Ok(Applied::Unchanged);
+    }
+    if !same
+        && let Some(current_ref) = current
+            .as_ref()
+            .filter(|c| c.is_paid_and_effective(timestamp))
+            .and_then(|c| c.external_ref.clone())
+    {
+        return Ok(Applied::Duplicate { current_ref });
     }
 
     let period_end = if live {
@@ -417,6 +524,16 @@ pub async fn apply_payment_subscription(
         Some(snapshot.ended_at.unwrap_or(timestamp))
     };
     let interval = snapshot.interval.map(|i| i.key().to_string());
+    let trial_end = snapshot
+        .trial_end
+        .filter(|_| snapshot.provider_status == "trialing");
+    let past_due_since = (status == SubscriptionStatus::PastDue).then(|| {
+        current
+            .as_ref()
+            .filter(|c| same && c.status == SubscriptionStatus::PastDue)
+            .and_then(|c| c.past_due_since)
+            .unwrap_or(timestamp)
+    });
 
     let kind = match current.as_ref().filter(|_| same) {
         None => Some("subscribed"),
@@ -444,28 +561,48 @@ pub async fn apply_payment_subscription(
                 Some("resumed")
             } else if period_end > c.current_period_end {
                 Some("renewed")
+            } else if c.provider_status.as_deref() != Some(snapshot.provider_status.as_str())
+                || c.unit_amount_cents != snapshot.unit_amount
+                || c.trial_ends_at != trial_end
+            {
+                // A trial that started charging, a new price: no notice.
+                Some("updated")
             } else {
                 None
             }
         }
     };
     let Some(kind) = kind else {
-        return Ok(None);
+        return Ok(Applied::Unchanged);
     };
 
     sqlx::query(
         "INSERT INTO subscriptions (user_id, plan_code, status, source, started_at, current_period_end,
                                     trial_ends_at, cancel_at_period_end, canceled_at, external_ref,
-                                    billing_interval, created_at, updated_at, updated_by)
-         VALUES ($1, $2, $3, 'payment', $4, $5, NULL, $6, $7, $8, $9, $4, $4, NULL)
+                                    billing_interval, created_at, updated_at, updated_by,
+                                    past_due_since, provider_status, unit_amount_cents, currency)
+         VALUES ($1, $2, $3, 'payment', $4, $5, $10, $6, $7, $8, $9, $4, $4, NULL, $11, $12, $13, $14)
          ON CONFLICT (user_id) DO UPDATE SET
              plan_code = $2, status = $3, source = 'payment',
              started_at = CASE WHEN subscriptions.external_ref IS DISTINCT FROM $8
                                OR subscriptions.source <> 'payment'
                                THEN $4 ELSE subscriptions.started_at END,
-             current_period_end = $5, trial_ends_at = NULL, cancel_at_period_end = $6,
+             paid_trial_reminder_sent_at = CASE WHEN subscriptions.external_ref IS DISTINCT FROM $8
+                                                  OR subscriptions.source <> 'payment'
+                                                THEN NULL ELSE subscriptions.paid_trial_reminder_sent_at END,
+             renewal_reminder_period_end = CASE WHEN subscriptions.external_ref IS DISTINCT FROM $8
+                                                  OR subscriptions.source <> 'payment'
+                                                THEN NULL ELSE subscriptions.renewal_reminder_period_end END,
+             terms_version = CASE WHEN subscriptions.external_ref IS DISTINCT FROM $8
+                                    OR subscriptions.source <> 'payment'
+                                  THEN NULL ELSE subscriptions.terms_version END,
+             terms_accepted_at = CASE WHEN subscriptions.external_ref IS DISTINCT FROM $8
+                                        OR subscriptions.source <> 'payment'
+                                      THEN NULL ELSE subscriptions.terms_accepted_at END,
+             current_period_end = $5, trial_ends_at = $10, cancel_at_period_end = $6,
              canceled_at = $7, external_ref = $8, billing_interval = $9, note = NULL,
-             updated_at = $4, updated_by = NULL, trial_reminder_sent_at = NULL",
+             updated_at = $4, updated_by = NULL, trial_reminder_sent_at = NULL,
+             past_due_since = $11, provider_status = $12, unit_amount_cents = $13, currency = $14",
     )
     .bind(user_id)
     .bind(&snapshot.plan_code)
@@ -476,9 +613,33 @@ pub async fn apply_payment_subscription(
     .bind((!live).then_some(timestamp))
     .bind(&snapshot.external_ref)
     .bind(&interval)
+    .bind(trial_end)
+    .bind(past_due_since)
+    .bind(&snapshot.provider_status)
+    .bind(snapshot.unit_amount)
+    .bind(&snapshot.currency)
     .execute(&mut *conn)
     .await?;
 
+    let mut data = json!({
+        "source": SubscriptionSource::Payment,
+        "external_ref": snapshot.external_ref,
+        "interval": interval,
+        "provider_status": snapshot.provider_status,
+    });
+    // A complimentary plan replaced by the purchase comes back when the
+    // purchase ends (`restore_complimentary_grant`).
+    if kind == "subscribed"
+        && let Some(c) = current
+            .as_ref()
+            .filter(|c| !same && c.source == SubscriptionSource::Admin && c.is_effective(timestamp))
+    {
+        data["replaced"] = json!({
+            "plan_code": c.plan_code,
+            "source": c.source,
+            "current_period_end": c.current_period_end,
+        });
+    }
     record_event(
         conn,
         user_id,
@@ -486,22 +647,140 @@ pub async fn apply_payment_subscription(
         current.as_ref(),
         Some(&snapshot.plan_code),
         Some(status),
-        json!({
-            "source": SubscriptionSource::Payment,
-            "external_ref": snapshot.external_ref,
-            "interval": interval,
-            "provider_status": snapshot.provider_status,
-        }),
+        data,
         None,
     )
     .await?;
+    if kind == "canceled" {
+        restore_complimentary_grant(conn, user_id, &snapshot.external_ref).await?;
+    }
 
-    Ok(Some(PaymentChange {
+    Ok(Applied::Changed(PaymentChange {
         kind,
         plan_code: snapshot.plan_code.clone(),
         status,
         current_period_end: period_end,
+        extra: Value::Null,
     }))
+}
+
+/// Ends the paid subscription `external_ref` of `user_id` here, right
+/// away (it was canceled at the provider after a withdrawal, a dispute or
+/// a full refund). `kind` is what the history and the notice call it.
+/// `None` when that subscription isn't the account's live one.
+pub async fn end_paid_subscription(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    external_ref: &str,
+    kind: &'static str,
+    data: Value,
+    actor_id: Option<Uuid>,
+) -> Result<Option<PaymentChange>, ApiError> {
+    let Some(current) = lock_subscription(conn, user_id).await?.filter(|c| {
+        c.source == SubscriptionSource::Payment
+            && c.external_ref.as_deref() == Some(external_ref)
+            && c.status.is_live()
+    }) else {
+        return Ok(None);
+    };
+    let timestamp = now();
+    sqlx::query(
+        "UPDATE subscriptions
+         SET status = 'canceled', current_period_end = $2, canceled_at = $2,
+             cancel_at_period_end = FALSE, past_due_since = NULL, provider_status = 'canceled',
+             updated_at = $2, updated_by = $3
+         WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .bind(timestamp)
+    .bind(actor_id)
+    .execute(&mut *conn)
+    .await?;
+    let mut event_data = json!({
+        "source": SubscriptionSource::Payment,
+        "external_ref": external_ref,
+    });
+    if let (Some(obj), Some(extra)) = (event_data.as_object_mut(), data.as_object()) {
+        obj.extend(extra.clone());
+    }
+    record_event(
+        conn,
+        user_id,
+        kind,
+        Some(&current),
+        Some(&current.plan_code),
+        Some(SubscriptionStatus::Canceled),
+        event_data,
+        actor_id,
+    )
+    .await?;
+    restore_complimentary_grant(conn, user_id, external_ref).await?;
+    Ok(Some(PaymentChange {
+        kind,
+        plan_code: current.plan_code,
+        status: SubscriptionStatus::Canceled,
+        current_period_end: Some(timestamp),
+        extra: data,
+    }))
+}
+
+/// Brings back the complimentary (staff) plan a purchase replaced, when
+/// that purchase ends and the grant would still be running. `true` when a
+/// grant was restored.
+async fn restore_complimentary_grant(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    external_ref: &str,
+) -> Result<bool, ApiError> {
+    let replaced: Option<Value> = sqlx::query_scalar(
+        "SELECT data->'replaced' FROM subscription_events
+         WHERE user_id = $1 AND kind = 'subscribed' AND data->>'external_ref' = $2
+           AND data ? 'replaced'
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(external_ref)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(replaced) = replaced else {
+        return Ok(false);
+    };
+    let Some(plan_code) = replaced["plan_code"].as_str() else {
+        return Ok(false);
+    };
+    let until: Option<NaiveDateTime> =
+        serde_json::from_value(replaced["current_period_end"].clone()).unwrap_or(None);
+    let timestamp = now();
+    if until.is_some_and(|end| end <= timestamp) {
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE subscriptions
+         SET plan_code = $2, status = 'active', source = 'admin', current_period_end = $3,
+             started_at = $4, canceled_at = NULL, cancel_at_period_end = FALSE, external_ref = NULL,
+             billing_interval = NULL, past_due_since = NULL, provider_status = NULL,
+             unit_amount_cents = NULL, currency = NULL, trial_ends_at = NULL, updated_at = $4
+         WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .bind(plan_code)
+    .bind(until)
+    .bind(timestamp)
+    .execute(&mut *conn)
+    .await?;
+    record_event(
+        conn,
+        user_id,
+        "grant_restored",
+        None,
+        Some(plan_code),
+        Some(SubscriptionStatus::Active),
+        json!({ "source": SubscriptionSource::Admin, "after": external_ref }),
+        None,
+    )
+    .await?;
+    info!(%user_id, plan = plan_code, "Complimentary plan restored after a paid subscription ended");
+    Ok(true)
 }
 
 /// Adds `days` to a running trial, or starts a trial of the configured
@@ -848,12 +1127,29 @@ pub async fn redeem_reward(
 }
 
 /// Starts the registration trial when plans are enforced.
+///
+/// Idempotent and safe to call again later (for example on e-mail
+/// verification): an account gets at most one registration trial, and
+/// never while or after it had any subscription.
 pub async fn start_registration_trial(state: &AppState, user_id: Uuid) -> Result<(), ApiError> {
     let settings = load_settings(&state.db).await?;
     if !settings.enforced || settings.trial_days <= 0 {
         return Ok(());
     }
     let mut tx = state.db.begin().await?;
+    // Two calls at once (sign-up and verification racing) wait here.
+    lock_user_credits(&mut tx, user_id).await?;
+    let had_plan: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM subscriptions WHERE user_id = $1)
+             OR EXISTS (SELECT 1 FROM subscription_events
+                        WHERE user_id = $1 AND kind = 'trial_started')",
+    )
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if had_plan {
+        return Ok(());
+    }
     let outcome = start_trial(
         &mut tx,
         user_id,
@@ -881,15 +1177,35 @@ struct PendingReferral {
     referrer_id: Uuid,
 }
 
-async fn registration_ip(state: &AppState, user_id: Uuid) -> Result<Option<String>, ApiError> {
-    Ok(sqlx::query_scalar(
-        "SELECT ip_address FROM audit_logs
-         WHERE action = 'user.registered' AND target_id = $1 AND ip_address IS NOT NULL
-         ORDER BY created_at LIMIT 1",
+async fn pending_referral(
+    state: &AppState,
+    referred_id: Uuid,
+) -> Result<Option<PendingReferral>, ApiError> {
+    Ok(sqlx::query_as::<_, PendingReferral>(
+        "SELECT id, referrer_id FROM referrals WHERE referred_id = $1 AND status = 'pending'",
     )
-    .bind(user_id)
+    .bind(referred_id)
     .fetch_optional(&state.db)
     .await?)
+}
+
+/// Whether two accounts deliver to the same mailbox once tags, dots and
+/// case are folded (`me@gmail.com` referring `m.e+x@gmail.com`): the same
+/// rule that keeps trials to one per person, applied to referrals.
+async fn same_mailbox(state: &AppState, a: Uuid, b: Uuid) -> Result<bool, ApiError> {
+    let emails: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, email FROM users WHERE id = $1 OR id = $2")
+            .bind(a)
+            .bind(b)
+            .fetch_all(&state.db)
+            .await?;
+    let mailbox = |id: Uuid| {
+        emails
+            .iter()
+            .find(|(user, _)| *user == id)
+            .map(|(_, email)| crate::models::user::canonical_email(email))
+    };
+    Ok(matches!((mailbox(a), mailbox(b)), (Some(x), Some(y)) if x == y))
 }
 
 async fn reject_referral(state: &AppState, id: Uuid, note: &str) -> Result<(), ApiError> {
@@ -904,34 +1220,79 @@ async fn reject_referral(state: &AppState, id: Uuid, note: &str) -> Result<(), A
     Ok(())
 }
 
-/// Called when `referred_id` verifies their e-mail: pays out (or rejects)
-/// their pending referral.
+/// Called when `referred_id` verifies their e-mail: pays the referred
+/// account its own welcome bonus (once). The referrer is paid later, on
+/// that account's first paid invoice ([`reward_referrer_on_payment`]), so
+/// throwaway sign-ups earn nothing.
 pub async fn qualify_referral(state: &AppState, referred_id: Uuid) -> Result<(), ApiError> {
-    let Some(referral) = sqlx::query_as::<_, PendingReferral>(
-        "SELECT id, referrer_id FROM referrals WHERE referred_id = $1 AND status = 'pending'",
-    )
-    .bind(referred_id)
-    .fetch_optional(&state.db)
-    .await?
-    else {
+    let Some(referral) = pending_referral(state, referred_id).await? else {
         return Ok(());
     };
+    let settings = load_settings(&state.db).await?;
+    if !settings.referral.enabled {
+        return reject_referral(state, referral.id, "referral_disabled").await;
+    }
+    if referral.referrer_id == referred_id
+        || same_mailbox(state, referral.referrer_id, referred_id).await?
+    {
+        return reject_referral(state, referral.id, "self_referral").await;
+    }
 
+    let mut tx = state.db.begin().await?;
+    lock_user_credits(&mut tx, referred_id).await?;
+    let claimed = sqlx::query(
+        "UPDATE referrals SET referred_rewarded_at = $2
+         WHERE id = $1 AND status = 'pending' AND referred_rewarded_at IS NULL",
+    )
+    .bind(referral.id)
+    .bind(now())
+    .execute(&mut *tx)
+    .await?;
+    if claimed.rows_affected() == 0 {
+        return Ok(());
+    }
+    let credits = settings.referral.referred_credits;
+    add_credits(
+        &mut tx,
+        referred_id,
+        credits,
+        "referral_referred",
+        Some(referral.id),
+        None,
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    if credits > 0 {
+        notify_all(
+            state,
+            vec![Notification::credits_granted(
+                referred_id,
+                credits,
+                "referral_referred",
+            )],
+        )
+        .await;
+    }
+    info!(referral_id = %referral.id, "Referred account bonus paid");
+    Ok(())
+}
+
+/// Called when `referred_id` pays its first invoice: pays out (or
+/// rejects, over the monthly limit) the referrer's reward.
+pub async fn reward_referrer_on_payment(
+    state: &AppState,
+    referred_id: Uuid,
+) -> Result<(), ApiError> {
+    let Some(referral) = pending_referral(state, referred_id).await? else {
+        return Ok(());
+    };
     let settings = load_settings(&state.db).await?;
     if !settings.referral.enabled {
         return reject_referral(state, referral.id, "referral_disabled").await;
     }
     if referral.referrer_id == referred_id {
         return reject_referral(state, referral.id, "self_referral").await;
-    }
-    let (referrer_ip, referred_ip) = (
-        registration_ip(state, referral.referrer_id).await?,
-        registration_ip(state, referred_id).await?,
-    );
-    if let (Some(a), Some(b)) = (&referrer_ip, &referred_ip)
-        && a == b
-    {
-        return reject_referral(state, referral.id, "same_registration_ip").await;
     }
 
     let mut tx = state.db.begin().await?;
@@ -958,48 +1319,29 @@ pub async fn qualify_referral(state: &AppState, referred_id: Uuid) -> Result<(),
     if claimed.rows_affected() == 0 {
         return Ok(());
     }
-    let (referrer_credits, referred_credits) = (
-        settings.referral.referrer_credits,
-        settings.referral.referred_credits,
-    );
+    let credits = settings.referral.referrer_credits;
     add_credits(
         &mut tx,
         referral.referrer_id,
-        referrer_credits,
+        credits,
         "referral_referrer",
         Some(referral.id),
         None,
         None,
     )
     .await?;
-    add_credits(
-        &mut tx,
-        referred_id,
-        referred_credits,
-        "referral_referred",
-        Some(referral.id),
-        None,
-        None,
-    )
-    .await?;
     tx.commit().await?;
-
-    let mut notifications = Vec::new();
-    if referrer_credits > 0 {
-        notifications.push(Notification::credits_granted(
-            referral.referrer_id,
-            referrer_credits,
-            "referral_referrer",
-        ));
+    if credits > 0 {
+        notify_all(
+            state,
+            vec![Notification::credits_granted(
+                referral.referrer_id,
+                credits,
+                "referral_referrer",
+            )],
+        )
+        .await;
     }
-    if referred_credits > 0 {
-        notifications.push(Notification::credits_granted(
-            referred_id,
-            referred_credits,
-            "referral_referred",
-        ));
-    }
-    notify_all(state, notifications).await;
     info!(referral_id = %referral.id, "Referral rewarded");
     Ok(())
 }
@@ -1109,13 +1451,21 @@ pub async fn grant_trials(state: &AppState, days: i64, actor_id: Uuid) -> Result
     Ok(users.len() as i64)
 }
 
-/// Hourly maintenance while plans are enforced: expires subscriptions
-/// whose period ended and sends trial-ending reminders three days ahead.
-/// Returns `(expired, reminded)`.
+/// Hourly maintenance.
 ///
-/// Paid subscriptions are kept up to date by the payment provider's
-/// webhook; they only expire here once their grace period has passed too
-/// (the webhook never confirmed a renewal).
+/// Paid subscriptions (whatever the enforcement setting, since the
+/// provider keeps charging them): those whose period ended or whose failed
+/// renewal ran out of grace are reconciled with the provider before they
+/// lose their plan; card-on-file trials get their "first charge in 7 days"
+/// reminder, yearly plans their renewal reminder; customers whose deletion
+/// failed are retried; once a day every subscription at the provider is
+/// compared with its mirror.
+///
+/// While plans are enforced: expires the other subscriptions whose period
+/// ended (revoking public links the account's plan no longer includes) and
+/// sends trial-ending reminders three days ahead.
+///
+/// Returns `(expired, reminded)`.
 pub async fn run_subscription_maintenance(state: &AppState) -> Result<(u64, u64), ApiError> {
     let timestamp = now();
     // Webhook events are only redelivered for three days.
@@ -1124,23 +1474,35 @@ pub async fn run_subscription_maintenance(state: &AppState) -> Result<(u64, u64)
         .execute(&state.db)
         .await?;
 
-    let settings = load_settings(&state.db).await?;
-    if !settings.enforced {
-        return Ok((0, 0));
+    let mut expired_count = payments::reconcile_due(state).await?;
+    let mut reminded = send_paid_trial_reminders(state, None).await?;
+    reminded += send_renewal_reminders(state, None, RENEWAL_REMINDER_DAYS, None).await?;
+    payments::process_cleanup_queue(state).await?;
+    if claim_job_run(state, "stripe_reconciliation", Duration::hours(24)).await? {
+        match payments::reconcile_all(state).await {
+            Ok(count) => info!(count, "Stripe subscriptions reconciled"),
+            Err(e) => error!(error = %e, "Stripe reconciliation failed"),
+        }
     }
 
+    let settings = load_settings(&state.db).await?;
+    if !settings.enforced {
+        return Ok((expired_count, reminded));
+    }
+
+    // Paid subscriptions are expired by `payments::reconcile_due`, after
+    // asking the provider.
     let expired: Vec<(Uuid, String, SubscriptionStatus)> = sqlx::query_as(
         "UPDATE subscriptions s SET status = 'expired', updated_at = $1
          FROM (SELECT user_id, status FROM subscriptions
                WHERE status IN ('trialing', 'active', 'past_due')
                  AND current_period_end IS NOT NULL AND current_period_end <= $1
-                 AND (source <> 'payment' OR current_period_end <= $2)
+                 AND source <> 'payment'
                FOR UPDATE) AS old
          WHERE s.user_id = old.user_id
          RETURNING s.user_id, s.plan_code, old.status",
     )
     .bind(timestamp)
-    .bind(timestamp - Duration::days(PAYMENT_GRACE_DAYS))
     .fetch_all(&state.db)
     .await?;
     let mut notifications = Vec::new();
@@ -1164,7 +1526,9 @@ pub async fn run_subscription_maintenance(state: &AppState) -> Result<(u64, u64)
             Some("expired"),
             Some(timestamp),
         ));
+        revoke_shares_if_lost(state, *user_id).await?;
     }
+    expired_count += expired.len() as u64;
 
     let reminders: Vec<(Uuid, String, NaiveDateTime)> = sqlx::query_as(
         "UPDATE subscriptions SET trial_reminder_sent_at = $1
@@ -1181,7 +1545,266 @@ pub async fn run_subscription_maintenance(state: &AppState) -> Result<(u64, u64)
     }
 
     notify_all(state, notifications).await;
-    Ok((expired.len() as u64, reminders.len() as u64))
+    Ok((expired_count, reminded + reminders.len() as u64))
+}
+
+/// `true` when job `name` last ran more than `every` ago, recording this
+/// run (at most one replica wins).
+async fn claim_job_run(state: &AppState, name: &str, every: Duration) -> Result<bool, ApiError> {
+    let timestamp = now();
+    let claimed: Option<String> = sqlx::query_scalar(
+        "INSERT INTO billing_job_runs (name, last_run_at) VALUES ($1, $2)
+         ON CONFLICT (name) DO UPDATE SET last_run_at = $2
+         WHERE billing_job_runs.last_run_at <= $3
+         RETURNING name",
+    )
+    .bind(name)
+    .bind(timestamp)
+    .bind(timestamp - every)
+    .fetch_optional(&state.db)
+    .await?;
+    Ok(claimed.is_some())
+}
+
+/// How long before the first charge of a card-on-file trial the owner is
+/// reminded (card-network rules; Subscription Terms §4.4).
+pub const PAID_TRIAL_REMINDER_DAYS: i64 = 7;
+
+/// How long before a yearly renewal the owner is reminded when the
+/// provider's `invoice.upcoming` event didn't do it earlier (Subscription
+/// Terms §6.2).
+pub const RENEWAL_REMINDER_DAYS: i64 = 7;
+
+/// Sends the "your first charge is on {date}" reminder of card-on-file
+/// trials ending within [`PAID_TRIAL_REMINDER_DAYS`], once per
+/// subscription. `user_id` limits it to one account. Returns how many were
+/// sent.
+pub async fn send_paid_trial_reminders(
+    state: &AppState,
+    user_id: Option<Uuid>,
+) -> Result<u64, ApiError> {
+    let timestamp = now();
+    #[allow(clippy::type_complexity)]
+    let due: Vec<(
+        Uuid,
+        String,
+        NaiveDateTime,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "UPDATE subscriptions SET paid_trial_reminder_sent_at = $1
+         WHERE source = 'payment' AND status = 'active' AND provider_status = 'trialing'
+           AND paid_trial_reminder_sent_at IS NULL AND NOT cancel_at_period_end
+           AND trial_ends_at > $1 AND trial_ends_at <= $2
+           AND ($3::uuid IS NULL OR user_id = $3)
+         RETURNING user_id, plan_code, trial_ends_at, unit_amount_cents, currency, billing_interval",
+    )
+    .bind(timestamp)
+    .bind(timestamp + Duration::days(PAID_TRIAL_REMINDER_DAYS))
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await?;
+    let notifications = due
+        .iter()
+        .map(|(user_id, plan, charge_at, amount, currency, interval)| {
+            billing_notice(
+                *user_id,
+                "paid_trial_ending",
+                plan,
+                json!({
+                    "charge_at": charge_at,
+                    "amount_cents": amount,
+                    "currency": currency,
+                    "interval": interval,
+                }),
+            )
+        })
+        .collect();
+    notify_all(state, notifications).await;
+    Ok(due.len() as u64)
+}
+
+/// Sends the yearly renewal reminder of subscriptions renewing within
+/// `within_days`, once per period. `user_id` limits it to one account;
+/// `amount` is the upcoming invoice's `(minor units, currency)` when the
+/// provider announced it. Returns how many were sent.
+pub async fn send_renewal_reminders(
+    state: &AppState,
+    user_id: Option<Uuid>,
+    within_days: i64,
+    amount: Option<(i64, String)>,
+) -> Result<u64, ApiError> {
+    let timestamp = now();
+    #[allow(clippy::type_complexity)]
+    let due: Vec<(Uuid, String, NaiveDateTime, Option<i64>, Option<String>)> = sqlx::query_as(
+        "UPDATE subscriptions SET renewal_reminder_period_end = current_period_end
+         WHERE source = 'payment' AND status = 'active' AND billing_interval = 'yearly'
+           AND COALESCE(provider_status, 'active') = 'active' AND NOT cancel_at_period_end
+           AND current_period_end > $1 AND current_period_end <= $2
+           AND renewal_reminder_period_end IS DISTINCT FROM current_period_end
+           AND ($3::uuid IS NULL OR user_id = $3)
+         RETURNING user_id, plan_code, current_period_end, unit_amount_cents, currency",
+    )
+    .bind(timestamp)
+    .bind(timestamp + Duration::days(within_days))
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await?;
+    let notifications = due
+        .iter()
+        .map(|(user_id, plan, renews_at, unit_amount, currency)| {
+            let (amount_cents, currency) = match &amount {
+                Some((cents, currency)) => (Some(*cents), Some(currency.clone())),
+                None => (*unit_amount, currency.clone()),
+            };
+            billing_notice(
+                *user_id,
+                "renewal_reminder",
+                plan,
+                json!({
+                    "renews_at": renews_at,
+                    "amount_cents": amount_cents,
+                    "currency": currency,
+                    "interval": "yearly",
+                }),
+            )
+        })
+        .collect();
+    notify_all(state, notifications).await;
+    Ok(due.len() as u64)
+}
+
+/// New list prices of a plan, minor units (`None` = unchanged).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NewPrices {
+    pub monthly_cents: Option<i64>,
+    pub yearly_cents: Option<i64>,
+}
+
+/// Tells every paying subscriber of `plan_code` whose price changes that
+/// it will cost `new_prices` from `effective_at` (Subscription Terms
+/// §11.1: at least 30 days ahead). Only the notice: moving the
+/// subscriptions to the new price is a separate step. Returns how many
+/// subscribers were told.
+pub async fn notify_price_change(
+    state: &AppState,
+    plan_code: &str,
+    new_prices: NewPrices,
+    effective_at: NaiveDateTime,
+) -> Result<u64, ApiError> {
+    #[allow(clippy::type_complexity)]
+    let subscribers: Vec<(Uuid, Option<String>, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT user_id, billing_interval, unit_amount_cents, currency FROM subscriptions
+         WHERE source = 'payment' AND plan_code = $1 AND status IN ('active', 'past_due')
+           AND NOT cancel_at_period_end",
+    )
+    .bind(plan_code)
+    .fetch_all(&state.db)
+    .await?;
+    let mut notifications = Vec::new();
+    for (user_id, interval, old_amount, currency) in subscribers {
+        let new_amount = match interval.as_deref() {
+            Some("yearly") => new_prices.yearly_cents,
+            _ => new_prices.monthly_cents,
+        };
+        let Some(new_amount) = new_amount.filter(|n| Some(*n) != old_amount) else {
+            continue;
+        };
+        let data = json!({
+            "interval": interval,
+            "old_amount_cents": old_amount,
+            "new_amount_cents": new_amount,
+            "currency": currency,
+            "effective_at": effective_at,
+        });
+        let mut conn = state.db.acquire().await?;
+        record_event_row(
+            &mut conn,
+            user_id,
+            "price_change_notified",
+            Some(plan_code),
+            data.clone(),
+            None,
+        )
+        .await?;
+        notifications.push(billing_notice(user_id, "price_change", plan_code, data));
+    }
+    let count = notifications.len() as u64;
+    notify_all(state, notifications).await;
+    info!(plan = plan_code, count, "Price change notices sent");
+    Ok(count)
+}
+
+/// Turns off the public links of `user_id`'s own setlists and gigs when
+/// the account's plan no longer includes public sharing. Returns how many
+/// links were revoked.
+pub async fn revoke_shares_if_lost(state: &AppState, user_id: Uuid) -> Result<u64, ApiError> {
+    if entitlements::has_feature(state, user_id, Feature::PublicSharing).await? {
+        return Ok(0);
+    }
+    let setlists = sqlx::query(
+        "UPDATE setlists SET share_token = NULL
+         WHERE user_id = $1 AND band_id IS NULL AND share_token IS NOT NULL",
+    )
+    .bind(user_id)
+    .execute(&state.db)
+    .await?
+    .rows_affected();
+    let gigs = sqlx::query(
+        "UPDATE gigs SET share_token = NULL
+         WHERE user_id = $1 AND band_id IS NULL AND share_token IS NOT NULL",
+    )
+    .bind(user_id)
+    .execute(&state.db)
+    .await?
+    .rows_affected();
+    if setlists + gigs > 0 {
+        info!(%user_id, setlists, gigs, "Public links revoked: the plan no longer includes sharing");
+    }
+    Ok(setlists + gigs)
+}
+
+/// The last day the buyer may withdraw from a paid subscription whose
+/// first paid invoice was paid at `first_paid` and the latest at
+/// `latest_paid`: 7 days from the first charge, and, for yearly plans, 7
+/// days from each renewal charge too (conservative reading of CDC art. 49).
+pub fn withdrawal_deadline(
+    first_paid: NaiveDateTime,
+    latest_paid: NaiveDateTime,
+    yearly: bool,
+) -> NaiveDateTime {
+    let first = first_paid + Duration::days(WITHDRAWAL_DAYS);
+    if yearly {
+        first.max(latest_paid + Duration::days(WITHDRAWAL_DAYS))
+    } else {
+        first
+    }
+}
+
+/// Until when the account's current paid subscription can be withdrawn
+/// from, per the payment ledger. `None` outside the window.
+async fn withdrawal_eligible_until(
+    state: &AppState,
+    user_id: Uuid,
+) -> Result<Option<NaiveDateTime>, ApiError> {
+    let row: Option<(Option<NaiveDateTime>, Option<NaiveDateTime>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT MIN(p.paid_at), MAX(p.paid_at), MAX(s.billing_interval)
+             FROM subscriptions s
+             JOIN payments p ON p.subscription_id = s.external_ref
+             WHERE s.user_id = $1 AND s.source = 'payment'
+               AND s.status IN ('active', 'past_due')
+               AND p.amount_cents > 0 AND p.refunded_cents < p.amount_cents",
+        )
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await?;
+    let Some((Some(first), Some(latest), interval)) = row else {
+        return Ok(None);
+    };
+    let deadline = withdrawal_deadline(first, latest, interval.as_deref() == Some("yearly"));
+    Ok((deadline > now()).then_some(deadline))
 }
 
 /// The body of `GET /billing/me`.
@@ -1197,6 +1820,16 @@ pub async fn billing_me(state: &AppState, user_id: Uuid) -> Result<BillingMe, Ap
         .await?
         .flatten();
     let plan = load_effective_plan(&state.db, user_id).await?;
+    let past_due_since = subscription
+        .as_ref()
+        .filter(|s| {
+            s.source == SubscriptionSource::Payment && s.status == SubscriptionStatus::PastDue
+        })
+        .and_then(|s| s.past_due_since)
+        .map(|t| t.and_utc());
+    let withdrawal_eligible_until = withdrawal_eligible_until(state, user_id)
+        .await?
+        .map(|t| t.and_utc());
     Ok(BillingMe {
         enforced: settings.enforced,
         payments_enabled: state.payments.is_some(),
@@ -1211,5 +1844,53 @@ pub async fn billing_me(state: &AppState, user_id: Uuid) -> Result<BillingMe, Ap
             pending_count: pending,
         },
         rewards: settings.rewards,
+        withdrawal_eligible_until,
+        past_due_since,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(day: u32) -> NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 9, day)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn withdrawal_counts_from_the_first_charge_and_yearly_renewals() {
+        assert_eq!(withdrawal_deadline(at(1), at(1), false), at(8));
+        // A monthly renewal doesn't reopen the window.
+        assert_eq!(withdrawal_deadline(at(1), at(20), false), at(8));
+        // A yearly renewal does.
+        assert_eq!(withdrawal_deadline(at(1), at(20), true), at(27));
+    }
+
+    #[test]
+    fn billing_notices_carry_their_fields() {
+        let user = Uuid::nil();
+        let notice = billing_notice(
+            user,
+            "paid_trial_ending",
+            "pro",
+            json!({ "amount_cents": 3990 }),
+        );
+        assert_eq!(notice.data["kind"], "paid_trial_ending");
+        assert_eq!(notice.data["plan_code"], "pro");
+        assert_eq!(notice.data["amount_cents"], 3990);
+        let change = PaymentChange {
+            kind: "withdrawn",
+            plan_code: "pro".into(),
+            status: SubscriptionStatus::Canceled,
+            current_period_end: None,
+            extra: json!({ "refunded_cents": 3990 }),
+        };
+        assert!(change.ended());
+        let notice = change.notification(user).unwrap();
+        assert_eq!(notice.data["refunded_cents"], 3990);
+        assert!(BILLING_NOTICE_KINDS.contains(&"withdrawn"));
+    }
 }

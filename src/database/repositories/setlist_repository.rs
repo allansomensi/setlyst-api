@@ -1,4 +1,7 @@
-use crate::database::repositories::song_repository::{like_pattern, song_columns};
+use crate::database::repositories::{
+    quota_repository::QuotaGuard,
+    song_repository::{like_pattern, song_columns},
+};
 use crate::{
     errors::api_error::{ApiError, codes},
     models::{
@@ -74,10 +77,13 @@ pub trait SetlistRepository: Send + Sync {
     /// personal setlist, or a setlist belonging to any band they are a
     /// member of.
     async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Setlist>, ApiError>;
+    /// Creates a setlist. `quota` is enforced inside the insert's
+    /// transaction (see [`QuotaGuard`]).
     async fn create(
         &self,
         payload: &CreateSetlistPayload,
         user_id: Uuid,
+        quota: &[QuotaGuard],
     ) -> Result<Setlist, ApiError>;
     /// Title changes on a repertoire fail with `REPERTOIRE_PROTECTED`.
     async fn update(
@@ -149,7 +155,14 @@ pub trait SetlistRepository: Send + Sync {
     /// space (the position is always computed server-side). For a band
     /// setlist the song is also appended to the band's repertoire when it
     /// isn't there yet, in the same transaction.
-    async fn add_song(&self, setlist_id: Uuid, song_id: Uuid) -> Result<(), ApiError>;
+    /// `quota` (the setlist's item limit) is enforced in the same
+    /// transaction.
+    async fn add_song(
+        &self,
+        setlist_id: Uuid,
+        song_id: Uuid,
+        quota: &[QuotaGuard],
+    ) -> Result<(), ApiError>;
     /// Checks whether a song is already part of a setlist — used to reject
     /// adding the same song twice rather than silently repositioning it.
     async fn has_song(&self, setlist_id: Uuid, song_id: Uuid) -> Result<bool, ApiError>;
@@ -176,30 +189,53 @@ pub trait SetlistRepository: Send + Sync {
     /// song are created). Songs that would take the caller over their song
     /// or artist quota are left out; their number is returned alongside
     /// the new setlist.
+    ///
+    /// `quota` (the caller's setlist limit) is enforced in the copy's
+    /// transaction.
     async fn duplicate(
         &self,
         id: Uuid,
         user_id: Uuid,
         title_override: Option<String>,
         limits: Option<QuotaLimits>,
+        quota: &[QuotaGuard],
     ) -> Result<(Setlist, i64), ApiError>;
     /// Lists a setlist's block/break markers, ordered by position.
     async fn get_markers(&self, setlist_id: Uuid) -> Result<Vec<SetlistMarker>, ApiError>;
     /// The full, position-merged view of a setlist's contents (songs,
     /// block headers, and breaks) used by the setlist builder UI.
     async fn get_items(&self, setlist_id: Uuid) -> Result<Vec<SetlistItem>, ApiError>;
-    async fn create_block(&self, setlist_id: Uuid, name: &str) -> Result<SetlistMarker, ApiError>;
+    /// Like [`get_items`](Self::get_items), but reads at most `max_items + 1`
+    /// songs and `max_items + 1` markers: enough for the caller to tell the
+    /// setlist is over `max_items` without loading all of it (a repertoire
+    /// can hold thousands of songs with their lyrics).
+    async fn get_items_capped(
+        &self,
+        setlist_id: Uuid,
+        max_items: usize,
+    ) -> Result<Vec<SetlistItem>, ApiError>;
+    /// Appends a block. `quota` (the setlist's item limit) is enforced in
+    /// the insert's transaction; a repertoire holds at most
+    /// [`MAX_REPERTOIRE_MARKERS`] blocks and breaks.
+    async fn create_block(
+        &self,
+        setlist_id: Uuid,
+        name: &str,
+        quota: &[QuotaGuard],
+    ) -> Result<SetlistMarker, ApiError>;
     async fn update_block(
         &self,
         setlist_id: Uuid,
         marker_id: Uuid,
         name: &str,
     ) -> Result<SetlistMarker, ApiError>;
+    /// Appends a break; limits as for [`create_block`](Self::create_block).
     async fn create_break(
         &self,
         setlist_id: Uuid,
         label: Option<String>,
         duration_minutes: Option<i32>,
+        quota: &[QuotaGuard],
     ) -> Result<SetlistMarker, ApiError>;
     async fn update_break(
         &self,
@@ -229,6 +265,11 @@ pub trait SetlistRepository: Send + Sync {
         size: i64,
     ) -> Result<(Vec<SongWithArtist>, i64), ApiError>;
 }
+
+/// Blocks and breaks a band's repertoire may hold. The repertoire's songs
+/// are bounded by the band's song quota instead of `setlist_items`, but its
+/// markers would otherwise be unbounded.
+pub const MAX_REPERTOIRE_MARKERS: i64 = 200;
 
 pub struct SetlistRepositoryImpl {
     pub db: PgPool,
@@ -370,6 +411,7 @@ impl SetlistRepository for SetlistRepositoryImpl {
         &self,
         payload: &CreateSetlistPayload,
         user_id: Uuid,
+        quota: &[QuotaGuard],
     ) -> Result<Setlist, ApiError> {
         let links = normalize_links(payload.links.as_deref().unwrap_or_default())?;
         let description = payload
@@ -382,6 +424,8 @@ impl SetlistRepository for SetlistRepositoryImpl {
             Setlist::new(payload.title.trim(), description, user_id, payload.band_id);
         new_setlist.links = Links::from_stored(links.clone());
 
+        let mut tx = self.db.begin().await?;
+        QuotaGuard::enforce_all(quota, &mut tx).await?;
         sqlx::query(
             "INSERT INTO setlists (id, title, description, user_id, band_id, links, created_at, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
@@ -394,8 +438,9 @@ impl SetlistRepository for SetlistRepositoryImpl {
         .bind(sqlx::types::Json(&links))
         .bind(new_setlist.created_at)
         .bind(new_setlist.updated_at)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(new_setlist)
     }
 
@@ -732,8 +777,14 @@ impl SetlistRepository for SetlistRepositoryImpl {
         Ok(setlist)
     }
 
-    async fn add_song(&self, setlist_id: Uuid, song_id: Uuid) -> Result<(), ApiError> {
+    async fn add_song(
+        &self,
+        setlist_id: Uuid,
+        song_id: Uuid,
+        quota: &[QuotaGuard],
+    ) -> Result<(), ApiError> {
         let mut tx = self.db.begin().await?;
+        QuotaGuard::enforce_all(quota, &mut tx).await?;
 
         // Serializes concurrent appends to the same setlist, so two songs
         // added at once can't land on the same position.
@@ -875,6 +926,7 @@ impl SetlistRepository for SetlistRepositoryImpl {
         user_id: Uuid,
         title_override: Option<String>,
         limits: Option<QuotaLimits>,
+        quota: &[QuotaGuard],
     ) -> Result<(Setlist, i64), ApiError> {
         let original = self
             .find_by_id(id, user_id)
@@ -903,6 +955,7 @@ impl SetlistRepository for SetlistRepositoryImpl {
         }
 
         let mut tx = self.db.begin().await?;
+        QuotaGuard::enforce_all(quota, &mut tx).await?;
 
         // Personal copy: try the requested title, then fall back to
         // "<title> (2)", "<title> (3)", ... rather than failing outright
@@ -1026,44 +1079,44 @@ impl SetlistRepository for SetlistRepositoryImpl {
     async fn get_items(&self, setlist_id: Uuid) -> Result<Vec<SetlistItem>, ApiError> {
         let (song_rows, markers) =
             tokio::try_join!(self.song_rows(setlist_id), self.get_markers(setlist_id))?;
-
-        let mut items: Vec<SetlistItem> = song_rows
-            .into_iter()
-            .map(|r| SetlistItem::Song {
-                position: r.position,
-                song: Box::new(r.song),
-            })
-            .collect();
-
-        items.extend(markers.into_iter().map(|m| match m.marker_type {
-            SetlistMarkerType::Block => SetlistItem::Block {
-                position: m.position,
-                id: m.id,
-                name: m.label.unwrap_or_default(),
-            },
-            SetlistMarkerType::Break => SetlistItem::Break {
-                position: m.position,
-                id: m.id,
-                label: m.label,
-                duration_minutes: m.duration_minutes,
-            },
-        }));
-
-        items.sort_by_key(|i| match i {
-            SetlistItem::Song { position, .. } => *position,
-            SetlistItem::Block { position, .. } => *position,
-            SetlistItem::Break { position, .. } => *position,
-        });
-
-        Ok(items)
+        Ok(merge_items(song_rows, markers))
     }
 
-    async fn create_block(&self, setlist_id: Uuid, name: &str) -> Result<SetlistMarker, ApiError> {
+    async fn get_items_capped(
+        &self,
+        setlist_id: Uuid,
+        max_items: usize,
+    ) -> Result<Vec<SetlistItem>, ApiError> {
+        let limit = i64::try_from(max_items).unwrap_or(i64::MAX - 1) + 1;
+        let markers = async {
+            Ok::<_, ApiError>(
+                sqlx::query_as::<_, SetlistMarker>(
+                    "SELECT id, setlist_id, marker_type, label, duration_minutes, position, created_at
+                     FROM setlist_markers WHERE setlist_id = $1 ORDER BY position ASC LIMIT $2",
+                )
+                .bind(setlist_id)
+                .bind(limit)
+                .fetch_all(&self.db)
+                .await?,
+            )
+        };
+        let (song_rows, markers) =
+            tokio::try_join!(self.song_rows_limited(setlist_id, Some(limit)), markers)?;
+        Ok(merge_items(song_rows, markers))
+    }
+
+    async fn create_block(
+        &self,
+        setlist_id: Uuid,
+        name: &str,
+        quota: &[QuotaGuard],
+    ) -> Result<SetlistMarker, ApiError> {
         self.create_marker(
             setlist_id,
             SetlistMarkerType::Block,
             Some(name.to_string()),
             None,
+            quota,
         )
         .await
     }
@@ -1083,12 +1136,14 @@ impl SetlistRepository for SetlistRepositoryImpl {
         setlist_id: Uuid,
         label: Option<String>,
         duration_minutes: Option<i32>,
+        quota: &[QuotaGuard],
     ) -> Result<SetlistMarker, ApiError> {
         self.create_marker(
             setlist_id,
             SetlistMarkerType::Break,
             label,
             duration_minutes,
+            quota,
         )
         .await
     }
@@ -1264,9 +1319,51 @@ struct SongItemRow {
     song: SongWithArtist,
 }
 
+/// Songs and markers merged into one running order, by position.
+fn merge_items(song_rows: Vec<SongItemRow>, markers: Vec<SetlistMarker>) -> Vec<SetlistItem> {
+    let mut items: Vec<SetlistItem> = song_rows
+        .into_iter()
+        .map(|r| SetlistItem::Song {
+            position: r.position,
+            song: Box::new(r.song),
+        })
+        .collect();
+
+    items.extend(markers.into_iter().map(|m| match m.marker_type {
+        SetlistMarkerType::Block => SetlistItem::Block {
+            position: m.position,
+            id: m.id,
+            name: m.label.unwrap_or_default(),
+        },
+        SetlistMarkerType::Break => SetlistItem::Break {
+            position: m.position,
+            id: m.id,
+            label: m.label,
+            duration_minutes: m.duration_minutes,
+        },
+    }));
+
+    items.sort_by_key(|i| match i {
+        SetlistItem::Song { position, .. } => *position,
+        SetlistItem::Block { position, .. } => *position,
+        SetlistItem::Break { position, .. } => *position,
+    });
+    items
+}
+
 impl SetlistRepositoryImpl {
     /// Live songs of the setlist's own scope, with positions, in order.
     async fn song_rows(&self, setlist_id: Uuid) -> Result<Vec<SongItemRow>, ApiError> {
+        self.song_rows_limited(setlist_id, None).await
+    }
+
+    /// The first `limit` of [`song_rows`](Self::song_rows) (`None` = all;
+    /// `LIMIT NULL` is `LIMIT ALL` in Postgres).
+    async fn song_rows_limited(
+        &self,
+        setlist_id: Uuid,
+        limit: Option<i64>,
+    ) -> Result<Vec<SongItemRow>, ApiError> {
         let rows = sqlx::query_as::<_, SongItemRow>(concat!(
             "SELECT ss.position, ",
             song_columns!(),
@@ -1277,9 +1374,10 @@ impl SetlistRepositoryImpl {
              INNER JOIN artists a ON a.id = s.artist_id
              WHERE ss.setlist_id = $1 AND ",
             scoped_songs!(),
-            " ORDER BY ss.position ASC"
+            " ORDER BY ss.position ASC LIMIT $2"
         ))
         .bind(setlist_id)
+        .bind(limit)
         .fetch_all(&self.db)
         .await?;
         Ok(rows)
@@ -1346,9 +1444,35 @@ impl SetlistRepositoryImpl {
         marker_type: SetlistMarkerType,
         label: Option<String>,
         duration_minutes: Option<i32>,
+        quota: &[QuotaGuard],
     ) -> Result<SetlistMarker, ApiError> {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now().naive_utc();
+
+        let mut tx = self.db.begin().await?;
+        // Serializes appends to the setlist (positions and the repertoire
+        // cap below are computed from what's there).
+        let is_repertoire: bool = sqlx::query_scalar(
+            "SELECT is_repertoire FROM setlists WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+        )
+        .bind(setlist_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+        QuotaGuard::enforce_all(quota, &mut tx).await?;
+        if is_repertoire {
+            let markers: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM setlist_markers WHERE setlist_id = $1")
+                    .bind(setlist_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if markers >= MAX_REPERTOIRE_MARKERS {
+                return Err(ApiError::quota_exceeded(
+                    "repertoire_markers",
+                    MAX_REPERTOIRE_MARKERS,
+                ));
+            }
+        }
 
         // Append at the end of the shared song/marker ordering space.
         let next_position: i32 = sqlx::query_scalar(
@@ -1360,7 +1484,7 @@ impl SetlistRepositoryImpl {
             "#,
         )
         .bind(setlist_id)
-        .fetch_one(&self.db)
+        .fetch_one(&mut *tx)
         .await?;
 
         sqlx::query(
@@ -1374,8 +1498,9 @@ impl SetlistRepositoryImpl {
         .bind(duration_minutes)
         .bind(next_position)
         .bind(now)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(SetlistMarker {
             id,

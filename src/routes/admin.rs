@@ -121,6 +121,8 @@ fn billing_routes() -> Router<AppState> {
             get(billing::get_settings).put(billing::update_settings),
         )
         .route("/billing/overview", get(billing::overview))
+        .route("/finance", get(billing::finance_overview))
+        .route("/finance/sync", post(billing::finance_sync))
         .route("/billing/grant-trials", post(billing::grant_trials))
         .route("/plans", get(billing::list_plans))
         .route(
@@ -132,6 +134,10 @@ fn billing_routes() -> Router<AppState> {
             get(billing::get_user_subscription)
                 .put(billing::grant_user_subscription)
                 .delete(billing::revoke_user_subscription),
+        )
+        .route(
+            "/users/{id}/subscription/refund",
+            post(admin::refund_user_subscription),
         )
         .route("/users/{id}/credits", post(billing::adjust_user_credits))
         .route(

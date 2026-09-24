@@ -1,8 +1,8 @@
 use crate::{
     controllers::{
         account, admin, announcement, artist, auth, backup, band, band_note, billing, gig, metrics,
-        migrations, moderation, notification, pin, public, release_note, setlist, song, status,
-        suggestion, tour, trash, user,
+        moderation, notification, pin, public, release_note, setlist, song, status, suggestion,
+        tour, trash, user,
     },
     export::pdf::{ChordMode, MarginSize, Orientation, PaperFormat, PdfLocale},
     models::{
@@ -42,13 +42,17 @@ use crate::{
             GrantTrialsPayload, GrantTrialsResponse, Plan, PlanPromotion, PromoCode, PromoKind,
             PromoRedemption, Promotion, PublicPlan, RedeemCodePayload, RedeemResponse,
             RedeemRewardPayload, RedemptionSummary, RedirectResponse, ReferralEntry,
-            ReferralSettings, ReferralStatus, ReferralSummary, Reward, Subscription,
-            SubscriptionEvent, SubscriptionSource, SubscriptionStatus, UpdatePromoCodePayload,
-            UpdatePromotionPayload, UpsertPlanPayload,
+            ReferralSettings, ReferralStatus, ReferralSummary, Reward, StaffRefundPayload,
+            Subscription, SubscriptionEvent, SubscriptionSource, SubscriptionStatus,
+            UpdatePromoCodePayload, UpdatePromotionPayload, UpsertPlanPayload, WithdrawResponse,
         },
         communication::{
             Category, CategoryPrefs, ChannelPrefs, CommunicationSettings, UnsubscribeInfo,
             UnsubscribePayload, UpdateCommunicationPayload,
+        },
+        finance::{
+            FinanceOverview, FinanceSyncPayload, FinanceSyncResult, MonthRevenue, PaymentRow,
+            PlanRevenue, RevenueTotals, TrialConversion,
         },
         gig::{Gig, GigStatus, PublicGig},
         link::{Link, LinkInput, LinkProvider, Links},
@@ -71,8 +75,8 @@ use crate::{
             UpdateReleaseNotePayload,
         },
         security::{
-            CodeSentResponse, EmailChangePayload, EmailCodePayload, LinkedIdentity,
-            PasswordConfirmationPayload, RecoveryCodesResponse, SecurityOverview,
+            CodeSentResponse, EmailChangePayload, EmailCodePayload, LinkGooglePayload,
+            LinkedIdentity, PasswordConfirmationPayload, RecoveryCodesResponse, SecurityOverview,
             TwoFactorCodePayload, TwoFactorDisablePayload, TwoFactorSetupResponse,
         },
         setlist::{
@@ -140,9 +144,7 @@ use utoipa::{
         public::list_release_notes,
         public::inspect_unsubscribe,
         public::unsubscribe,
-
-        // Migrations
-        migrations::live_run,
+        public::unsubscribe_one_click,
 
         // Auth
         auth::login,
@@ -155,6 +157,7 @@ use utoipa::{
 
         // Account (self-service security)
         account::get_security,
+        account::export_personal_data,
         account::revoke_my_sessions,
         account::send_email_verification,
         account::verify_email,
@@ -170,6 +173,8 @@ use utoipa::{
         account::update_communication,
         account::accept_terms,
         account::delete_current_user,
+        account::send_reauth_code,
+        account::link_google,
 
         // Users
         user::find_user_by_id,
@@ -384,10 +389,13 @@ use utoipa::{
         billing::checkout,
         billing::change_subscription,
         billing::portal,
+        billing::withdraw,
         billing::stripe_webhook,
         billing::get_settings,
         billing::update_settings,
         billing::overview,
+        billing::finance_overview,
+        billing::finance_sync,
         billing::grant_trials,
         billing::list_plans,
         billing::get_plan,
@@ -395,6 +403,7 @@ use utoipa::{
         billing::get_user_subscription,
         billing::grant_user_subscription,
         billing::revoke_user_subscription,
+        admin::refund_user_subscription,
         billing::adjust_user_credits,
         billing::list_promo_codes,
         billing::create_promo_code,
@@ -558,6 +567,7 @@ use utoipa::{
             TwoFactorDisablePayload,
             RecoveryCodesResponse,
             LinkedIdentity,
+            LinkGooglePayload,
             Category,
             ChannelPrefs,
             CategoryPrefs,
@@ -598,6 +608,8 @@ use utoipa::{
             BillingInterval,
             CheckoutPayload,
             RedirectResponse,
+            WithdrawResponse,
+            StaffRefundPayload,
             CreditsSummary,
             ReferralSummary,
             RedeemCodePayload,
@@ -621,6 +633,14 @@ use utoipa::{
             GrantTrialsPayload,
             GrantTrialsResponse,
             BillingOverview,
+            FinanceOverview,
+            FinanceSyncResult,
+            FinanceSyncPayload,
+            PlanRevenue,
+            MonthRevenue,
+            PaymentRow,
+            RevenueTotals,
+            TrialConversion,
             ModerationTarget,
             ModerationStatus,
             ModerationSource,
@@ -638,7 +658,6 @@ use utoipa::{
     ),
     tags(
         (name = "Status",     description = "Status endpoints"),
-        (name = "Migrations", description = "Migrations endpoints"),
         (name = "Auth",       description = "Auth endpoints"),
         (name = "Users",      description = "Users endpoints"),
         (name = "Artists",    description = "Artists endpoints"),
@@ -711,6 +730,12 @@ mod tests {
             "/api/v1/bands/{id}/suggestions/{sid}/vote",
             "/api/v1/bands/{id}/notes/{nid}",
             "/api/v1/bands/{id}/repertoire",
+            // Launch hardening.
+            "/api/v1/users/me/reauth/code",
+            "/api/v1/users/me/identities/{provider}",
+            "/api/v1/billing/withdraw",
+            "/api/v1/admin/users/{id}/subscription/refund",
+            "/api/v1/public/email/unsubscribe/one-click",
         ] {
             assert!(paths.contains_key(path), "{path} is documented");
         }
@@ -724,8 +749,51 @@ mod tests {
             "TrashItem",
             "Suggestion",
             "PublicSong",
+            "LinkGooglePayload",
+            "WithdrawResponse",
+            "StaffRefundPayload",
+            "ReauthRequiredResponse",
         ] {
             assert!(schemas.contains_key(schema), "{schema} is registered");
         }
+        let identities = &paths["/api/v1/users/me/identities/{provider}"];
+        assert!(
+            identities["post"].is_object(),
+            "linking Google is documented"
+        );
+        assert!(identities["delete"].is_object(), "unlinking is documented");
+    }
+
+    /// Collects every `$ref` in `value`.
+    fn refs<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    match (key.as_str(), value) {
+                        ("$ref", serde_json::Value::String(target)) => out.push(target),
+                        _ => refs(value, out),
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|v| refs(v, out)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn every_schema_reference_resolves() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("serializable document");
+        let schemas = doc["components"]["schemas"].as_object().expect("schemas");
+        let mut found = Vec::new();
+        refs(&doc, &mut found);
+        assert!(!found.is_empty(), "the document uses references");
+        let mut missing: Vec<&str> = found
+            .into_iter()
+            .filter_map(|r| r.strip_prefix("#/components/schemas/"))
+            .filter(|name| !schemas.contains_key(*name))
+            .collect();
+        missing.sort_unstable();
+        missing.dedup();
+        assert!(missing.is_empty(), "unregistered schemas: {missing:?}");
     }
 }

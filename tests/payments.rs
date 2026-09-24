@@ -14,8 +14,9 @@ use serde_json::{Value, json};
 use setlyst_api::{
     models::{billing::BillingInterval, user::Role},
     payments::{
-        CheckoutRequest, GatewaySubscription, PaymentError, PaymentGateway, Payments, PriceSpec,
-        webhook::sign,
+        CheckoutRequest, CheckoutSession, GatewayInvoice, GatewayRefund, GatewaySubscription,
+        InvoicePage, PaymentError, PaymentGateway, Payments, PriceSpec, RefundPage,
+        SubscriptionPage, webhook::sign,
     },
     routes::api_router,
     services::billing::run_subscription_maintenance,
@@ -47,6 +48,14 @@ struct FakeGateway {
     subscriptions: Mutex<HashMap<String, GatewaySubscription>>,
     decline_changes: Mutex<bool>,
     customers: Mutex<u32>,
+    /// Paid invoices, newest first.
+    invoices: Mutex<Vec<GatewayInvoice>>,
+    /// Refunds, newest first.
+    refunds: Mutex<Vec<GatewayRefund>>,
+    /// Refunds made through the API: `(payment intent, idempotency key)`.
+    refunded: Mutex<Vec<(String, String)>>,
+    /// `get_subscription` fails as if Stripe were down.
+    unreachable: Mutex<bool>,
 }
 
 impl FakeGateway {
@@ -91,6 +100,7 @@ impl PaymentGateway for FakeGateway {
         email: Option<&str>,
         _name: &str,
         _locale: &str,
+        _generation: i32,
     ) -> Result<String, PaymentError> {
         let mut count = self.customers.lock().unwrap();
         *count += 1;
@@ -103,15 +113,66 @@ impl PaymentGateway for FakeGateway {
         Ok(format!("price_{}", spec.lookup_key()))
     }
 
-    async fn create_coupon(&self, percent: i32, _name: &str) -> Result<String, PaymentError> {
+    async fn update_customer(
+        &self,
+        customer_id: &str,
+        email: Option<&str>,
+        _name: &str,
+    ) -> Result<(), PaymentError> {
+        self.record(format!(
+            "update_customer:{customer_id}:{}",
+            email.unwrap_or("-")
+        ));
+        Ok(())
+    }
+
+    async fn create_coupon(
+        &self,
+        percent: i32,
+        _name: &str,
+        _idempotency_key: &str,
+    ) -> Result<String, PaymentError> {
         self.record(format!("coupon:{percent}"));
         Ok(format!("co_{percent}"))
     }
 
-    async fn create_checkout(&self, request: &CheckoutRequest) -> Result<String, PaymentError> {
+    async fn create_checkout(
+        &self,
+        request: &CheckoutRequest,
+    ) -> Result<CheckoutSession, PaymentError> {
         self.record("checkout");
-        self.checkouts.lock().unwrap().push(request.clone());
-        Ok("https://checkout.stripe.test/c/pay/cs_1".into())
+        let mut checkouts = self.checkouts.lock().unwrap();
+        checkouts.push(request.clone());
+        let id = format!("cs_{}", checkouts.len());
+        Ok(CheckoutSession {
+            url: format!("https://checkout.stripe.test/c/pay/{id}"),
+            id,
+        })
+    }
+
+    async fn expire_checkout(&self, session_id: &str) -> Result<(), PaymentError> {
+        self.record(format!("expire:{session_id}"));
+        Ok(())
+    }
+
+    async fn list_subscriptions(
+        &self,
+        customer_id: Option<&str>,
+        _starting_after: Option<&str>,
+    ) -> Result<SubscriptionPage, PaymentError> {
+        let subscriptions: Vec<GatewaySubscription> = self
+            .subscriptions
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| customer_id.is_none_or(|c| s.customer_id == c))
+            .cloned()
+            .collect();
+        Ok(SubscriptionPage {
+            last_id: subscriptions.last().map(|s| s.id.clone()),
+            subscriptions,
+            has_more: false,
+        })
     }
 
     async fn create_portal(
@@ -125,6 +186,9 @@ impl PaymentGateway for FakeGateway {
     }
 
     async fn get_subscription(&self, id: &str) -> Result<GatewaySubscription, PaymentError> {
+        if *self.unreachable.lock().unwrap() {
+            return Err(PaymentError::transport("Stripe unreachable"));
+        }
         self.subscriptions
             .lock()
             .unwrap()
@@ -159,6 +223,106 @@ impl PaymentGateway for FakeGateway {
         Ok(subscription.clone())
     }
 
+    async fn get_paid_invoice(&self, id: &str) -> Result<Option<GatewayInvoice>, PaymentError> {
+        Ok(self
+            .invoices
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|i| i.id == id)
+            .cloned())
+    }
+
+    /// Two per page, so the sync has to follow the cursor.
+    async fn list_paid_invoices(
+        &self,
+        starting_after: Option<&str>,
+    ) -> Result<InvoicePage, PaymentError> {
+        let invoices = self.invoices.lock().unwrap().clone();
+        let start = starting_after
+            .and_then(|after| invoices.iter().position(|i| i.id == after))
+            .map_or(0, |p| p + 1);
+        let page: Vec<GatewayInvoice> = invoices.iter().skip(start).take(2).cloned().collect();
+        Ok(InvoicePage {
+            has_more: start + page.len() < invoices.len(),
+            last_id: page.last().map(|i| i.id.clone()),
+            invoices: page,
+        })
+    }
+
+    async fn list_subscription_invoices(
+        &self,
+        subscription_id: &str,
+    ) -> Result<Vec<GatewayInvoice>, PaymentError> {
+        Ok(self
+            .invoices
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|i| i.subscription_id.as_deref() == Some(subscription_id))
+            .cloned()
+            .collect())
+    }
+
+    async fn refund(
+        &self,
+        payment_intent_id: &str,
+        amount: Option<i64>,
+        idempotency_key: &str,
+    ) -> Result<GatewayRefund, PaymentError> {
+        self.record(format!("refund:{payment_intent_id}:{idempotency_key}"));
+        self.refunded
+            .lock()
+            .unwrap()
+            .push((payment_intent_id.into(), idempotency_key.into()));
+        let paid = self
+            .invoices
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|i| i.payment_intent_id.as_deref() == Some(payment_intent_id))
+            .map_or(0, |i| i.amount_paid);
+        Ok(GatewayRefund {
+            id: format!("re_{idempotency_key}"),
+            payment_intent_id: Some(payment_intent_id.into()),
+            amount: amount.unwrap_or(paid),
+            currency: Some("BRL".into()),
+            status: "succeeded".into(),
+            created: Some(Utc::now().timestamp()),
+            ..Default::default()
+        })
+    }
+
+    async fn invoice_for_payment(
+        &self,
+        payment_intent_id: &str,
+    ) -> Result<Option<String>, PaymentError> {
+        Ok(self
+            .invoices
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|i| i.payment_intent_id.as_deref() == Some(payment_intent_id))
+            .map(|i| i.id.clone()))
+    }
+
+    async fn list_refunds(
+        &self,
+        _starting_after: Option<&str>,
+    ) -> Result<RefundPage, PaymentError> {
+        let refunds = self.refunds.lock().unwrap().clone();
+        Ok(RefundPage {
+            last_id: refunds.last().map(|r| r.id.clone()),
+            refunds,
+            has_more: false,
+        })
+    }
+
+    async fn delete_customer(&self, customer_id: &str) -> Result<(), PaymentError> {
+        self.record(format!("delete_customer:{customer_id}"));
+        Ok(())
+    }
+
     async fn cancel_now(&self, subscription_id: &str) -> Result<(), PaymentError> {
         self.record(format!("cancel:{subscription_id}"));
         if let Some(subscription) = self.subscriptions.lock().unwrap().get_mut(subscription_id) {
@@ -183,7 +347,7 @@ fn subscription(id: &str, user_id: Uuid, plan: &str, days: i64) -> GatewaySubscr
         canceled_at: None,
         ended_at: None,
         user_id: Some(user_id),
-        has_pending_update: false,
+        ..Default::default()
     }
 }
 
@@ -193,6 +357,7 @@ fn with_payments(app: &mut TestApp) -> Arc<FakeGateway> {
     app.state = app.state.clone().with_payments(Some(Payments {
         gateway: fake.clone(),
         webhook_secret: WEBHOOK_SECRET.into(),
+        livemode: false,
     }));
     app.router = api_router(app.state.clone());
     fake
@@ -384,8 +549,9 @@ async fn checkout_charges_database_prices_and_carries_trials_and_discounts() {
             .unwrap();
     assert_eq!(customer.as_deref(), Some("cus_1"));
 
-    // A running promotion comes off the first charge (which then isn't
-    // deferred), and the customer is reused.
+    // A running promotion comes off the first charge, which still waits
+    // for the trial to end; the customer is reused and the earlier page
+    // is expired.
     sqlx::query(
         "INSERT INTO promotions (id, name, plan_code, discount_percent, starts_at, ends_at, active,
                                  created_at, updated_at)
@@ -400,9 +566,10 @@ async fn checkout_charges_database_prices_and_carries_trials_and_discounts() {
     let request = fake.last_checkout();
     assert_eq!(request.price_id, "price_setlyst_pro_year_39900_brl");
     assert_eq!(request.coupon_id.as_deref(), Some("co_20"));
-    assert_eq!(request.trial_end, None);
+    assert_eq!(request.trial_end, Some(trial_ends.and_utc().timestamp()));
     assert_eq!(request.redemption_id, None);
     assert_eq!(fake.calls_to("customer:"), 1);
+    assert_eq!(fake.calls_to("expire:cs_1"), 1);
 
     // A better redeemed discount code wins and is named on the checkout.
     let code_id: Uuid = sqlx::query_scalar(
@@ -763,48 +930,866 @@ async fn revoking_or_deleting_cancels_the_charges() {
 }
 
 #[tokio::test]
-async fn paid_plans_outlive_a_late_renewal_by_the_grace_period() {
+async fn lapsed_paid_plans_are_checked_with_stripe_before_expiring() {
     let mut app = app!();
     let fake = with_payments(&mut app);
     app.enforce_billing().await;
     let (user_id, token) = verified_user(&app, "night.owl").await;
     fake.put(subscription("sub_1", user_id, "pro", 30));
     event(&app, "evt_1", "customer.subscription.created", "sub_1").await;
+    let set_period_end = |days_ago: i64| {
+        sqlx::query(
+            "UPDATE subscriptions
+             SET current_period_end = NOW() AT TIME ZONE 'utc' - make_interval(days => $2::INT)
+             WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .bind(days_ago as i32)
+        .execute(&app.pool)
+    };
 
-    // The period ended a day ago and the renewal hasn't been confirmed.
-    sqlx::query(
-        "UPDATE subscriptions SET current_period_end = NOW() AT TIME ZONE 'utc' - INTERVAL '1 day'
-         WHERE user_id = $1",
-    )
-    .bind(user_id)
-    .execute(&app.pool)
-    .await
-    .unwrap();
+    // The period ended a day ago here, but Stripe renewed it (the webhook
+    // was lost): the renewal is mirrored.
+    set_period_end(1).await.unwrap();
     run_subscription_maintenance(&app.state).await.unwrap();
-    assert_eq!(subscription_row(&app, user_id).await["status"], "active");
+    let row = subscription_row(&app, user_id).await;
+    assert_eq!(row["status"], "active");
+    assert_eq!(event_kinds(&app, user_id).await.last().unwrap(), "renewed");
     assert_eq!(
         app.get("/billing/me", &token).await.body["plan"]["code"],
         "pro"
     );
 
-    // Past the grace period, it lapses.
+    // Past the grace period while Stripe can't be reached: kept, and
+    // retried at the next run.
+    set_period_end(3).await.unwrap();
+    *fake.unreachable.lock().unwrap() = true;
+    run_subscription_maintenance(&app.state).await.unwrap();
+    assert_eq!(subscription_row(&app, user_id).await["status"], "active");
+
+    // Stripe no longer has it: it lapses.
+    *fake.unreachable.lock().unwrap() = false;
+    fake.subscriptions.lock().unwrap().remove("sub_1");
+    run_subscription_maintenance(&app.state).await.unwrap();
+    assert_eq!(subscription_row(&app, user_id).await["status"], "expired");
+    assert!(app.get("/billing/me", &token).await.body["plan"].is_null());
+
+    // A renewal event arriving afterwards restores it.
+    fake.put(subscription("sub_1", user_id, "pro", 30));
+    event(&app, "evt_2", "customer.subscription.updated", "sub_1").await;
+    assert_eq!(subscription_row(&app, user_id).await["status"], "active");
+    assert_eq!(
+        event_kinds(&app, user_id).await.last().unwrap(),
+        "subscribed"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_renewal_keeps_the_plan_for_14_days_then_ends() {
+    let mut app = app!();
+    let fake = with_payments(&mut app);
+    app.enforce_billing().await;
+    let (user_id, token) = verified_user(&app, "late.payer").await;
+    fake.put(subscription("sub_1", user_id, "pro", 30));
+    event(&app, "evt_1", "customer.subscription.created", "sub_1").await;
+
+    fake.edit("sub_1", |s| s.status = "past_due".into());
+    event(&app, "evt_2", "customer.subscription.updated", "sub_1").await;
+    let me = app.get("/billing/me", &token).await;
+    assert_eq!(me.body["plan"]["code"], "pro");
+    assert!(me.body["past_due_since"].is_string(), "{}", me.body);
+    // Stripe retrying again changes nothing.
+    event(&app, "evt_3", "customer.subscription.updated", "sub_1").await;
+    run_subscription_maintenance(&app.state).await.unwrap();
+    assert_eq!(fake.calls_to("cancel:sub_1"), 0);
+
+    // Fifteen days of failed retries: no plan, and the subscription is
+    // canceled at Stripe so it is never charged again.
     sqlx::query(
-        "UPDATE subscriptions SET current_period_end = NOW() AT TIME ZONE 'utc' - INTERVAL '3 days'
+        "UPDATE subscriptions SET past_due_since = NOW() AT TIME ZONE 'utc' - INTERVAL '15 days'
          WHERE user_id = $1",
     )
     .bind(user_id)
     .execute(&app.pool)
     .await
     .unwrap();
-    run_subscription_maintenance(&app.state).await.unwrap();
-    assert_eq!(subscription_row(&app, user_id).await["status"], "expired");
     assert!(app.get("/billing/me", &token).await.body["plan"].is_null());
+    run_subscription_maintenance(&app.state).await.unwrap();
+    assert_eq!(fake.calls_to("cancel:sub_1"), 1);
+    assert_eq!(subscription_row(&app, user_id).await["status"], "canceled");
+    assert_eq!(event_kinds(&app, user_id).await.last().unwrap(), "canceled");
+}
 
-    // The renewal event arriving afterwards restores it.
-    event(&app, "evt_2", "customer.subscription.updated", "sub_1").await;
-    assert_eq!(subscription_row(&app, user_id).await["status"], "active");
+fn invoice(id: &str, user_id: Uuid, amount: i64, days_ago: i64) -> GatewayInvoice {
+    GatewayInvoice {
+        id: id.into(),
+        customer_id: Some(format!("cus_{}", user_id.simple())),
+        subscription_id: Some("sub_fin".into()),
+        user_id: Some(user_id),
+        payment_intent_id: Some(format!("pi_{id}")),
+        plan_code: Some("pro".into()),
+        interval: Some(BillingInterval::Monthly),
+        amount_paid: amount,
+        currency: "BRL".into(),
+        paid_at: Some(Utc::now().timestamp() - days_ago * 86_400),
+    }
+}
+
+async fn signed(app: &TestApp, body: Value) -> StatusCode {
+    let signature = sign(
+        body.to_string().as_bytes(),
+        WEBHOOK_SECRET,
+        Utc::now().timestamp(),
+    );
+    deliver(app, &body, Some(signature)).await.0
+}
+
+#[tokio::test]
+async fn paid_invoices_and_refunds_feed_the_finance_report() {
+    let mut app = app!();
+    let fake = with_payments(&mut app);
+    app.enforce_billing().await;
+    let (user_id, token) = verified_user(&app, "paying.fan").await;
+    let (_, admin) = app.user("finance.admin", Role::Admin).await;
+    let (_, moderator) = app.user("finance.mod", Role::Moderator).await;
+
+    // Staff other than admins don't see the money.
+    assert_eq!(
+        app.get("/admin/finance", &moderator).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.get("/admin/finance", &token).await.status,
+        StatusCode::FORBIDDEN
+    );
+
+    fake.put(subscription("sub_fin", user_id, "pro", 30));
+    event(&app, "evt_sub", "customer.subscription.created", "sub_fin").await;
+    fake.invoices
+        .lock()
+        .unwrap()
+        .push(invoice("in_1", user_id, 2990, 0));
+
+    // invoice.paid records the payment once, however often it arrives.
+    let paid = json!({
+        "id": "evt_paid", "object": "event", "type": "invoice.paid",
+        "data": {"object": {"object": "invoice", "id": "in_1",
+                 "parent": {"subscription_details": {"subscription": "sub_fin"}}}}
+    });
+    assert_eq!(signed(&app, paid.clone()).await, StatusCode::OK);
+    assert_eq!(signed(&app, paid).await, StatusCode::OK);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    let report = app.get("/admin/finance", &admin).await;
+    assert_eq!(report.status, StatusCode::OK, "{}", report.body);
+    let body = &report.body;
+    assert_eq!(body["paying_subscribers"], 1);
+    assert_eq!(body["currency"], "BRL");
+    assert!(body["mrr_cents"].as_i64().unwrap() > 0);
+    assert_eq!(body["arr_cents"], body["mrr_cents"].as_i64().unwrap() * 12);
+    assert_eq!(body["revenue"]["all_time_cents"], 2990);
+    assert_eq!(body["revenue"]["last_12_months_cents"], 2990);
+    assert_eq!(body["monthly"].as_array().unwrap().len(), 12);
+    assert_eq!(body["new_subscribers_this_month"], 1);
+    assert_eq!(body["recent_payments"][0]["username"], "paying.fan");
+    assert_eq!(body["recent_payments"][0]["amount_cents"], 2990);
+
+    // A partial refund, then the full one; a replay of the first changes
+    // nothing.
+    let refund = |amount: i64, id: &str| {
+        json!({
+            "id": id, "object": "event", "type": "charge.refunded",
+            "data": {"object": {"object": "charge", "id": "ch_1",
+                     "payment_intent": "pi_in_1", "amount_refunded": amount}}
+        })
+    };
+    assert_eq!(signed(&app, refund(1000, "evt_r1")).await, StatusCode::OK);
+    assert_eq!(signed(&app, refund(2990, "evt_r2")).await, StatusCode::OK);
+    assert_eq!(signed(&app, refund(1000, "evt_r1")).await, StatusCode::OK);
+    let report = app.get("/admin/finance", &admin).await;
+    assert_eq!(report.body["revenue"]["all_time_cents"], 0);
+    assert_eq!(report.body["recent_payments"][0]["refunded_cents"], 2990);
+
+    // The sync brings in what the webhook never delivered, page by page.
+    {
+        let mut invoices = fake.invoices.lock().unwrap();
+        invoices.insert(0, invoice("in_4", user_id, 2990, 1));
+        invoices.insert(0, invoice("in_3", user_id, 2990, 2));
+        invoices.insert(0, invoice("in_2", user_id, 2990, 3));
+    }
+    assert_eq!(
+        app.post("/admin/finance/sync", &moderator, json!({}))
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+    let sync = app.post("/admin/finance/sync", &admin, json!({})).await;
+    assert_eq!(sync.status, StatusCode::OK, "{}", sync.body);
+    assert_eq!(sync.body["done"], true);
+    assert_eq!(sync.body["scanned"], 4);
+    assert_eq!(sync.body["imported"], 3);
+    let again = app.post("/admin/finance/sync", &admin, json!({})).await;
+    assert_eq!(again.body["imported"], 0);
+    let report = app.get("/admin/finance", &admin).await;
+    assert_eq!(report.body["revenue"]["all_time_cents"], 3 * 2990);
+
+    // Refunds the webhook never delivered come in with the sync too.
+    fake.refunds.lock().unwrap().push(GatewayRefund {
+        id: "re_1".into(),
+        payment_intent_id: Some("pi_in_2".into()),
+        amount: 990,
+        status: "succeeded".into(),
+        ..Default::default()
+    });
+    let sync = app.post("/admin/finance/sync", &admin, json!({})).await;
+    assert_eq!(sync.body["refunds_applied"], 1);
+    let report = app.get("/admin/finance", &admin).await;
+    assert_eq!(report.body["revenue"]["all_time_cents"], 3 * 2990 - 990);
+
+    // A refund that arrives before its invoice brings the invoice in.
+    fake.invoices
+        .lock()
+        .unwrap()
+        .insert(0, invoice("in_5", user_id, 2990, 0));
+    let early_refund = json!({
+        "id": "evt_r5", "object": "event", "type": "charge.refunded",
+        "data": {"object": {"object": "charge", "id": "ch_5",
+                 "payment_intent": "pi_in_5", "amount_refunded": 500}}
+    });
+    assert_eq!(signed(&app, early_refund).await, StatusCode::OK);
+    let refunded: i64 =
+        sqlx::query_scalar("SELECT refunded_cents FROM payments WHERE invoice_id = 'in_5'")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(refunded, 500);
+
+    // Deleting the account keeps the payments (anonymized) and removes
+    // the customer at the provider.
+    sqlx::query("UPDATE users SET stripe_customer_id = 'cus_gone' WHERE id = $1")
+        .bind(user_id)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let deleted = app
+        .request(
+            Method::DELETE,
+            "/users/me",
+            Some(&token),
+            Some(json!({ "password": STRONG_PASSWORD, "confirmation": "paying.fan" })),
+        )
+        .await;
+    assert!(
+        deleted.status.is_success(),
+        "{}: {}",
+        deleted.status,
+        deleted.body
+    );
+    assert_eq!(fake.calls_to("delete_customer:cus_gone"), 1);
+    let orphaned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE user_id IS NULL")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(orphaned, 5);
+}
+
+/// A paid invoice of subscription `subscription_id`.
+fn invoice_of(
+    id: &str,
+    subscription_id: &str,
+    user_id: Uuid,
+    amount: i64,
+    days_ago: i64,
+) -> GatewayInvoice {
+    GatewayInvoice {
+        subscription_id: Some(subscription_id.into()),
+        ..invoice(id, user_id, amount, days_ago)
+    }
+}
+
+/// Delivers a signed `invoice.paid` for `invoice_id`.
+async fn invoice_paid(app: &TestApp, event_id: &str, invoice_id: &str, subscription_id: &str) {
+    let body = json!({
+        "id": event_id, "object": "event", "type": "invoice.paid",
+        "data": {"object": {"object": "invoice", "id": invoice_id,
+                 "parent": {"subscription_details": {"subscription": subscription_id}}}}
+    });
+    assert_eq!(signed(app, body).await, StatusCode::OK);
+}
+
+async fn outbox_count(app: &TestApp, user_id: Uuid, template: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM email_outbox WHERE user_id = $1 AND template = $2")
+        .bind(user_id)
+        .bind(template)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn duplicate_checkouts_are_refused_and_second_subscriptions_refunded() {
+    let mut app = app!();
+    let fake = with_payments(&mut app);
+    app.enforce_billing().await;
+    let (user_id, token) = verified_user(&app, "double.click").await;
+
+    // A second checkout expires the page of the first.
+    let first = app
+        .post("/billing/checkout", &token, checkout_body("pro", "monthly"))
+        .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    let second = app
+        .post("/billing/checkout", &token, checkout_body("pro", "yearly"))
+        .await;
+    assert_eq!(
+        second.body["url"],
+        "https://checkout.stripe.test/c/pay/cs_2"
+    );
+    assert_eq!(fake.calls_to("expire:cs_1"), 1);
+    let expired: Option<chrono::NaiveDateTime> =
+        sqlx::query_scalar("SELECT expired_at FROM checkout_sessions WHERE session_id = 'cs_1'")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert!(expired.is_some());
+    // Both checkouts were cards only and required the Subscription Terms.
+    let request = fake.last_checkout();
+    assert!(
+        request
+            .terms_message
+            .as_deref()
+            .unwrap()
+            .contains("https://setlyst.test/en/legal/subscription")
+    );
+    assert!(request.idempotency_key.starts_with("setlyst-checkout-"));
+
+    // Paid in one tab, the webhook not here yet: Stripe already has a live
+    // subscription for the customer, so another checkout is refused.
+    let mut paid = subscription("sub_a", user_id, "pro", 30);
+    paid.customer_id = "cus_1".into();
+    fake.put(paid);
+    let refused = app
+        .post(
+            "/billing/checkout",
+            &token,
+            checkout_body("basic", "monthly"),
+        )
+        .await;
+    assert_eq!(refused.code(), "PAID_SUBSCRIPTION_ACTIVE");
+    assert_eq!(fake.calls_to("checkout"), 2);
+
+    // The older tab gets paid anyway: the second subscription is canceled
+    // and refunded instead of replacing the first.
+    event(&app, "evt_a", "customer.subscription.created", "sub_a").await;
+    let mut duplicate = subscription("sub_b", user_id, "pro", 365);
+    duplicate.customer_id = "cus_1".into();
+    duplicate.latest_invoice_id = Some("in_b".into());
+    fake.put(duplicate);
+    fake.invoices
+        .lock()
+        .unwrap()
+        .push(invoice_of("in_b", "sub_b", user_id, 39900, 0));
+    event(&app, "evt_b", "customer.subscription.created", "sub_b").await;
+    assert_eq!(fake.calls_to("cancel:sub_b"), 1);
+    assert_eq!(fake.calls_to("refund:pi_in_b:setlyst-duplicate-in_b"), 1);
+    assert_eq!(fake.get("sub_b").status, "canceled");
+    let row = subscription_row(&app, user_id).await;
+    assert_eq!(row["external_ref"], "sub_a");
+    assert_eq!(row["status"], "active");
+    assert!(
+        event_kinds(&app, user_id)
+            .await
+            .contains(&"duplicate_canceled".to_string())
+    );
+    // Stripe's "deleted" event for the duplicate changes nothing.
+    event(&app, "evt_b2", "customer.subscription.deleted", "sub_b").await;
+    assert_eq!(
+        subscription_row(&app, user_id).await["external_ref"],
+        "sub_a"
+    );
+}
+
+#[tokio::test]
+async fn withdrawal_within_7_days_refunds_and_cancels() {
+    let mut app = app!();
+    let fake = with_payments(&mut app);
+    app.enforce_billing().await;
+    let (user_id, token) = verified_user(&app, "changed.mind").await;
+    fake.put(subscription("sub_w", user_id, "pro", 30));
+    event(&app, "evt_w", "customer.subscription.created", "sub_w").await;
+    assert_eq!(
+        outbox_count(&app, user_id, "subscription_confirmed").await,
+        1
+    );
+    assert!(app.get("/billing/me", &token).await.body["withdrawal_eligible_until"].is_null());
+
+    fake.invoices
+        .lock()
+        .unwrap()
+        .push(invoice_of("in_w1", "sub_w", user_id, 3990, 2));
+    invoice_paid(&app, "evt_w1", "in_w1", "sub_w").await;
+    let me = app.get("/billing/me", &token).await;
+    assert!(
+        me.body["withdrawal_eligible_until"].is_string(),
+        "{}",
+        me.body
+    );
+    assert!(me.body["past_due_since"].is_null());
+
+    // Billing mails reach the inbox even with account e-mails off.
+    sqlx::query(
+        "INSERT INTO user_preferences (id, user_id, communication)
+         VALUES (gen_random_uuid(), $1, '{\"categories\": {\"account\": {\"email\": false, \"in_app\": true}}}')
+         ON CONFLICT (user_id) DO UPDATE SET communication = EXCLUDED.communication",
+    )
+    .bind(user_id)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    let withdrawn = app.post("/billing/withdraw", &token, json!({})).await;
+    assert_eq!(withdrawn.status, StatusCode::OK, "{}", withdrawn.body);
+    assert_eq!(withdrawn.body["refunded_cents"], 3990);
+    assert_eq!(withdrawn.body["currency"], "brl");
+    assert_eq!(fake.calls_to("refund:pi_in_w1:setlyst-withdraw-in_w1"), 1);
+    assert_eq!(fake.calls_to("cancel:sub_w"), 1);
+    assert_eq!(subscription_row(&app, user_id).await["status"], "canceled");
     assert_eq!(
         event_kinds(&app, user_id).await.last().unwrap(),
-        "subscribed"
+        "withdrawn"
+    );
+    assert_eq!(outbox_count(&app, user_id, "withdrawal_confirmed").await, 1);
+    let me = app.get("/billing/me", &token).await;
+    assert!(me.body["plan"].is_null());
+    assert!(me.body["withdrawal_eligible_until"].is_null());
+    let refunded: i64 =
+        sqlx::query_scalar("SELECT refunded_cents FROM payments WHERE invoice_id = 'in_w1'")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(refunded, 3990);
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_logs WHERE action = 'billing.subscription_withdrawn'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(audited, 1);
+
+    // Nothing left to withdraw from.
+    let again = app.post("/billing/withdraw", &token, json!({})).await;
+    assert_eq!(again.code(), "NO_PAID_SUBSCRIPTION");
+    // Stripe's own events afterwards change nothing.
+    let notices = outbox_count(&app, user_id, "subscription_changed").await;
+    event(&app, "evt_w2", "customer.subscription.deleted", "sub_w").await;
+    assert_eq!(
+        outbox_count(&app, user_id, "subscription_changed").await,
+        notices
+    );
+    assert_eq!(
+        event_kinds(&app, user_id).await.last().unwrap(),
+        "withdrawn"
+    );
+}
+
+#[tokio::test]
+async fn withdrawal_after_7_days_is_refused() {
+    let mut app = app!();
+    let fake = with_payments(&mut app);
+    app.enforce_billing().await;
+    let (user_id, token) = verified_user(&app, "too.late").await;
+    fake.put(subscription("sub_l", user_id, "pro", 20));
+    event(&app, "evt_l", "customer.subscription.created", "sub_l").await;
+    fake.invoices
+        .lock()
+        .unwrap()
+        .push(invoice_of("in_l", "sub_l", user_id, 3990, 10));
+
+    let refused = app.post("/billing/withdraw", &token, json!({})).await;
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert_eq!(refused.code(), "WITHDRAWAL_NOT_ELIGIBLE");
+    assert!(refused.body["meta"]["eligible_until"].is_string());
+    assert_eq!(fake.calls_to("refund:"), 0);
+    assert_eq!(fake.calls_to("cancel:"), 0);
+    assert_eq!(subscription_row(&app, user_id).await["status"], "active");
+
+    let (_, free) = verified_user(&app, "never.paid").await;
+    let none = app.post("/billing/withdraw", &free, json!({})).await;
+    assert_eq!(none.code(), "NO_PAID_SUBSCRIPTION");
+}
+
+#[tokio::test]
+async fn a_dispute_cancels_the_subscription_and_counts_against_revenue() {
+    let mut app = app!();
+    let fake = with_payments(&mut app);
+    app.enforce_billing().await;
+    let (user_id, token) = verified_user(&app, "charge.back").await;
+    fake.put(subscription("sub_d", user_id, "pro", 30));
+    event(&app, "evt_d", "customer.subscription.created", "sub_d").await;
+    fake.invoices
+        .lock()
+        .unwrap()
+        .push(invoice_of("in_d", "sub_d", user_id, 3990, 1));
+    invoice_paid(&app, "evt_d1", "in_d", "sub_d").await;
+
+    let dispute = |id: &str, kind: &str, status: &str| {
+        json!({
+            "id": id, "object": "event", "type": kind,
+            "data": {"object": {"object": "dispute", "id": "dp_1", "charge": "ch_d",
+                     "payment_intent": "pi_in_d", "amount": 3990, "status": status}}
+        })
+    };
+    assert_eq!(
+        signed(
+            &app,
+            dispute("evt_dp1", "charge.dispute.created", "needs_response")
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(fake.calls_to("cancel:sub_d"), 1);
+    assert_eq!(subscription_row(&app, user_id).await["status"], "canceled");
+    assert_eq!(event_kinds(&app, user_id).await.last().unwrap(), "disputed");
+    assert!(app.get("/billing/me", &token).await.body["plan"].is_null());
+    assert_eq!(outbox_count(&app, user_id, "payment_disputed").await, 1);
+    let disputed = || async {
+        sqlx::query_as::<_, (i64, Option<String>)>(
+            "SELECT disputed_cents, dispute_status FROM payments WHERE invoice_id = 'in_d'",
+        )
+        .fetch_one(&app.pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(disputed().await, (3990, Some("needs_response".into())));
+
+    // Won: the money came back.
+    signed(&app, dispute("evt_dp2", "charge.dispute.closed", "won")).await;
+    assert_eq!(disputed().await, (0, Some("won".into())));
+    assert_eq!(outbox_count(&app, user_id, "payment_disputed").await, 1);
+}
+
+#[tokio::test]
+async fn card_on_file_trials_are_reminded_once_before_the_first_charge() {
+    let mut app = app!();
+    let fake = with_payments(&mut app);
+    app.enforce_billing().await;
+    let (user_id, _) = verified_user(&app, "trial.card").await;
+    let mut trialing = subscription("sub_t", user_id, "pro", 5);
+    trialing.status = "trialing".into();
+    trialing.trial_end = trialing.current_period_end;
+    trialing.unit_amount = Some(3990);
+    trialing.currency = Some("BRL".into());
+    fake.put(trialing);
+    event(&app, "evt_t", "customer.subscription.created", "sub_t").await;
+    let row = subscription_row(&app, user_id).await;
+    assert_eq!(row["provider_status"], "trialing");
+    assert!(row["trial_ends_at"].is_string());
+    // The confirmation names the first charge date.
+    let (_, confirmation, _) = app
+        .last_email("subscription_confirmed", None)
+        .await
+        .unwrap();
+    assert!(confirmation["trial_ends_at"].is_string());
+
+    event(
+        &app,
+        "evt_t1",
+        "customer.subscription.trial_will_end",
+        "sub_t",
+    )
+    .await;
+    event(
+        &app,
+        "evt_t2",
+        "customer.subscription.trial_will_end",
+        "sub_t",
+    )
+    .await;
+    run_subscription_maintenance(&app.state).await.unwrap();
+    assert_eq!(outbox_count(&app, user_id, "paid_trial_ending").await, 1);
+    let (_, reminder, _) = app.last_email("paid_trial_ending", None).await.unwrap();
+    assert_eq!(reminder["amount_cents"], 3990);
+    assert_eq!(reminder["interval"], "monthly");
+
+    // Trials don't count as recurring revenue until they pay.
+    let (_, admin) = app.user("trial.admin", Role::Admin).await;
+    let report = app.get("/admin/finance", &admin).await;
+    assert_eq!(report.body["paying_subscribers"], 0);
+    assert_eq!(report.body["paid_trialing"], 1);
+}
+
+#[tokio::test]
+async fn yearly_renewals_are_reminded_once_per_period() {
+    let mut app = app!();
+    let fake = with_payments(&mut app);
+    app.enforce_billing().await;
+    let (user_id, _) = verified_user(&app, "yearly.fan").await;
+    let mut yearly = subscription("sub_y", user_id, "pro", 20);
+    yearly.interval = Some(BillingInterval::Yearly);
+    fake.put(yearly);
+    event(&app, "evt_y", "customer.subscription.created", "sub_y").await;
+
+    let upcoming = |id: &str, subscription: &str| {
+        json!({
+            "id": id, "object": "event", "type": "invoice.upcoming",
+            "data": {"object": {"object": "invoice", "amount_due": 39900, "currency": "brl",
+                     "parent": {"subscription_details": {"subscription": subscription}}}}
+        })
+    };
+    assert_eq!(
+        signed(&app, upcoming("evt_u1", "sub_y")).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        signed(&app, upcoming("evt_u2", "sub_y")).await,
+        StatusCode::OK
+    );
+    run_subscription_maintenance(&app.state).await.unwrap();
+    assert_eq!(outbox_count(&app, user_id, "renewal_reminder").await, 1);
+    let (_, reminder, _) = app.last_email("renewal_reminder", None).await.unwrap();
+    assert_eq!(reminder["amount_cents"], 39900);
+
+    // Monthly plans get no such reminder.
+    let (monthly_id, _) = verified_user(&app, "monthly.fan").await;
+    fake.put(subscription("sub_m", monthly_id, "pro", 20));
+    event(&app, "evt_m", "customer.subscription.created", "sub_m").await;
+    signed(&app, upcoming("evt_u3", "sub_m")).await;
+    assert_eq!(outbox_count(&app, monthly_id, "renewal_reminder").await, 0);
+}
+
+#[tokio::test]
+async fn accepted_terms_are_stored_from_the_completed_checkout() {
+    let mut app = app!();
+    let fake = with_payments(&mut app);
+    app.enforce_billing().await;
+    let (user_id, token) = verified_user(&app, "terms.reader").await;
+    let started = app
+        .post("/billing/checkout", &token, checkout_body("pro", "monthly"))
+        .await;
+    assert_eq!(started.status, StatusCode::OK, "{}", started.body);
+    fake.put(subscription("sub_c", user_id, "pro", 30));
+    let body = json!({
+        "id": "evt_cs", "object": "event", "type": "checkout.session.completed",
+        "data": {"object": {
+            "object": "checkout.session", "id": "cs_1", "mode": "subscription",
+            "subscription": "sub_c", "client_reference_id": user_id.to_string(),
+            "consent": {"terms_of_service": "accepted"},
+            "metadata": {"terms_version": "2026-09-24"}
+        }}
+    });
+    assert_eq!(signed(&app, body).await, StatusCode::OK);
+    let row = subscription_row(&app, user_id).await;
+    assert_eq!(row["terms_version"], "2026-09-24");
+    assert!(row["terms_accepted_at"].is_string());
+    let completed: Option<chrono::NaiveDateTime> =
+        sqlx::query_scalar("SELECT completed_at FROM checkout_sessions WHERE session_id = 'cs_1'")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert!(completed.is_some());
+}
+
+#[tokio::test]
+async fn events_from_the_other_stripe_mode_are_ignored() {
+    let mut app = app!();
+    let fake = with_payments(&mut app);
+    app.enforce_billing().await;
+    let (user_id, _) = verified_user(&app, "mode.mixup").await;
+    fake.put(subscription("sub_live", user_id, "pro", 30));
+    let body = json!({
+        "id": "evt_live", "object": "event", "type": "customer.subscription.created",
+        "livemode": true,
+        "data": {"object": {"object": "subscription", "id": "sub_live"}}
+    });
+    assert_eq!(signed(&app, body).await, StatusCode::OK);
+    assert_ne!(subscription_row(&app, user_id).await["source"], "payment");
+
+    let body = json!({
+        "id": "evt_test", "object": "event", "type": "customer.subscription.created",
+        "livemode": false,
+        "data": {"object": {"object": "subscription", "id": "sub_live"}}
+    });
+    assert_eq!(signed(&app, body).await, StatusCode::OK);
+    assert_eq!(subscription_row(&app, user_id).await["source"], "payment");
+}
+
+#[tokio::test]
+async fn customers_deleted_at_stripe_are_forgotten_and_emails_synced() {
+    let mut app = app!();
+    let fake = with_payments(&mut app);
+    let (user_id, _) = verified_user(&app, "gone.customer").await;
+    sqlx::query("UPDATE users SET stripe_customer_id = 'cus_zap' WHERE id = $1")
+        .bind(user_id)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+
+    setlyst_api::services::payments::sync_customer_email(&app.state, user_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.calls_to("update_customer:cus_zap:gone.customer@example.com"),
+        1
+    );
+
+    let body = json!({
+        "id": "evt_del", "object": "event", "type": "customer.deleted",
+        "data": {"object": {"object": "customer", "id": "cus_zap"}}
+    });
+    assert_eq!(signed(&app, body).await, StatusCode::OK);
+    let (customer, generation): (Option<String>, i32) = sqlx::query_as(
+        "SELECT stripe_customer_id, stripe_customer_generation FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(customer, None);
+    assert_eq!(generation, 1);
+}
+
+#[tokio::test]
+async fn webhook_bodies_are_capped() {
+    let mut app = app!();
+    with_payments(&mut app);
+    let body = json!({ "id": "evt_big", "object": "event", "padding": "x".repeat(300 * 1024) });
+    let signature = sign(
+        body.to_string().as_bytes(),
+        WEBHOOK_SECRET,
+        Utc::now().timestamp(),
+    );
+    let (status, _) = deliver(&app, &body, Some(signature)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn staff_refunds_cancel_now_and_refund_the_latest_charge() {
+    let mut app = app!();
+    let fake = with_payments(&mut app);
+    app.enforce_billing().await;
+    let (user_id, token) = verified_user(&app, "refund.me").await;
+    fake.put(subscription("sub_r", user_id, "pro", 20));
+    event(&app, "evt_r", "customer.subscription.created", "sub_r").await;
+    {
+        // Outside the withdrawal window: only the latest charge is refunded.
+        let mut invoices = fake.invoices.lock().unwrap();
+        invoices.push(invoice_of("in_r2", "sub_r", user_id, 3990, 10));
+        invoices.push(invoice_of("in_r1", "sub_r", user_id, 3990, 40));
+    }
+    let (_, moderator) = app.user("refund.moderator", Role::Moderator).await;
+    let (admin_id, admin) = app.user("refund.admin", Role::Admin).await;
+    let path = format!("/admin/users/{user_id}/subscription/refund");
+    let reason = json!({ "reason": "Service outage" });
+
+    for caller in [&moderator, &token] {
+        let refused = app.post(&path, caller, reason.clone()).await;
+        assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.body);
+    }
+    let blank = app.post(&path, &admin, json!({ "reason": "   " })).await;
+    assert_eq!(blank.status, StatusCode::BAD_REQUEST, "{}", blank.body);
+    let too_long = app
+        .post(&path, &admin, json!({ "reason": "x".repeat(501) }))
+        .await;
+    assert_eq!(
+        too_long.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        too_long.body
+    );
+    let unknown = app
+        .post(
+            &format!("/admin/users/{}/subscription/refund", Uuid::new_v4()),
+            &admin,
+            reason.clone(),
+        )
+        .await;
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND, "{}", unknown.body);
+    assert_eq!(fake.calls_to("refund:"), 0);
+    assert_eq!(fake.calls_to("cancel:"), 0);
+
+    let refunded = app.post(&path, &admin, reason.clone()).await;
+    assert_eq!(refunded.status, StatusCode::OK, "{}", refunded.body);
+    assert_eq!(refunded.body["refunded_cents"], 3990);
+    assert_eq!(refunded.body["currency"], "brl");
+    assert_eq!(fake.calls_to("refund:pi_in_r2:setlyst-withdraw-in_r2"), 1);
+    assert_eq!(fake.calls_to("refund:pi_in_r1"), 0);
+    assert_eq!(fake.calls_to("cancel:sub_r"), 1);
+    assert_eq!(subscription_row(&app, user_id).await["status"], "canceled");
+    assert_eq!(event_kinds(&app, user_id).await.last().unwrap(), "refunded");
+    assert_eq!(outbox_count(&app, user_id, "withdrawal_confirmed").await, 1);
+    let (actor, target, logged_reason): (Option<Uuid>, Option<Uuid>, Option<String>) =
+        sqlx::query_as(
+            "SELECT actor_id, target_id, metadata->>'reason' FROM audit_logs
+             WHERE action = 'billing.subscription_refunded'",
+        )
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(actor, Some(admin_id));
+    assert_eq!(target, Some(user_id));
+    assert_eq!(logged_reason.as_deref(), Some("Service outage"));
+    assert!(app.get("/billing/me", &token).await.body["plan"].is_null());
+
+    let again = app.post(&path, &admin, reason).await;
+    assert_eq!(again.code(), "NO_PAID_SUBSCRIPTION", "{}", again.body);
+}
+
+#[tokio::test]
+async fn confirmed_email_changes_reach_the_payment_customer() {
+    let mut app = app!();
+    let fake = with_payments(&mut app);
+    let (user_id, token) = verified_user(&app, "moving.house").await;
+    sqlx::query("UPDATE users SET stripe_customer_id = 'cus_move' WHERE id = $1")
+        .bind(user_id)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+
+    let started = app
+        .post(
+            "/users/me/email/change",
+            &token,
+            json!({ "new_email": "moved@example.com", "password": STRONG_PASSWORD }),
+        )
+        .await;
+    assert_eq!(started.status, StatusCode::ACCEPTED, "{}", started.body);
+    assert_eq!(
+        fake.calls_to("update_customer:"),
+        0,
+        "not before it's confirmed"
+    );
+    let code = app
+        .last_code("email_change_code", "moved@example.com")
+        .await;
+    let confirmed = app
+        .post(
+            "/users/me/email/change/confirm",
+            &token,
+            json!({ "code": code }),
+        )
+        .await;
+    assert_eq!(confirmed.status, StatusCode::OK, "{}", confirmed.body);
+    assert_eq!(
+        fake.calls_to("update_customer:cus_move:moved@example.com"),
+        1
+    );
+
+    // A staff change of the address too.
+    let (_, admin) = app.user("mail.admin", Role::Admin).await;
+    let changed = app
+        .patch(
+            &format!("/users/{user_id}"),
+            &admin,
+            json!({ "email": "set.by.staff@example.com" }),
+        )
+        .await;
+    assert_eq!(changed.status, StatusCode::OK, "{}", changed.body);
+    assert_eq!(
+        fake.calls_to("update_customer:cus_move:set.by.staff@example.com"),
+        1
     );
 }

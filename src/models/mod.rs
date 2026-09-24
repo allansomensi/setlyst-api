@@ -11,6 +11,7 @@ pub mod band;
 pub mod band_note;
 pub mod billing;
 pub mod communication;
+pub mod finance;
 pub mod gig;
 pub mod link;
 pub mod metrics;
@@ -53,7 +54,7 @@ pub struct PaginationQuery {
 
 impl PaginationQuery {
     /// The requested page and page size, clamped to sane bounds
-    /// (`1 <= page <= 100_000`, `1 <= per_page <= 100`, default 20). The
+    /// (`1 <= page <= 1_000`, `1 <= per_page <= 100`, default 20). The
     /// page cap keeps `(page - 1) * per_page` far from overflowing.
     pub fn resolve(&self) -> (i64, i64) {
         (
@@ -63,8 +64,10 @@ impl PaginationQuery {
     }
 }
 
-/// Highest page number accepted anywhere.
-pub const MAX_PAGE: i64 = 100_000;
+/// Highest page number accepted anywhere: deep `OFFSET`s make Postgres read
+/// and discard every row before the page, so lists stop at 1 000 pages
+/// (100 000 rows at the largest page size).
+pub const MAX_PAGE: i64 = 1_000;
 
 /// A requested page number clamped to `1..=MAX_PAGE` (default 1).
 pub fn clamp_page(page: Option<i64>) -> i64 {

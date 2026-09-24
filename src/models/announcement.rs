@@ -283,9 +283,30 @@ pub fn normalize_audience(list: Option<Vec<String>>) -> Option<Vec<String>> {
     (!out.is_empty()).then_some(out)
 }
 
+/// Hosts announcement buttons may link to, besides app paths: the
+/// comma-separated `ANNOUNCEMENT_CTA_HOSTS` (read here rather than from
+/// `Config`, which doesn't carry it yet). Unset or empty: app paths only,
+/// so a staff account can never mass-mail a link to an arbitrary site.
+pub fn cta_allowed_hosts() -> Vec<String> {
+    std::env::var("ANNOUNCEMENT_CTA_HOSTS")
+        .map(|raw| {
+            raw.split(',')
+                .map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// A call-to-action link: an app path (`/dashboard/...`, not `//host`) or
-/// an `https` URL, at most 500 characters.
+/// an `https` URL on one of the [`cta_allowed_hosts`], at most 500
+/// characters.
 pub fn is_valid_cta_url(url: &str) -> bool {
+    is_valid_cta_url_for(url, &cta_allowed_hosts())
+}
+
+/// [`is_valid_cta_url`] with an explicit host allowlist.
+pub fn is_valid_cta_url_for(url: &str, allowed_hosts: &[String]) -> bool {
     if url.chars().count() > 500 || url.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return false;
     }
@@ -295,9 +316,12 @@ pub fn is_valid_cta_url(url: &str) -> bool {
     match reqwest::Url::parse(url) {
         Ok(parsed) => {
             parsed.scheme() == "https"
-                && parsed.domain().is_some()
                 && parsed.username().is_empty()
                 && parsed.password().is_none()
+                && parsed.domain().is_some_and(|domain| {
+                    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+                    allowed_hosts.contains(&domain)
+                })
         }
         Err(_) => false,
     }
@@ -323,7 +347,7 @@ impl AnnouncementDraft {
                 }
                 if !is_valid_cta_url(url) {
                     return Err(
-                        "The button link must be an app path starting with '/' or an https URL."
+                        "The button link must be an app path starting with '/' (or an https URL on an allowed host)."
                             .into(),
                     );
                 }
@@ -416,8 +440,22 @@ mod tests {
         assert!(d.check().is_err());
         d.cta_url = Some("javascript:alert(1)".into());
         assert!(d.check().is_err());
+        // External hosts only when allowlisted (none by default).
         d.cta_url = Some("https://setlyst.app/pricing".into());
-        assert!(d.check().is_ok());
+        assert_eq!(d.check().is_ok(), !cta_allowed_hosts().is_empty());
+        let hosts = vec!["setlyst.app".to_string()];
+        assert!(is_valid_cta_url_for("https://setlyst.app/pricing", &hosts));
+        assert!(is_valid_cta_url_for("https://SETLYST.app./pricing", &hosts));
+        assert!(!is_valid_cta_url_for(
+            "https://setlyst-billing.example/login",
+            &hosts
+        ));
+        assert!(!is_valid_cta_url_for(
+            "https://evil.setlyst.app.example/",
+            &hosts
+        ));
+        assert!(!is_valid_cta_url_for("http://setlyst.app/pricing", &hosts));
+        assert!(!is_valid_cta_url_for("https://user@setlyst.app/", &hosts));
         let mut d = draft();
         d.audience_roles = Some(vec!["root".into()]);
         assert!(d.check().is_err());

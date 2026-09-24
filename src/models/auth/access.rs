@@ -82,6 +82,45 @@ where
     }
 }
 
+/// Request extension set by the authentication middleware on requests
+/// made with an impersonation ("view as") token. Handlers and response
+/// filters use it to withhold secrets from staff viewing as someone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Impersonation {
+    pub impersonator_id: Uuid,
+}
+
+/// What an impersonation response must not carry, replaced in place:
+/// every `share_token` (a public link staff could keep using after the
+/// session) becomes `null`, and, when `invite_codes`, every `code` (band
+/// invite codes, which would let staff join a private band under their own
+/// identity) becomes `"***"`. Only call it with `invite_codes` on invite
+/// answers: `code` is a common key elsewhere (plan codes, error codes).
+pub fn redact_for_impersonation(value: &mut serde_json::Value, invite_codes: bool) {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                if key == "share_token" {
+                    if !item.is_null() {
+                        *item = Value::Null;
+                    }
+                } else if invite_codes && key == "code" && item.is_string() {
+                    *item = Value::String("***".into());
+                } else {
+                    redact_for_impersonation(item, invite_codes);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_for_impersonation(item, invite_codes);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The client IP as seen by the API, resolved exactly like the rate
 /// limiters do (see `middlewares::client_ip`): forwarding headers only
 /// count when they come from a trusted proxy or carry the internal secret.
@@ -109,5 +148,27 @@ where
             .map(|axum::extract::ConnectInfo(addr)| addr.ip());
         let ip = crate::middlewares::client_ip::resolve_with_config(peer, &parts.headers);
         Ok(Self(ip.map(|ip| ip.to_string())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn impersonation_redacts_share_tokens_everywhere_and_invite_codes_on_request() {
+        let mut value = json!({
+            "share_token": "abc",
+            "items": [{ "share_token": "def", "code": "INVITE123" }],
+            "code": "pro"
+        });
+        redact_for_impersonation(&mut value, false);
+        assert!(value["share_token"].is_null());
+        assert!(value["items"][0]["share_token"].is_null());
+        assert_eq!(value["items"][0]["code"], "INVITE123");
+        assert_eq!(value["code"], "pro");
+        redact_for_impersonation(&mut value, true);
+        assert_eq!(value["items"][0]["code"], "***");
     }
 }

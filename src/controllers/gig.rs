@@ -10,7 +10,7 @@ use crate::{
         quota::QuotaResource,
         resolve_page,
     },
-    services::entitlements::{Feature, ensure_feature},
+    services::entitlements::{Feature, ensure_feature, shared_content_visible},
     utils::share_token::token_fingerprint,
 };
 use axum::{
@@ -191,7 +191,7 @@ pub async fn create_gig(
 
     payload.validate()?;
 
-    match payload.band_id {
+    let quota = match payload.band_id {
         Some(band_id) => {
             // Gigs follow the band's `manage_setlists` permission, the same
             // rule used to edit or delete them (see `GigRepository::can_manage`).
@@ -211,16 +211,16 @@ pub async fn create_gig(
 
             state
                 .quota_repo
-                .ensure_band(band_id, QuotaResource::BandGigs, 1)
-                .await?;
+                .band_guard(band_id, QuotaResource::BandGigs, 1)
+                .await?
         }
         None => {
             state
                 .quota_repo
-                .ensure_user(user_id, QuotaResource::Gigs, 1)
-                .await?;
+                .user_guard(user_id, QuotaResource::Gigs, 1)
+                .await?
         }
-    }
+    };
 
     if let Some(setlist_id) = payload.setlist_id {
         validate_setlist_scope(&state, user_id, setlist_id, payload.band_id).await?;
@@ -229,7 +229,7 @@ pub async fn create_gig(
         validate_tour_scope(&state, tour_id, payload.band_id, user_id).await?;
     }
 
-    match state.gig_repo.create(&payload, user_id).await {
+    match state.gig_repo.create(&payload, user_id, &[quota]).await {
         Ok(new_gig) => {
             info!(%user_id, gig_id = %new_gig.id, "Gig created successfully");
 
@@ -394,7 +394,7 @@ pub async fn find_band_gigs(
     path = "/api/v1/gigs/{id}/share",
     tags = ["Gigs"],
     summary = "Enable (or rotate) a public read-only share link for a gig.",
-    description = "Generates a fresh, unguessable share token, replacing any previous one — so re-sharing invalidates links that were already handed out. Requires the same permission as editing the gig and the plan feature `public_sharing`.",
+    description = "Generates a fresh, unguessable share token, replacing any previous one — so re-sharing invalidates links that were already handed out. Requires the same permission as editing the gig, a verified e-mail address (`EMAIL_NOT_VERIFIED`, 403) and the plan feature `public_sharing`.",
     params(("id" = Uuid, Path, description = "The ID of the gig")),
     security((), ("jwt_token" = [])),
     responses(
@@ -412,6 +412,7 @@ pub async fn enable_gig_sharing(
     debug!(%user_id, gig_id = %id, "Processing request to enable public sharing for gig");
 
     state.gig_repo.can_manage(id, user_id).await?;
+    crate::services::account::require_verified_email(&state, user_id).await?;
     ensure_feature(&state, user_id, Feature::PublicSharing).await?;
 
     let gig = state.gig_repo.enable_sharing(id).await?;
@@ -454,7 +455,7 @@ pub async fn disable_gig_sharing(
     path = "/api/v1/public/gigs/{token}",
     tags = ["Gigs"],
     summary = "View a publicly shared gig.",
-    description = "No authentication required. The token itself is the only access control — anyone who has it can view the gig, and its linked setlist, read-only. The setlist is left out when it is in the trash or when staff took its public link down.",
+    description = "No authentication required. The token itself is the only access control — anyone who has it can view the gig, and its linked setlist, read-only. The setlist is left out when it is in the trash or when staff took its public link down. Answers 404 as well once the owner's plan no longer includes `public_sharing` (for band content: neither the creator's nor the band owner's plan).",
     params(("token" = String, Path, description = "The gig's public share token")),
     responses(
         (status = 200, description = "Gig retrieved successfully.", body = PublicGig),
@@ -472,6 +473,11 @@ pub async fn get_public_gig(
         .find_by_share_token(&token)
         .await?
         .ok_or(ApiError::NotFound)?;
+    // Hidden once the owner's plan no longer includes public sharing.
+    if !shared_content_visible(&state, gig.user_id, gig.band_id).await? {
+        debug!(gig_id = %gig.id, "Public gig hidden: the owner's plan lost public sharing");
+        return Err(ApiError::NotFound);
+    }
 
     // Resolved without an access filter: the share token already
     // authorizes the gig, and its creator may have since left the band

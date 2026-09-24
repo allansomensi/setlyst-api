@@ -41,7 +41,7 @@ macro_rules! user_account_columns {
          username_changed_at, created_at, updated_at, email_verified_at, password_set,
          totp_secret_enc, totp_enabled_at, totp_pending_secret_enc, totp_pending_created_at,
          totp_last_step, failed_login_count, locked_until, terms_accepted_at, terms_version,
-         referral_code, avatar_url"
+         referral_code, avatar_url, password_changed_at"
     };
 }
 
@@ -57,6 +57,88 @@ pub struct AuthState {
     pub banned_at: Option<NaiveDateTime>,
     pub banned_until: Option<NaiveDateTime>,
     pub ban_reason: Option<String>,
+    pub two_factor_enabled: bool,
+    /// Since when the account holds its current role (the account's
+    /// creation when it never changed).
+    pub role_since: NaiveDateTime,
+}
+
+/// Days a vacated username stays reserved for its previous owner.
+pub const USERNAME_QUARANTINE_DAYS: i64 = 90;
+
+/// Consecutive failed password sign-ins from one network before that
+/// network is locked out of the account (15 minutes, doubling up to 24
+/// hours).
+pub const NETWORK_LOCKOUT_THRESHOLD: i32 = 5;
+/// Failed password sign-ins from any network within
+/// [`ACCOUNT_FAILURE_WINDOW_MINUTES`] before the whole account is locked
+/// for 15 minutes (a softer cap against distributed guessing).
+pub const ACCOUNT_FAILURE_CAP: i32 = 20;
+pub const ACCOUNT_FAILURE_WINDOW_MINUTES: i64 = 15;
+
+/// Outcome of a failed password sign-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PasswordFailure {
+    /// Consecutive failures from this network.
+    pub network_failures: i32,
+    /// Set when this failure locked the network out of the account.
+    pub network_lock: Option<NaiveDateTime>,
+    /// Set when this failure locked the whole account.
+    pub account_lock: Option<NaiveDateTime>,
+}
+
+/// An unverified account removed by the purge job.
+#[derive(Debug, Clone, FromRow)]
+pub struct PurgedAccount {
+    pub id: Uuid,
+    pub username: String,
+}
+
+/// Invalidates every pending security artifact of the account: live
+/// second-factor challenges and unused e-mailed codes. Called in the same
+/// transaction as every credential change (password change or recovery,
+/// "sign out everywhere", e-mail change, suspension), so nothing issued
+/// under the old state can still be completed.
+pub async fn invalidate_pending(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> Result<(), ApiError> {
+    let timestamp = now();
+    sqlx::query(
+        "UPDATE login_challenges SET consumed_at = $2 WHERE user_id = $1 AND consumed_at IS NULL",
+    )
+    .bind(user_id)
+    .bind(timestamp)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE verification_codes SET consumed_at = $2 WHERE user_id = $1 AND consumed_at IS NULL",
+    )
+    .bind(user_id)
+    .bind(timestamp)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Keeps `username` reserved for its previous owner for
+/// [`USERNAME_QUARANTINE_DAYS`] (rename or deletion).
+async fn release_username(
+    tx: &mut Transaction<'_, Postgres>,
+    username: &str,
+    previous_owner: Uuid,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "INSERT INTO released_usernames (username_lower, previous_owner, released_at)
+         VALUES (LOWER($1), $2, $3)
+         ON CONFLICT (username_lower) DO UPDATE SET previous_owner = $2, released_at = $3",
+    )
+    .bind(username)
+    .bind(previous_owner)
+    .bind(now())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Optional case-insensitive search over the account's names; `$n` is a
@@ -176,15 +258,21 @@ pub trait UserRepository: Send + Sync {
         id: Uuid,
         threshold: i32,
     ) -> Result<(i32, Option<NaiveDateTime>), ApiError>;
-    async fn reset_login_failures(&self, id: Uuid) -> Result<(), ApiError>;
+    /// A complete sign-in: clears the account's failure counter and the
+    /// failures of the network it came from (`bucket`).
+    async fn reset_login_failures(&self, id: Uuid, bucket: Option<&str>) -> Result<(), ApiError>;
     /// Password recovery: sets the password, revokes sessions, clears the
     /// lockout and (when `verify_email`) marks the e-mail verified.
+    ///
+    /// Returns `true` when this was the first proof of ownership of the
+    /// address: two-factor authentication, recovery codes and linked
+    /// identities set up before it were removed.
     async fn recover_password(
         &self,
         id: Uuid,
         new_password: &str,
         verify_email: bool,
-    ) -> Result<(), ApiError>;
+    ) -> Result<bool, ApiError>;
     /// Marks `email` verified, provided it is still the account's address.
     async fn mark_email_verified(&self, id: Uuid, email: &str) -> Result<bool, ApiError>;
     /// Replaces the e-mail with an already verified address.
@@ -208,6 +296,48 @@ pub trait UserRepository: Send + Sync {
         actor_id: Uuid,
     ) -> Result<(), ApiError>;
     async fn remove_avatar(&self, id: Uuid, actor_id: Uuid) -> Result<(), ApiError>;
+
+    // --- Launch hardening ---
+
+    /// Counts a failed *password* sign-in from `bucket` (the client's
+    /// IPv4 address or IPv6 /64): every [`NETWORK_LOCKOUT_THRESHOLD`]
+    /// consecutive failures lock that network out of the account, and
+    /// [`ACCOUNT_FAILURE_CAP`] failures from anywhere within the window
+    /// lock the whole account.
+    async fn record_password_failure(
+        &self,
+        id: Uuid,
+        bucket: &str,
+    ) -> Result<PasswordFailure, ApiError>;
+    /// The end of an active lock of `bucket` out of the account.
+    async fn network_locked_until(
+        &self,
+        id: Uuid,
+        bucket: &str,
+    ) -> Result<Option<NaiveDateTime>, ApiError>;
+    /// Replaces the hash of a password verified in its legacy
+    /// (non-normalized) form, unless it changed meanwhile.
+    async fn upgrade_password_hash(
+        &self,
+        id: Uuid,
+        old_hash: &str,
+        new_hash: &str,
+    ) -> Result<(), ApiError>;
+    /// Removes the (never proven) address of an unverified account, so
+    /// the person who proved they own it can use it. `false` when the
+    /// account was verified meanwhile.
+    async fn detach_unverified_email(&self, id: Uuid) -> Result<bool, ApiError>;
+    /// Deletes self-registered accounts created before `cutoff` that never
+    /// verified the address they claimed, haven't signed in since `cutoff`
+    /// and have no content (no song, setlist, gig or band membership) and
+    /// no staff role. At most `limit` per call. Accounts without an
+    /// address (created by staff, or before addresses were required) are
+    /// never touched.
+    async fn purge_unverified(
+        &self,
+        cutoff: NaiveDateTime,
+        limit: i64,
+    ) -> Result<Vec<PurgedAccount>, ApiError>;
 }
 
 /// A new account created by self-registration or an identity provider.
@@ -225,6 +355,8 @@ pub struct NewAccount {
     pub language: String,
     /// Initial `user_preferences.communication`.
     pub communication: Value,
+    /// The age declaration was made at sign-up.
+    pub age_attested: bool,
 }
 
 /// Inserts a user row with a fresh, unique referral code (retrying on the
@@ -384,7 +516,9 @@ impl UserRepository for UserRepositoryImpl {
     async fn auth_state(&self, id: Uuid) -> Result<Option<AuthState>, ApiError> {
         let state = sqlx::query_as::<_, AuthState>(
             "SELECT username, role, status, token_version, must_change_password,
-                    banned_at, banned_until, ban_reason
+                    banned_at, banned_until, ban_reason,
+                    (totp_enabled_at IS NOT NULL AND totp_secret_enc IS NOT NULL) AS two_factor_enabled,
+                    COALESCE(role_changed_at, created_at) AS role_since
              FROM users WHERE id = $1",
         )
         .bind(id)
@@ -465,6 +599,9 @@ impl UserRepository for UserRepositoryImpl {
                 .bind(now())
                 .execute(&mut *tx)
                 .await?;
+                if !previous_username.eq_ignore_ascii_case(username) {
+                    release_username(&mut tx, &previous_username, id).await?;
+                }
                 updated = true;
             }
         }
@@ -472,17 +609,23 @@ impl UserRepository for UserRepositoryImpl {
         if let Some(email) = clearable(&payload.email) {
             // A staff-set address is unproven: it must be verified again,
             // unless it's the same address as before.
-            sqlx::query(
+            let changed = sqlx::query(
                 "UPDATE users
                  SET email_verified_at = CASE WHEN LOWER(COALESCE(email, '')) = LOWER(COALESCE($1, ''))
                                               THEN email_verified_at ELSE NULL END,
                      email = $1
-                 WHERE id = $2",
+                 WHERE id = $2 AND LOWER(COALESCE(email, '')) <> LOWER(COALESCE($1, ''))",
             )
             .bind(email)
             .bind(id)
             .execute(&mut *tx)
-            .await?;
+            .await?
+            .rows_affected()
+                > 0;
+            // Codes sent to the previous address must not outlive it.
+            if changed {
+                invalidate_pending(&mut tx, id).await?;
+            }
             updated = true;
         }
 
@@ -508,11 +651,17 @@ impl UserRepository for UserRepositoryImpl {
             if *role != Role::Admin {
                 guard_last_admin(&mut tx, id).await?;
             }
-            sqlx::query("UPDATE users SET role = $1 WHERE id = $2;")
-                .bind(role)
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE users
+                 SET role_changed_at = CASE WHEN role <> $1 THEN $3 ELSE role_changed_at END,
+                     role = $1
+                 WHERE id = $2",
+            )
+            .bind(role)
+            .bind(id)
+            .bind(now())
+            .execute(&mut *tx)
+            .await?;
             updated = true;
         }
 
@@ -644,14 +793,16 @@ impl UserRepository for UserRepositoryImpl {
         .execute(&mut *tx)
         .await?;
 
-        let result = sqlx::query("DELETE FROM users WHERE id = $1;")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        let username: Option<String> =
+            sqlx::query_scalar("DELETE FROM users WHERE id = $1 RETURNING username")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
 
-        if result.rows_affected() == 0 {
+        let Some(username) = username else {
             return Err(ApiError::NotFound);
-        }
+        };
+        release_username(&mut tx, &username, id).await?;
 
         tx.commit().await?;
         Ok(())
@@ -675,7 +826,21 @@ impl UserRepository for UserRepositoryImpl {
                 .is_some(),
         };
 
-        if exists {
+        // A recently vacated name is only free for its previous owner.
+        let quarantined = !exists
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM released_usernames
+                                WHERE username_lower = LOWER($1)
+                                  AND released_at > $2
+                                  AND ($3::uuid IS NULL OR previous_owner IS DISTINCT FROM $3))",
+            )
+            .bind(username.trim())
+            .bind(now() - chrono::Duration::days(USERNAME_QUARANTINE_DAYS))
+            .bind(exclude_id)
+            .fetch_one(&self.db)
+            .await?;
+
+        if exists || quarantined {
             Err(ApiError::rule(
                 axum::http::StatusCode::CONFLICT,
                 crate::errors::api_error::codes::USERNAME_TAKEN,
@@ -765,6 +930,7 @@ impl UserRepository for UserRepositoryImpl {
         let hash = hash_password(new_password).await?;
         let timestamp = now();
 
+        let mut tx = self.db.begin().await?;
         let result = sqlx::query(
             "UPDATE users
              SET password_hash = $1,
@@ -782,12 +948,14 @@ impl UserRepository for UserRepositoryImpl {
         .bind(revoke_sessions)
         .bind(actor_id)
         .bind(id)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
             return Err(ApiError::NotFound);
         }
+        invalidate_pending(&mut tx, id).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -801,14 +969,17 @@ impl UserRepository for UserRepositoryImpl {
     }
 
     async fn revoke_sessions(&self, id: Uuid) -> Result<(), ApiError> {
+        let mut tx = self.db.begin().await?;
         let result =
             sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
                 .bind(id)
-                .execute(&self.db)
+                .execute(&mut *tx)
                 .await?;
         if result.rows_affected() == 0 {
             return Err(ApiError::NotFound);
         }
+        invalidate_pending(&mut tx, id).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -820,6 +991,7 @@ impl UserRepository for UserRepositoryImpl {
         actor_id: Uuid,
     ) -> Result<(), ApiError> {
         let timestamp = now();
+        let mut tx = self.db.begin().await?;
         // Bumping the token version signs the account out everywhere
         // immediately, instead of letting open sessions run until expiry.
         let result = sqlx::query(
@@ -833,12 +1005,14 @@ impl UserRepository for UserRepositoryImpl {
         .bind(reason)
         .bind(actor_id)
         .bind(id)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
             return Err(ApiError::NotFound);
         }
+        invalidate_pending(&mut tx, id).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -938,6 +1112,13 @@ impl UserRepository for UserRepositoryImpl {
 
         let mut tx = self.db.begin().await?;
         user.referral_code = Some(insert_with_referral_code(&mut tx, &user, None).await?);
+        if account.age_attested {
+            sqlx::query("UPDATE users SET age_attested_at = $2 WHERE id = $1")
+                .bind(user.id)
+                .bind(timestamp)
+                .execute(&mut *tx)
+                .await?;
+        }
 
         if let Some(referrer) = account.referred_by.filter(|r| *r != user.id) {
             sqlx::query("UPDATE users SET referred_by = $2 WHERE id = $1")
@@ -1009,7 +1190,7 @@ impl UserRepository for UserRepositoryImpl {
         Ok((row.0, lock))
     }
 
-    async fn reset_login_failures(&self, id: Uuid) -> Result<(), ApiError> {
+    async fn reset_login_failures(&self, id: Uuid, bucket: Option<&str>) -> Result<(), ApiError> {
         sqlx::query(
             "UPDATE users SET failed_login_count = 0, locked_until = NULL
              WHERE id = $1 AND (failed_login_count <> 0 OR locked_until IS NOT NULL)",
@@ -1017,6 +1198,13 @@ impl UserRepository for UserRepositoryImpl {
         .bind(id)
         .execute(&self.db)
         .await?;
+        if let Some(bucket) = bucket {
+            sqlx::query("DELETE FROM login_failures WHERE user_id = $1 AND bucket = $2")
+                .bind(id)
+                .bind(bucket)
+                .execute(&self.db)
+                .await?;
+        }
         Ok(())
     }
 
@@ -1025,10 +1213,19 @@ impl UserRepository for UserRepositoryImpl {
         id: Uuid,
         new_password: &str,
         verify_email: bool,
-    ) -> Result<(), ApiError> {
+    ) -> Result<bool, ApiError> {
         let hash = hash_password(new_password).await?;
         let timestamp = now();
-        let result = sqlx::query(
+        let mut tx = self.db.begin().await?;
+        let verified_before: Option<Option<NaiveDateTime>> =
+            sqlx::query_scalar("SELECT email_verified_at FROM users WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(verified_before) = verified_before else {
+            return Err(ApiError::NotFound);
+        };
+        sqlx::query(
             "UPDATE users
              SET password_hash = $1, password_set = TRUE, must_change_password = FALSE,
                  password_changed_at = $2, token_version = token_version + 1,
@@ -1041,12 +1238,41 @@ impl UserRepository for UserRepositoryImpl {
         .bind(timestamp)
         .bind(verify_email)
         .bind(id)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
-        if result.rows_affected() == 0 {
-            return Err(ApiError::NotFound);
+        sqlx::query("DELETE FROM login_failures WHERE user_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        invalidate_pending(&mut tx, id).await?;
+
+        // The first proof that the owner controls the address: whatever
+        // was set up before it, possibly by someone who registered the
+        // address without owning it, is removed (a squatter's 2FA would
+        // otherwise lock the real owner out, and their linked Google
+        // account would keep a way in).
+        let first_proof = verify_email && verified_before.is_none();
+        if first_proof {
+            sqlx::query(
+                "UPDATE users
+                 SET totp_secret_enc = NULL, totp_enabled_at = NULL, totp_last_step = NULL,
+                     totp_pending_secret_enc = NULL, totp_pending_created_at = NULL
+                 WHERE id = $1",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM totp_recovery_codes WHERE user_id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM oauth_identities WHERE user_id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
         }
-        Ok(())
+        tx.commit().await?;
+        Ok(first_proof)
     }
 
     async fn mark_email_verified(&self, id: Uuid, email: &str) -> Result<bool, ApiError> {
@@ -1064,6 +1290,7 @@ impl UserRepository for UserRepositoryImpl {
 
     async fn change_email(&self, id: Uuid, new_email: &str) -> Result<(), ApiError> {
         let timestamp = now();
+        let mut tx = self.db.begin().await?;
         sqlx::query(
             "UPDATE users SET email = $2, email_verified_at = $3, updated_at = $3, updated_by = $1
              WHERE id = $1",
@@ -1071,8 +1298,11 @@ impl UserRepository for UserRepositoryImpl {
         .bind(id)
         .bind(new_email.trim())
         .bind(timestamp)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
+        // A recovery code sent to the old address must stop working.
+        invalidate_pending(&mut tx, id).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1217,6 +1447,7 @@ impl UserRepository for UserRepositoryImpl {
         .bind(timestamp)
         .execute(&mut *tx)
         .await?;
+        release_username(&mut tx, &previous, id).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1233,5 +1464,166 @@ impl UserRepository for UserRepositoryImpl {
         .execute(&self.db)
         .await?;
         Ok(())
+    }
+
+    async fn record_password_failure(
+        &self,
+        id: Uuid,
+        bucket: &str,
+    ) -> Result<PasswordFailure, ApiError> {
+        let timestamp = now();
+        // Per network: consecutive failures, a lock every `threshold`
+        // (15 minutes, doubling, at most 24 hours). One statement, so
+        // concurrent failures can't lose increments.
+        let (network_failures, network_locked): (i32, Option<NaiveDateTime>) = sqlx::query_as(
+            "INSERT INTO login_failures (user_id, bucket, failures, window_started_at, locked_until, updated_at)
+             VALUES ($1, $2, 1, $3, NULL, $3)
+             ON CONFLICT (user_id, bucket) DO UPDATE SET
+                 failures = login_failures.failures + 1,
+                 locked_until = CASE
+                     WHEN (login_failures.failures + 1) % $4 = 0
+                     THEN $3 + LEAST(
+                         INTERVAL '24 hours',
+                         INTERVAL '15 minutes' * POWER(2, LEAST(((login_failures.failures + 1) / $4) - 1, 10))
+                     )
+                     ELSE login_failures.locked_until
+                 END,
+                 updated_at = $3
+             RETURNING failures, locked_until",
+        )
+        .bind(id)
+        .bind(bucket)
+        .bind(timestamp)
+        .bind(NETWORK_LOCKOUT_THRESHOLD)
+        .fetch_one(&self.db)
+        .await?;
+        let network_lock = network_locked.filter(|until| {
+            *until > timestamp && network_failures % NETWORK_LOCKOUT_THRESHOLD == 0
+        });
+
+        // Account-wide: failures from every network in a fixed window
+        // (bucket '*'); reaching the cap locks the account itself.
+        let window_start = timestamp - chrono::Duration::minutes(ACCOUNT_FAILURE_WINDOW_MINUTES);
+        let account_failures: i32 = sqlx::query_scalar(
+            "INSERT INTO login_failures (user_id, bucket, failures, window_started_at, locked_until, updated_at)
+             VALUES ($1, '*', 1, $2, NULL, $2)
+             ON CONFLICT (user_id, bucket) DO UPDATE SET
+                 failures = CASE WHEN login_failures.window_started_at <= $3
+                                 THEN 1 ELSE login_failures.failures + 1 END,
+                 window_started_at = CASE WHEN login_failures.window_started_at <= $3
+                                          THEN $2 ELSE login_failures.window_started_at END,
+                 updated_at = $2
+             RETURNING failures",
+        )
+        .bind(id)
+        .bind(timestamp)
+        .bind(window_start)
+        .fetch_one(&self.db)
+        .await?;
+        let mut account_lock = None;
+        if account_failures == ACCOUNT_FAILURE_CAP {
+            let until = timestamp + chrono::Duration::minutes(ACCOUNT_FAILURE_WINDOW_MINUTES);
+            sqlx::query(
+                "UPDATE users SET locked_until = GREATEST(COALESCE(locked_until, $2), $2) WHERE id = $1",
+            )
+            .bind(id)
+            .bind(until)
+            .execute(&self.db)
+            .await?;
+            account_lock = Some(until);
+        }
+        Ok(PasswordFailure {
+            network_failures,
+            network_lock,
+            account_lock,
+        })
+    }
+
+    async fn network_locked_until(
+        &self,
+        id: Uuid,
+        bucket: &str,
+    ) -> Result<Option<NaiveDateTime>, ApiError> {
+        let until: Option<Option<NaiveDateTime>> = sqlx::query_scalar(
+            "SELECT locked_until FROM login_failures WHERE user_id = $1 AND bucket = $2",
+        )
+        .bind(id)
+        .bind(bucket)
+        .fetch_optional(&self.db)
+        .await?;
+        Ok(until.flatten().filter(|until| *until > now()))
+    }
+
+    async fn upgrade_password_hash(
+        &self,
+        id: Uuid,
+        old_hash: &str,
+        new_hash: &str,
+    ) -> Result<(), ApiError> {
+        sqlx::query("UPDATE users SET password_hash = $3 WHERE id = $1 AND password_hash = $2")
+            .bind(id)
+            .bind(old_hash)
+            .bind(new_hash)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn detach_unverified_email(&self, id: Uuid) -> Result<bool, ApiError> {
+        let mut tx = self.db.begin().await?;
+        let detached = sqlx::query(
+            "UPDATE users SET email = NULL, updated_at = $2
+             WHERE id = $1 AND email_verified_at IS NULL AND email IS NOT NULL",
+        )
+        .bind(id)
+        .bind(now())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        if detached {
+            invalidate_pending(&mut tx, id).await?;
+        }
+        tx.commit().await?;
+        Ok(detached)
+    }
+
+    async fn purge_unverified(
+        &self,
+        cutoff: NaiveDateTime,
+        limit: i64,
+    ) -> Result<Vec<PurgedAccount>, ApiError> {
+        let mut tx = self.db.begin().await?;
+        let accounts = sqlx::query_as::<_, PurgedAccount>(
+            "DELETE FROM users u
+             WHERE u.id IN (
+                 SELECT c.id FROM users c
+                 WHERE c.email_verified_at IS NULL
+                   AND c.email IS NOT NULL
+                   AND c.created_at < $1
+                   AND (c.last_login_at IS NULL OR c.last_login_at < $1)
+                   AND c.role = 'user'
+                   AND c.created_by IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM songs s WHERE s.user_id = c.id)
+                   AND NOT EXISTS (SELECT 1 FROM setlists s WHERE s.user_id = c.id)
+                   AND NOT EXISTS (SELECT 1 FROM gigs g WHERE g.user_id = c.id)
+                   AND NOT EXISTS (SELECT 1 FROM band_members m WHERE m.user_id = c.id)
+                   AND NOT EXISTS (SELECT 1 FROM subscriptions p WHERE p.user_id = c.id
+                                   AND p.source <> 'trial')
+                 ORDER BY c.created_at
+                 LIMIT $2
+                 FOR UPDATE SKIP LOCKED
+             )
+             RETURNING u.id, u.username",
+        )
+        .bind(cutoff)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        for account in &accounts {
+            release_username(&mut tx, &account.username, account.id).await?;
+        }
+        tx.commit().await?;
+        Ok(accounts)
     }
 }

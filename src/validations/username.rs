@@ -70,6 +70,31 @@ const RESERVED: &[&str] = &[
     "setlyst",
 ];
 
+/// The shape a name *looks* like, for reserved-name checks: lower case,
+/// separators removed and look-alikes folded (`i`, `1` → `l`; `0` → `o`;
+/// `5` → `s`; `rn` → `m`). "setIyst", "supp0rt", "adm1n" and "rnoderator"
+/// all fold onto the reserved name they imitate.
+pub fn skeleton(username: &str) -> String {
+    let folded: String = username
+        .chars()
+        .filter(|c| !SEPARATORS.contains(c))
+        .map(|c| match c.to_ascii_lowercase() {
+            'i' | '1' | '|' => 'l',
+            '0' => 'o',
+            '5' => 's',
+            other => other,
+        })
+        .collect();
+    folded.replace("rn", "m")
+}
+
+/// `true` when `username` is, or looks like, a reserved name.
+fn is_reserved(username: &str) -> bool {
+    let shape = skeleton(username);
+    RESERVED.iter().any(|reserved| skeleton(reserved) == shape)
+        || shape.starts_with(&skeleton("setlyst"))
+}
+
 fn error(message: &'static str) -> ValidationError {
     let mut error = ValidationError::new("invalid_username");
     error.message = Some(Cow::from(message));
@@ -112,12 +137,7 @@ pub fn validate_username(username: &str) -> Result<(), ValidationError> {
         previous_was_separator = is_separator;
     }
 
-    let normalized: String = username
-        .chars()
-        .filter(|c| !SEPARATORS.contains(c))
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
-    if RESERVED.contains(&normalized.as_str()) || normalized.starts_with("setlyst") {
+    if is_reserved(username) {
         return Err(error(
             "This username is reserved. Please choose another one.",
         ));
@@ -181,6 +201,27 @@ mod tests {
         assert!(validate_username("big.faggot").is_err());
         assert!(validate_username("niger.music").is_ok());
         assert!(validate_username("scunthorpe").is_ok());
+    }
+
+    #[test]
+    fn rejects_look_alikes_of_reserved_names() {
+        for name in [
+            "setIyst",
+            "supp0rt",
+            "adm1n",
+            "rnoderator",
+            "5upport",
+            "Set1yst.band",
+        ] {
+            assert!(
+                validate_username(name).is_err(),
+                "{name} should be reserved"
+            );
+        }
+        for name in ["augusto", "maria.silva", "rnb.band", "user42"] {
+            assert!(validate_username(name).is_ok(), "{name} should be valid");
+        }
+        assert_eq!(skeleton("Adm1n"), skeleton("admin"));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::{
-    errors::api_error::ApiError,
+    errors::api_error::{ApiError, codes},
     models::{
         backup::{
             BACKUP_FORMAT_VERSION, BackupArtist, BackupFile, BackupGig, BackupSetlist,
@@ -11,6 +11,7 @@ use crate::{
     },
     validations::{link::normalize_links, tag::normalize_tags},
 };
+use axum::http::StatusCode;
 use chrono::{NaiveDate, Utc};
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
@@ -106,16 +107,23 @@ pub trait BackupRepository: Send + Sync {
     ///   reference keys during the import phase.
     ///
     /// Everything is validated before anything is written (lengths, ranges,
-    /// links, per-setlist item limits), and the whole import runs in one
-    /// transaction; any failure rolls back completely. When `limits` is
-    /// given, the account's totals are checked against them *after*
-    /// merging (so re-importing overlapping data isn't penalized) and the
-    /// whole import is rolled back if any is exceeded.
+    /// links, per-setlist item limits). When `limits` is given, the quota
+    /// is checked twice: before the transaction, with every record of the
+    /// file counted as new (an upper bound: a file that could never fit is
+    /// refused without touching the database), and again inside it, after
+    /// merging, on the account's real totals.
+    ///
+    /// The whole import runs in one transaction (any failure rolls back
+    /// completely) with a 20-second statement timeout, and only one import
+    /// per account runs at a time (`IMPORT_IN_PROGRESS`, 409). Without
+    /// `allow_tours` (the plan lacks the `tours` feature) the file's tours
+    /// are skipped and counted in `skipped_tours`.
     async fn import(
         &self,
         user_id: Uuid,
         backup: BackupFile,
         limits: Option<QuotaLimits>,
+        allow_tours: bool,
     ) -> Result<ImportSummary, ApiError>;
 }
 
@@ -292,6 +300,7 @@ impl BackupRepository for BackupRepositoryImpl {
         user_id: Uuid,
         backup: BackupFile,
         limits: Option<QuotaLimits>,
+        allow_tours: bool,
     ) -> Result<ImportSummary, ApiError> {
         backup.validate_contents().map_err(ApiError::BadRequest)?;
 
@@ -318,54 +327,114 @@ impl BackupRepository for BackupRepositoryImpl {
             }
         }
 
-        let now = Utc::now().naive_utc();
+        let tours: &[BackupTour] = if allow_tours { &backup.tours } else { &[] };
+        let skipped_tours = backup.tours.len() - tours.len();
 
-        let artists_incoming = backup.artists.len();
-        let songs_incoming = backup.songs.len();
-        let setlists_incoming = backup.setlists.len();
-        let gigs_incoming = backup.gigs.len();
-        let tours_incoming = backup.tours.len();
+        // Upper bound before any write: every record counted as new.
+        if let Some(limits) = limits {
+            let usage = usage_of(&self.db, user_id).await?;
+            for (resource, used, incoming, limit) in [
+                (
+                    "artists",
+                    usage.artists,
+                    backup.artists.len(),
+                    limits.artists,
+                ),
+                ("songs", usage.songs, backup.songs.len(), limits.songs),
+                (
+                    "setlists",
+                    usage.setlists,
+                    backup.setlists.len(),
+                    limits.setlists,
+                ),
+                ("gigs", usage.gigs, backup.gigs.len(), limits.gigs),
+                ("tours", usage.tours, tours.len(), limits.tours),
+            ] {
+                if used + incoming as i64 > limit {
+                    return Err(ApiError::quota_exceeded(resource, limit));
+                }
+            }
+        }
+
+        let now = Utc::now().naive_utc();
 
         let mut tx = self.db.begin().await?;
 
-        let mut artist_id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(artists_incoming);
+        // One import per account at a time: a second one fails right away
+        // instead of queueing behind the first (holding a connection).
+        let locked: bool = sqlx::query_scalar(
+            "SELECT pg_try_advisory_xact_lock(hashtextextended('backup_import:' || $1::text, 0))",
+        )
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !locked {
+            return Err(import_in_progress());
+        }
+        sqlx::query("SET LOCAL statement_timeout = '20s'")
+            .execute(&mut *tx)
+            .await?;
 
+        // Artists: the account's existing ones by name, the rest inserted
+        // in one statement.
+        let existing_artists: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT id, LOWER(name) FROM artists
+             WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL
+             ORDER BY created_at",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut artist_by_name: HashMap<String, Uuid> = HashMap::new();
+        for (id, name) in existing_artists {
+            artist_by_name.entry(name).or_insert(id);
+        }
+        let mut artist_id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(backup.artists.len());
+        let (mut new_artist_ids, mut new_artist_names) = (Vec::new(), Vec::new());
         for artist in &backup.artists {
             let name = artist.name.trim();
-            let resolved_id: Uuid = match sqlx::query_scalar(
-                "SELECT id FROM artists
-                 WHERE LOWER(name) = LOWER($1) AND user_id = $2 AND band_id IS NULL AND deleted_at IS NULL",
+            let resolved = *artist_by_name
+                .entry(name.to_lowercase())
+                .or_insert_with(|| {
+                    let id = Uuid::new_v4();
+                    new_artist_ids.push(id);
+                    new_artist_names.push(name.to_string());
+                    id
+                });
+            artist_id_map.insert(artist.id, resolved);
+        }
+        if !new_artist_ids.is_empty() {
+            sqlx::query(
+                "INSERT INTO artists (id, name, user_id, created_at, updated_at)
+                 SELECT t.id, t.name, $3, $4, $4 FROM UNNEST($1::uuid[], $2::text[]) AS t(id, name)",
             )
-            .bind(name)
+            .bind(&new_artist_ids)
+            .bind(&new_artist_names)
             .bind(user_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            {
-                Some(existing_id) => existing_id,
-                None => {
-                    let new_id = Uuid::new_v4();
-                    sqlx::query(
-                        "INSERT INTO artists (id, name, user_id, created_at, updated_at)
-                         VALUES ($1, $2, $3, $4, $4)",
-                    )
-                    .bind(new_id)
-                    .bind(name)
-                    .bind(user_id)
-                    .bind(now)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to insert an artist during import: {e}");
-                        ApiError::DatabaseError(e)
-                    })?;
-                    new_id
-                }
-            };
-
-            artist_id_map.insert(artist.id, resolved_id);
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                error!("Failed to insert artists during import: {e}");
+                ApiError::DatabaseError(e)
+            })?;
         }
 
-        let mut song_id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(songs_incoming);
+        // Songs: existing ones by (artist, title) in memory; new ones one
+        // insert each (enum columns), tags in one statement at the end.
+        let existing_songs: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+            "SELECT id, artist_id, LOWER(TRIM(title)) FROM songs
+             WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut song_by_key: HashMap<(Uuid, String), Uuid> = existing_songs
+            .into_iter()
+            .map(|(id, artist, title)| ((artist, title), id))
+            .collect();
+        let mut song_id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(backup.songs.len());
+        let (mut tag_song_ids, mut tag_values) = (Vec::new(), Vec::new());
         for (song, links) in backup.songs.iter().zip(song_links) {
             let Some(&resolved_artist_id) = artist_id_map.get(&song.artist_id) else {
                 return Err(ApiError::BadRequest(format!(
@@ -374,19 +443,10 @@ impl BackupRepository for BackupRepositoryImpl {
                 )));
             };
             let title = song.title.trim();
+            let key = (resolved_artist_id, title.to_lowercase());
 
-            let resolved_id: Uuid = match sqlx::query_scalar(
-                "SELECT id FROM songs
-                 WHERE LOWER(TRIM(title)) = LOWER(TRIM($1)) AND artist_id = $2 AND user_id = $3
-                   AND band_id IS NULL AND deleted_at IS NULL",
-            )
-            .bind(title)
-            .bind(resolved_artist_id)
-            .bind(user_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            {
-                Some(existing_id) => existing_id,
+            let resolved_id = match song_by_key.get(&key) {
+                Some(&existing_id) => existing_id,
                 None => {
                     let new_id = Uuid::new_v4();
                     let lyrics = song.lyrics.as_deref().filter(|l| !l.trim().is_empty());
@@ -419,56 +479,53 @@ impl BackupRepository for BackupRepositoryImpl {
                         error!("Failed to insert a song during import: {e}");
                         ApiError::DatabaseError(e)
                     })?;
+                    song_by_key.insert(key, new_id);
                     new_id
                 }
             };
 
-            let tags = normalize_tags(&song.tags).unwrap_or_default();
-            if !tags.is_empty() {
-                sqlx::query(
-                    "INSERT INTO song_tags (song_id, tag, created_at)
-                     SELECT $1, t, $3 FROM UNNEST($2::text[]) AS t
-                     ON CONFLICT DO NOTHING",
-                )
-                .bind(resolved_id)
-                .bind(&tags)
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
+            for tag in normalize_tags(&song.tags).unwrap_or_default() {
+                tag_song_ids.push(resolved_id);
+                tag_values.push(tag);
             }
-
             song_id_map.insert(song.id, resolved_id);
         }
-
-        let mut setlist_id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(setlists_incoming);
-
-        for (setlist, links) in backup.setlists.iter().zip(setlist_links) {
-            let new_setlist_id = Uuid::new_v4();
-            let description = setlist
-                .description
-                .as_deref()
-                .map(str::trim)
-                .filter(|d| !d.is_empty());
-
+        if !tag_song_ids.is_empty() {
             sqlx::query(
-                "INSERT INTO setlists (id, title, description, user_id, links, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $6)",
+                "INSERT INTO song_tags (song_id, tag, created_at)
+                 SELECT t.song_id, t.tag, $3 FROM UNNEST($1::uuid[], $2::text[]) AS t(song_id, tag)
+                 ON CONFLICT DO NOTHING",
             )
-            .bind(new_setlist_id)
-            .bind(setlist.title.trim())
-            .bind(description)
-            .bind(user_id)
-            .bind(sqlx::types::Json(&links))
+            .bind(&tag_song_ids)
+            .bind(&tag_values)
             .bind(now)
             .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                error!("Failed to insert a setlist during import: {e}");
-                ApiError::DatabaseError(e)
-            })?;
+            .await?;
+        }
 
+        // Setlists and all their entries: two statements.
+        let mut setlist_id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(backup.setlists.len());
+        let mut setlist_rows = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut entries = (Vec::new(), Vec::new(), Vec::new());
+        for (setlist, links) in backup.setlists.iter().zip(setlist_links) {
+            let new_setlist_id = Uuid::new_v4();
             setlist_id_map.insert(setlist.id, new_setlist_id);
+            setlist_rows.0.push(new_setlist_id);
+            setlist_rows.1.push(setlist.title.trim().to_string());
+            setlist_rows.2.push(
+                setlist
+                    .description
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|d| !d.is_empty())
+                    .map(str::to_string),
+            );
+            setlist_rows.3.push(
+                serde_json::to_value(&links).unwrap_or_else(|_| serde_json::Value::Array(vec![])),
+            );
 
+            // A song listed twice keeps its last position.
+            let mut position_of: HashMap<Uuid, usize> = HashMap::with_capacity(setlist.songs.len());
             let mut song_ids: Vec<Uuid> = Vec::with_capacity(setlist.songs.len());
             let mut positions: Vec<i32> = Vec::with_capacity(setlist.songs.len());
             for entry in &setlist.songs {
@@ -478,51 +535,88 @@ impl BackupRepository for BackupRepositoryImpl {
                         setlist.title
                     )));
                 };
-                // A song listed twice keeps its last position.
-                if let Some(index) = song_ids.iter().position(|id| *id == resolved_song_id) {
-                    positions[index] = entry.position;
-                } else {
-                    song_ids.push(resolved_song_id);
-                    positions.push(entry.position);
+                match position_of.get(&resolved_song_id) {
+                    Some(&index) => positions[index] = entry.position,
+                    None => {
+                        position_of.insert(resolved_song_id, song_ids.len());
+                        song_ids.push(resolved_song_id);
+                        positions.push(entry.position);
+                    }
                 }
             }
-
-            if !song_ids.is_empty() {
-                sqlx::query(
-                    "INSERT INTO setlist_songs (setlist_id, song_id, position)
-                     SELECT $1, t.song_id, t.position
-                     FROM UNNEST($2::uuid[], $3::int[]) AS t(song_id, position)",
-                )
-                .bind(new_setlist_id)
-                .bind(&song_ids)
-                .bind(&positions)
-                .execute(&mut *tx)
-                .await?;
+            for (song_id, position) in song_ids.into_iter().zip(positions) {
+                entries.0.push(new_setlist_id);
+                entries.1.push(song_id);
+                entries.2.push(position);
             }
         }
+        if !setlist_rows.0.is_empty() {
+            sqlx::query(
+                "INSERT INTO setlists (id, title, description, user_id, links, created_at, updated_at)
+                 SELECT t.id, t.title, t.description, $5, t.links, $6, $6
+                 FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::jsonb[])
+                      AS t(id, title, description, links)",
+            )
+            .bind(&setlist_rows.0)
+            .bind(&setlist_rows.1)
+            .bind(&setlist_rows.2)
+            .bind(&setlist_rows.3)
+            .bind(user_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                error!("Failed to insert setlists during import: {e}");
+                ApiError::DatabaseError(e)
+            })?;
+        }
+        if !entries.0.is_empty() {
+            sqlx::query(
+                "INSERT INTO setlist_songs (setlist_id, song_id, position)
+                 SELECT t.setlist_id, t.song_id, t.position
+                 FROM UNNEST($1::uuid[], $2::uuid[], $3::int[]) AS t(setlist_id, song_id, position)",
+            )
+            .bind(&entries.0)
+            .bind(&entries.1)
+            .bind(&entries.2)
+            .execute(&mut *tx)
+            .await?;
+        }
 
-        let mut tour_id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(tours_incoming);
-        for tour in &backup.tours {
+        // Tours: one statement.
+        let mut tour_id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(tours.len());
+        let mut tour_rows = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for tour in tours {
             let new_tour_id = Uuid::new_v4();
-            let description = tour
-                .description
-                .as_deref()
-                .map(str::trim)
-                .filter(|d| !d.is_empty());
+            tour_id_map.insert(tour.id, new_tour_id);
+            tour_rows.0.push(new_tour_id);
+            tour_rows.1.push(tour.name.trim().to_string());
+            tour_rows.2.push(
+                tour.description
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|d| !d.is_empty())
+                    .map(str::to_string),
+            );
+            tour_rows.3.push(tour.start_date);
+            tour_rows.4.push(tour.end_date);
+        }
+        if !tour_rows.0.is_empty() {
             sqlx::query(
                 "INSERT INTO tours (id, user_id, band_id, name, description, start_date, end_date, created_at, updated_at)
-                 VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $7)",
+                 SELECT t.id, $6, NULL, t.name, t.description, t.start_date, t.end_date, $7, $7
+                 FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::date[], $5::date[])
+                      AS t(id, name, description, start_date, end_date)",
             )
-            .bind(new_tour_id)
+            .bind(&tour_rows.0)
+            .bind(&tour_rows.1)
+            .bind(&tour_rows.2)
+            .bind(&tour_rows.3)
+            .bind(&tour_rows.4)
             .bind(user_id)
-            .bind(tour.name.trim())
-            .bind(description)
-            .bind(tour.start_date)
-            .bind(tour.end_date)
             .bind(now)
             .execute(&mut *tx)
             .await?;
-            tour_id_map.insert(tour.id, new_tour_id);
         }
 
         for gig in &backup.gigs {
@@ -558,30 +652,16 @@ impl BackupRepository for BackupRepositoryImpl {
             })?;
         }
 
+        // The exact check, on the merged totals.
         if let Some(limits) = limits {
-            let (artists, songs, setlists, gigs, tags, tours): (i64, i64, i64, i64, i64, i64) =
-                sqlx::query_as(
-                    "SELECT
-                    (SELECT COUNT(*) FROM artists WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL),
-                    (SELECT COUNT(*) FROM songs WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL),
-                    (SELECT COUNT(*) FROM setlists WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL),
-                    (SELECT COUNT(*) FROM gigs WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL),
-                    (SELECT COUNT(DISTINCT st.tag) FROM song_tags st
-                        INNER JOIN songs s ON s.id = st.song_id
-                        WHERE s.user_id = $1 AND s.band_id IS NULL AND s.deleted_at IS NULL),
-                    (SELECT COUNT(*) FROM tours WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL)",
-                )
-                .bind(user_id)
-                .fetch_one(&mut *tx)
-                .await?;
-
+            let usage = usage_of(&mut *tx, user_id).await?;
             for (resource, used, limit) in [
-                ("artists", artists, limits.artists),
-                ("songs", songs, limits.songs),
-                ("setlists", setlists, limits.setlists),
-                ("gigs", gigs, limits.gigs),
-                ("tags", tags, limits.tags),
-                ("tours", tours, limits.tours),
+                ("artists", usage.artists, limits.artists),
+                ("songs", usage.songs, limits.songs),
+                ("setlists", usage.setlists, limits.setlists),
+                ("gigs", usage.gigs, limits.gigs),
+                ("tags", usage.tags, limits.tags),
+                ("tours", usage.tours, limits.tours),
             ] {
                 if used > limit {
                     tx.rollback().await?;
@@ -593,11 +673,60 @@ impl BackupRepository for BackupRepositoryImpl {
         tx.commit().await?;
 
         Ok(ImportSummary {
-            artists_imported: artists_incoming,
-            songs_imported: songs_incoming,
-            setlists_imported: setlists_incoming,
-            gigs_imported: gigs_incoming,
-            tours_imported: tours_incoming,
+            artists_imported: backup.artists.len(),
+            songs_imported: backup.songs.len(),
+            setlists_imported: backup.setlists.len(),
+            gigs_imported: backup.gigs.len(),
+            tours_imported: tours.len(),
+            skipped_tours,
         })
     }
+}
+
+/// `IMPORT_IN_PROGRESS` (409).
+pub fn import_in_progress() -> ApiError {
+    ApiError::rule(
+        StatusCode::CONFLICT,
+        codes::IMPORT_IN_PROGRESS,
+        "Another backup import is still running for this account. Wait for it to finish.",
+    )
+}
+
+/// An account's personal content totals (what the backup quota covers).
+struct Usage {
+    artists: i64,
+    songs: i64,
+    setlists: i64,
+    gigs: i64,
+    tags: i64,
+    tours: i64,
+}
+
+async fn usage_of<'e, E>(executor: E, user_id: Uuid) -> Result<Usage, ApiError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let (artists, songs, setlists, gigs, tags, tours): (i64, i64, i64, i64, i64, i64) =
+        sqlx::query_as(
+            "SELECT
+            (SELECT COUNT(*) FROM artists WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL),
+            (SELECT COUNT(*) FROM songs WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL),
+            (SELECT COUNT(*) FROM setlists WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL),
+            (SELECT COUNT(*) FROM gigs WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL),
+            (SELECT COUNT(DISTINCT st.tag) FROM song_tags st
+                INNER JOIN songs s ON s.id = st.song_id
+                WHERE s.user_id = $1 AND s.band_id IS NULL AND s.deleted_at IS NULL),
+            (SELECT COUNT(*) FROM tours WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL)",
+        )
+        .bind(user_id)
+        .fetch_one(executor)
+        .await?;
+    Ok(Usage {
+        artists,
+        songs,
+        setlists,
+        gigs,
+        tags,
+        tours,
+    })
 }

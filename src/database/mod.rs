@@ -81,9 +81,9 @@ impl AppState {
     /// build their state through here.
     pub fn new(pool: PgPool) -> Self {
         Self::with_services(
-            pool,
+            pool.clone(),
             Arc::new(GoogleJwksVerifier::new()),
-            Arc::new(DefaultModerationService::new()),
+            Arc::new(DefaultModerationService::new().with_budget(pool)),
         )
     }
 

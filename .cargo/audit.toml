@@ -1,0 +1,18 @@
+# cargo-audit configuration (read by `cargo audit` locally and in CI).
+#
+# Every ignored advisory must say why it does not apply to this API, and
+# be revisited when the dependency behind it changes.
+
+[advisories]
+ignore = [
+    # lopdf: stack overflow when *parsing* a PDF with deeply nested objects.
+    # lopdf only comes in through genpdf/printpdf (PDF export), which only
+    # *write* documents; the API never loads or parses a PDF. No fixed
+    # version is reachable: genpdf 0.2 (the latest) pins lopdf 0.26.
+    "RUSTSEC-2026-0187",
+    # rsa: Marvin timing attack on RSA *private-key* operations (decryption
+    # and signing). jsonwebtoken pulls rsa in, but the API signs its own
+    # tokens with HS256 and uses RS256 only to *verify* Google ID tokens
+    # with Google's public keys. No fixed version exists upstream.
+    "RUSTSEC-2023-0071",
+]

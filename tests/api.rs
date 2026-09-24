@@ -64,7 +64,7 @@ async fn registration_enforces_the_password_and_username_policies() {
             axum::http::Method::POST,
             "/auth/register",
             None,
-            Some(json!({ "username": "newbie", "password": STRONG_PASSWORD, "email": "newbie@example.com", "accept_terms": true })),
+            Some(json!({ "username": "newbie", "password": STRONG_PASSWORD, "email": "newbie@example.com", "accept_terms": true, "age_confirmed": true })),
         )
         .await;
     assert_eq!(ok.status, StatusCode::CREATED, "{}", ok.body);
@@ -75,7 +75,7 @@ async fn registration_enforces_the_password_and_username_policies() {
             axum::http::Method::POST,
             "/auth/register",
             None,
-            Some(json!({ "username": "NEWBIE", "email": "other@example.com", "accept_terms": true, "password": STRONG_PASSWORD })),
+            Some(json!({ "username": "NEWBIE", "email": "other@example.com", "accept_terms": true, "age_confirmed": true, "password": STRONG_PASSWORD })),
         )
         .await;
     assert_eq!(duplicate.status, StatusCode::CONFLICT);
@@ -756,11 +756,12 @@ async fn status_reports_health_version_and_database() {
         status.body["status"].as_str(),
         Some("operational" | "degraded")
     ));
-    assert_eq!(status.body["version"], env!("CARGO_PKG_VERSION"));
-    // Infrastructure details are staff-only (v0.12).
+    // The version and infrastructure details are staff-only.
+    assert!(status.body.get("version").is_none());
     assert!(status.body.get("dependencies").is_none());
     let (_, staff) = app.user("status.mod", Role::Moderator).await;
     let details = app.get("/status/details", &staff).await;
+    assert_eq!(details.body["version"], env!("CARGO_PKG_VERSION"));
     assert!(details.body["dependencies"]["database"]["latency_ms"].is_number());
 }
 

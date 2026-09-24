@@ -107,6 +107,45 @@ pub async fn has_feature(
     Ok(entitlements(state, user_id).await?.has(feature))
 }
 
+/// `true` while the owner of a setlist or gig may keep it public: the
+/// public views answer 404 once the owner's plan no longer includes
+/// public sharing (the hourly job also revokes those links).
+pub async fn owner_can_share(state: &AppState, owner_id: Uuid) -> Result<bool, ApiError> {
+    has_feature(state, owner_id, Feature::PublicSharing).await
+}
+
+/// `true` while a shared setlist or gig (created by `creator_id`, in
+/// `band_id` when it belongs to a band) may still be viewed through its
+/// public link: its creator's plan includes public sharing or, for band
+/// content, the band owner's plan does. The public views answer 404
+/// otherwise. Links of personal content are also cleared by the billing
+/// jobs; band content is only covered by this check.
+pub async fn shared_content_visible(
+    state: &AppState,
+    creator_id: Uuid,
+    band_id: Option<Uuid>,
+) -> Result<bool, ApiError> {
+    if !state.billing_repo.get_settings().await?.enforced {
+        return Ok(true);
+    }
+    if owner_can_share(state, creator_id).await? {
+        return Ok(true);
+    }
+    let Some(band_id) = band_id else {
+        return Ok(false);
+    };
+    let band_owner: Option<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM band_members WHERE band_id = $1 AND role = 'owner' LIMIT 1",
+    )
+    .bind(band_id)
+    .fetch_optional(&state.db)
+    .await?;
+    match band_owner {
+        Some(owner) if owner != creator_id => owner_can_share(state, owner).await,
+        _ => Ok(false),
+    }
+}
+
 /// The cheapest public plan that includes `feature` (to point the user
 /// at an upgrade).
 pub async fn cheapest_plan_with(

@@ -103,6 +103,15 @@ pub struct StripeEvent {
     pub client_reference_id: Option<String>,
     /// `metadata.redemption_id` of a completed checkout.
     pub redemption_id: Option<String>,
+    /// Whether the event comes from live mode (`None` when absent).
+    pub livemode: Option<bool>,
+    /// Id of the event's object (checkout session, customer, dispute...).
+    pub object_id: Option<String>,
+    /// A completed checkout whose buyer ticked the required Terms of
+    /// Service box.
+    pub terms_accepted: bool,
+    /// `metadata.terms_version` of a completed checkout.
+    pub terms_version: Option<String>,
 }
 
 fn string_at(value: &Value, pointer: &str) -> Option<String> {
@@ -123,6 +132,7 @@ pub fn parse_event(body: &Value) -> Option<StripeEvent> {
     let object = body.pointer("/data/object")?;
     let object_type = object.get("object").and_then(Value::as_str).unwrap_or("");
 
+    let checkout = object_type == "checkout.session";
     let (subscription_id, client_reference_id, redemption_id) = match object_type {
         "subscription" => (string_at(object, "/id"), None, None),
         "checkout.session"
@@ -151,6 +161,16 @@ pub fn parse_event(body: &Value) -> Option<StripeEvent> {
         subscription_id,
         client_reference_id,
         redemption_id,
+        livemode: body.get("livemode").and_then(Value::as_bool),
+        object_id: string_at(object, "/id"),
+        terms_accepted: checkout
+            && object
+                .pointer("/consent/terms_of_service")
+                .and_then(Value::as_str)
+                == Some("accepted"),
+        terms_version: checkout
+            .then(|| string_at(object, "/metadata/terms_version"))
+            .flatten(),
     })
 }
 
@@ -228,17 +248,27 @@ mod tests {
         let event = parse_event(&subscription).unwrap();
         assert_eq!(event.subscription_id.as_deref(), Some("sub_1"));
 
+        assert_eq!(event.livemode, None);
+        assert!(!event.terms_accepted);
+
         let checkout = json!({
             "object": "event", "id": "evt_2", "type": "checkout.session.completed",
+            "livemode": true,
             "data": {"object": {
-                "object": "checkout.session", "mode": "subscription", "subscription": "sub_2",
-                "client_reference_id": "3f1c", "metadata": {"redemption_id": "r1"}
+                "object": "checkout.session", "id": "cs_2", "mode": "subscription",
+                "subscription": "sub_2", "client_reference_id": "3f1c",
+                "metadata": {"redemption_id": "r1", "terms_version": "2026-09-01"},
+                "consent": {"terms_of_service": "accepted"}
             }}
         });
         let event = parse_event(&checkout).unwrap();
         assert_eq!(event.subscription_id.as_deref(), Some("sub_2"));
         assert_eq!(event.client_reference_id.as_deref(), Some("3f1c"));
         assert_eq!(event.redemption_id.as_deref(), Some("r1"));
+        assert_eq!(event.livemode, Some(true));
+        assert_eq!(event.object_id.as_deref(), Some("cs_2"));
+        assert!(event.terms_accepted);
+        assert_eq!(event.terms_version.as_deref(), Some("2026-09-01"));
 
         let one_off = json!({
             "object": "event", "id": "evt_3", "type": "checkout.session.completed",

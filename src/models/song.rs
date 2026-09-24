@@ -582,6 +582,7 @@ pub struct CreateSongPayload {
     ))]
     pub duration: Option<i32>,
     /// Free-form tags; normalized server-side (see `validations::tag`).
+    #[validate(length(max = 10, message = "A song can have at most 10 tags."))]
     pub tags: Option<Vec<String>>,
     #[validate(range(min = 1, max = 5, message = "Energy must be between 1 and 5."))]
     pub energy: Option<i16>,
@@ -623,6 +624,7 @@ pub struct UpdateSongPayload {
     ))]
     pub duration: Option<Option<i32>>,
     /// Replaces the song's whole tag set when present.
+    #[validate(length(max = 10, message = "A song can have at most 10 tags."))]
     pub tags: Option<Vec<String>>,
     #[serde(default, deserialize_with = "crate::models::patch::double_option")]
     #[validate(range(min = 1, max = 5, message = "Energy must be between 1 and 5."))]

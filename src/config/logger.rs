@@ -7,17 +7,47 @@ use tracing_subscriber::{
     layer::SubscriberExt,
 };
 
+/// Console log filter when `RUST_LOG_CONSOLE` is unset.
+pub const DEFAULT_CONSOLE_FILTER: &str = "info,sqlx=warn,tower_governor=warn";
+
 impl Config {
     pub fn logger_init() -> Option<WorkerGuard> {
-        let rust_log_console = EnvFilter::from_env("RUST_LOG_CONSOLE");
+        // Unset, `EnvFilter` would only let errors through: warnings
+        // (lockouts, delivery retries, moderation failures) and the access
+        // log would silently vanish in production.
+        let rust_log_console = match env::var("RUST_LOG_CONSOLE") {
+            Ok(filter) if !filter.trim().is_empty() => EnvFilter::new(filter),
+            _ => EnvFilter::new(DEFAULT_CONSOLE_FILTER),
+        };
 
-        let console_layer = fmt::Layer::new()
-            .pretty()
-            .with_file(false)
-            .with_ansi(true)
-            .with_line_number(false)
-            .with_target(false)
-            .with_filter(rust_log_console);
+        // `pretty` (multi-line, coloured) reads well in a terminal; hosted
+        // log viewers (Render) want one plain line per event, so that is
+        // the default of release builds. `LOG_FORMAT` overrides either.
+        let format = env::var("LOG_FORMAT").unwrap_or_else(|_| {
+            if cfg!(debug_assertions) {
+                "pretty"
+            } else {
+                "compact"
+            }
+            .to_string()
+        });
+        let console_layer = if format.eq_ignore_ascii_case("pretty") {
+            fmt::Layer::new()
+                .pretty()
+                .with_file(false)
+                .with_ansi(true)
+                .with_line_number(false)
+                .with_target(false)
+                .with_filter(rust_log_console)
+                .boxed()
+        } else {
+            fmt::Layer::new()
+                .compact()
+                .with_ansi(false)
+                .with_target(false)
+                .with_filter(rust_log_console)
+                .boxed()
+        };
 
         let log_to_file = env::var("LOG_TO_FILE").unwrap_or_default() == "true";
 

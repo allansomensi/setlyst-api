@@ -87,6 +87,8 @@ async fn enforcement_applies_plans_trials_and_limits() {
 
     // New accounts start with a trial of the trial plan.
     let (_, token) = app.registered_user("trial.user", "trial@example.com").await;
+    // The trial starts once the address is verified.
+    app.verify_email(&token, "trial@example.com").await;
     let me = app.get("/billing/me", &token).await;
     assert_eq!(me.body["enforced"], true);
     assert_eq!(me.body["subscription"]["status"], "trialing");
@@ -212,9 +214,12 @@ async fn maintenance_expires_periods_and_reminds_trials() {
     let (user_id, token) = app
         .registered_user("expiring", "expiring@example.com")
         .await;
-    let (reminded_id, _) = app
+    let (reminded_id, reminded) = app
         .registered_user("reminded", "reminded@example.com")
         .await;
+    // Trials start once the address is verified.
+    app.verify_email(&token, "expiring@example.com").await;
+    app.verify_email(&reminded, "reminded@example.com").await;
 
     sqlx::query("UPDATE subscriptions SET current_period_end = NOW() AT TIME ZONE 'utc' - INTERVAL '1 hour' WHERE user_id = $1")
         .bind(user_id)
@@ -262,13 +267,13 @@ async fn promo_codes_of_every_kind_and_their_errors() {
     assert_eq!(mismatched.code(), "VALIDATION_ERROR");
 
     let plan = create(
-        json!({ "code": "PRO30", "kind": "plan_grant", "plan_code": "pro", "duration_days": 30 }),
+        json!({ "code": "PROPLAN30", "kind": "plan_grant", "plan_code": "pro", "duration_days": 30 }),
     )
     .await;
     assert_eq!(plan.status, StatusCode::CREATED, "{}", plan.body);
     create(json!({ "code": "trial7", "kind": "trial_extension", "duration_days": 7 })).await;
     create(json!({ "code": "CREDITS50", "kind": "credits", "credits": 50 })).await;
-    create(json!({ "code": "HALF", "kind": "discount", "discount_percent": 50 })).await;
+    create(json!({ "code": "HALFPRICE", "kind": "discount", "discount_percent": 50 })).await;
     create(json!({ "code": "OLDCODE", "kind": "credits", "credits": 5,
                    "expires_at": "2020-01-01T00:00:00" }))
     .await;
@@ -277,23 +282,29 @@ async fn promo_codes_of_every_kind_and_their_errors() {
             .await;
     create(json!({ "code": "NEWBIES", "kind": "credits", "credits": 5, "new_users_only": true }))
         .await;
-    let duplicate = create(json!({ "code": "pro30", "kind": "credits", "credits": 1 })).await;
+    let duplicate = create(json!({ "code": "proplan30", "kind": "credits", "credits": 1 })).await;
     assert_eq!(duplicate.code(), "ALREADY_EXISTS");
+    // Codes worth money must not be guessable.
+    let short = create(json!({ "code": "HALF", "kind": "discount", "discount_percent": 50 })).await;
+    assert_eq!(short.code(), "VALIDATION_ERROR");
 
     let redeem = |code: &str| app.post("/billing/redeem", &user, json!({ "code": code }));
 
-    let granted = redeem("pro30").await;
+    let granted = redeem("proplan30").await;
     assert_eq!(granted.status, StatusCode::OK, "{}", granted.body);
     assert_eq!(granted.body["redemption"]["kind"], "plan_grant");
     assert_eq!(granted.body["subscription"]["plan_code"], "pro");
-    assert_eq!(redeem("PRO30").await.code(), "PROMO_CODE_ALREADY_REDEEMED");
+    assert_eq!(
+        redeem("PROPLAN30").await.code(),
+        "PROMO_CODE_ALREADY_REDEEMED"
+    );
 
     // A trial extension doesn't apply to an account on a plan.
     assert_eq!(redeem("TRIAL7").await.code(), "PROMO_CODE_NOT_ELIGIBLE");
 
     let credits = redeem("credits50").await;
     assert_eq!(credits.body["credits"]["balance"], 50);
-    let discount = redeem("HALF").await;
+    let discount = redeem("HALFPRICE").await;
     assert_eq!(discount.body["redemption"]["discount_percent"], 50);
 
     assert_eq!(redeem("NOPE").await.code(), "PROMO_CODE_INVALID");
@@ -318,7 +329,7 @@ async fn promo_codes_of_every_kind_and_their_errors() {
     )
     .await;
     assert_eq!(
-        app.post("/billing/redeem", &fresh, json!({ "code": "PRO30" }))
+        app.post("/billing/redeem", &fresh, json!({ "code": "PROPLAN30" }))
             .await
             .code(),
         "PROMO_CODE_INVALID"
@@ -527,6 +538,15 @@ async fn public_plans_show_the_best_running_promotion_and_admins_edit_plans() {
         )
         .await;
     assert_eq!(bogus.code(), "VALIDATION_ERROR");
+    // Stripe can't charge less than R$ 0,50.
+    let too_cheap = app
+        .put(
+            "/admin/plans/basic",
+            &admin,
+            json!({ "price_monthly_cents": 49 }),
+        )
+        .await;
+    assert_eq!(too_cheap.code(), "VALIDATION_ERROR");
     let nameless = app.put("/admin/plans/studio", &admin, json!({})).await;
     assert_eq!(nameless.code(), "VALIDATION_ERROR");
     let plans = app
@@ -575,4 +595,151 @@ async fn public_plans_show_the_best_running_promotion_and_admins_edit_plans() {
         .status,
         StatusCode::FORBIDDEN
     );
+}
+
+#[tokio::test]
+async fn plans_stay_enforced_while_paid_subscriptions_are_live() {
+    let app = app!();
+    let (_, admin) = app.user("enforce.admin", Role::Admin).await;
+    let (user_id, _) = app.user("still.paying", Role::User).await;
+    app.enforce_billing().await;
+    sqlx::query(
+        "INSERT INTO subscriptions (user_id, plan_code, status, source, started_at, current_period_end,
+                                    external_ref, created_at, updated_at)
+         VALUES ($1, 'pro', 'active', 'payment', NOW(), NOW() + INTERVAL '20 days', 'sub_1', NOW(), NOW())",
+    )
+    .bind(user_id)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    let mut settings = app.get("/admin/billing/settings", &admin).await.body;
+    settings["enforced"] = json!(false);
+    let blocked = app
+        .put("/admin/billing/settings", &admin, settings.clone())
+        .await;
+    assert_eq!(blocked.status, StatusCode::CONFLICT);
+    assert_eq!(blocked.code(), "BILLING_HAS_PAID_SUBSCRIPTIONS");
+    assert_eq!(blocked.body["meta"]["live"], 1);
+    let forced = app
+        .put("/admin/billing/settings?force=true", &admin, settings)
+        .await;
+    assert_eq!(forced.status, StatusCode::OK, "{}", forced.body);
+}
+
+#[tokio::test]
+async fn the_registration_trial_starts_at_most_once() {
+    let app = app!();
+    app.set_billing(json!({ "enforced": true })).await;
+    let (user_id, token) = app
+        .registered_user("one.trial", "one.trial@example.com")
+        .await;
+    let trials = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM subscription_events WHERE user_id = $1 AND kind = 'trial_started'",
+        )
+        .bind(user_id)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap()
+    };
+    // Nothing until the address is verified: the trial is what makes a
+    // throwaway sign-up worth something.
+    assert_eq!(trials().await, 0);
+    let verified = app.verify_email(&token, "one.trial@example.com").await;
+    assert_eq!(verified.status, StatusCode::OK, "{}", verified.body);
+    assert_eq!(trials().await, 1);
+    // Called again, even after the trial ended: nothing new.
+    sqlx::query("UPDATE subscriptions SET status = 'expired' WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    setlyst_api::services::billing::start_registration_trial(&app.state, user_id)
+        .await
+        .unwrap();
+    assert_eq!(trials().await, 1);
+}
+
+/// Enables the public link of `/{kind}/{id}` and returns its token.
+async fn share(app: &TestApp, token: &str, kind: &str, id: &str) -> String {
+    let shared = app
+        .post(&format!("/{kind}/{id}/share"), token, json!({}))
+        .await;
+    assert_eq!(shared.status, StatusCode::OK, "{}", shared.body);
+    shared.body["share_token"].as_str().unwrap().to_string()
+}
+
+async fn public_status(app: &TestApp, path: &str) -> StatusCode {
+    app.request(axum::http::Method::GET, path, None, None)
+        .await
+        .status
+}
+
+#[tokio::test]
+async fn public_links_stop_working_when_the_owner_loses_public_sharing() {
+    let app = app!();
+    let (sharer_id, sharer) = app.user("lapsed.sharer", Role::User).await;
+    // Admins keep every feature, so their band stays shareable.
+    let (_, staff_leader) = app.user("staff.leader", Role::Admin).await;
+    let (_, free_leader) = app.user("free.leader", Role::User).await;
+
+    let setlist = app.setlist(&sharer, "Personal", None).await;
+    let setlist_token = share(&app, &sharer, "setlists", &setlist).await;
+    let gig = app
+        .post(
+            "/gigs",
+            &sharer,
+            json!({ "venue": "Bar", "scheduled_at": "2030-03-01T22:00:00" }),
+        )
+        .await;
+    assert_eq!(gig.status, StatusCode::CREATED, "{}", gig.body);
+    let gig_token = share(&app, &sharer, "gigs", gig.body["id"].as_str().unwrap()).await;
+
+    // Band setlists created by the same (soon free) member.
+    let covered_band = app.band(&staff_leader, "Covered").await;
+    app.join_band(&staff_leader, &sharer, &covered_band, Some("admin"))
+        .await;
+    let covered = app
+        .setlist(&sharer, "Covered set", Some(&covered_band))
+        .await;
+    let covered_token = share(&app, &sharer, "setlists", &covered).await;
+    let bare_band = app.band(&free_leader, "Bare").await;
+    app.join_band(&free_leader, &sharer, &bare_band, Some("admin"))
+        .await;
+    let bare = app.setlist(&sharer, "Bare set", Some(&bare_band)).await;
+    let bare_token = share(&app, &sharer, "setlists", &bare).await;
+
+    let setlist_path = format!("/public/setlists/{setlist_token}");
+    let pdf_path = format!("/public/setlists/{setlist_token}/export/pdf");
+    let gig_path = format!("/public/gigs/{gig_token}");
+    let covered_path = format!("/public/setlists/{covered_token}");
+    let bare_path = format!("/public/setlists/{bare_token}");
+    for path in [&setlist_path, &gig_path, &covered_path, &bare_path] {
+        assert_eq!(public_status(&app, path).await, StatusCode::OK, "{path}");
+    }
+
+    // Subscriptions enforced and nobody but the admin on a plan: the
+    // links are gone, except the band whose owner still has the feature.
+    app.enforce_billing().await;
+    for path in [&setlist_path, &pdf_path, &gig_path, &bare_path] {
+        assert_eq!(
+            public_status(&app, path).await,
+            StatusCode::NOT_FOUND,
+            "{path}"
+        );
+    }
+    assert_eq!(public_status(&app, &covered_path).await, StatusCode::OK);
+
+    // A plan with public sharing brings the (still stored) link back.
+    let (_, admin) = app.user("billing.admin", Role::Admin).await;
+    let granted = app
+        .put(
+            &format!("/admin/users/{sharer_id}/subscription"),
+            &admin,
+            json!({ "plan_code": "basic", "days": 30, "note": "Support" }),
+        )
+        .await;
+    assert_eq!(granted.status, StatusCode::OK, "{}", granted.body);
+    assert_eq!(public_status(&app, &setlist_path).await, StatusCode::OK);
+    assert_eq!(public_status(&app, &bare_path).await, StatusCode::OK);
 }

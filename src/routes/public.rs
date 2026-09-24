@@ -1,26 +1,25 @@
-use crate::{
-    controllers::public, database::AppState, middlewares::client_ip::ClientIpKeyExtractor,
+use crate::{controllers::public, database::AppState};
+use axum::{
+    Router,
+    routing::{get, post},
 };
-use axum::{Router, routing::get};
-use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
+use std::time::Duration;
 
 /// Public platform routes (no session), with their full `/public/...`
 /// paths so they can be merged next to the public share routes.
 pub fn create_routes(state: AppState) -> Router {
-    // Unsubscribing: one per second, bursts of 10, per client IP.
-    let unsubscribe = GovernorConfigBuilder::default()
-        .per_second(1)
-        .burst_size(10)
-        .key_extractor(ClientIpKeyExtractor)
-        .finish()
-        .expect("valid governor configuration");
-
+    // Unsubscribing (the page and the providers' one-click POST): one per
+    // second, bursts of 10, per client.
     let unsubscribe_routes = Router::new()
         .route(
             "/public/email/unsubscribe",
             get(public::inspect_unsubscribe).post(public::unsubscribe),
         )
-        .layer(GovernorLayer::new(unsubscribe));
+        .route(
+            "/public/email/unsubscribe/one-click",
+            post(public::unsubscribe_one_click),
+        )
+        .layer(client_governor!(Duration::from_secs(1), 10));
 
     Router::new()
         .route("/public/legal/version", get(public::legal_version))

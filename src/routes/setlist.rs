@@ -85,7 +85,7 @@ pub fn create_public_routes(state: AppState) -> Router {
             "/{token}/export/pdf",
             get(setlist::export_public_setlist_pdf),
         )
-        .layer(GovernorLayer::new(pdf_governor));
+        .layer(GovernorLayer::new(pruned!(pdf_governor)));
 
     Router::new()
         .route("/{token}", get(setlist::get_public_setlist))

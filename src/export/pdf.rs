@@ -216,6 +216,17 @@ impl PdfExportOptions {
         self.margins = MarginSize::Normal;
         self
     }
+
+    /// The options a public share link may use: never the songbook, nor
+    /// anything that only shapes it. Whoever holds the link gets the
+    /// running order, never the lyrics (they may be someone's copyrighted
+    /// or unpublished work).
+    pub fn for_public_share(mut self) -> Self {
+        self.include_lyrics = false;
+        self.page_break_per_song = false;
+        self.chords = ChordMode::Hide;
+        self
+    }
 }
 
 impl Default for PdfExportOptions {

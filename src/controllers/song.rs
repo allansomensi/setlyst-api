@@ -1,3 +1,4 @@
+use crate::utils::rate_limit::presets;
 use crate::{
     controllers::pin::{mark_one, mark_pinned},
     database::{AppState, repositories::song_repository::SongFilter},
@@ -171,13 +172,16 @@ pub async fn create_song(
         .song_repo
         .is_unique(&payload.title, payload.artist_id, user_id, None)
         .await?;
-    state
+    let quota = state
         .quota_repo
-        .ensure_user(user_id, QuotaResource::Songs, 1)
+        .user_guard(user_id, QuotaResource::Songs, 1)
         .await?;
     state.quota_repo.ensure_tags(user_id, &tags).await?;
 
-    let new_song = state.song_repo.create(&payload, &tags, user_id).await?;
+    let new_song = state
+        .song_repo
+        .create(&payload, &tags, user_id, &[quota])
+        .await?;
 
     info!(%user_id, song_id = %new_song.id, "Song created successfully");
 
@@ -380,7 +384,7 @@ fn chordpro_response(filename: &str, body: String) -> axum::response::Response {
     path = "/api/v1/songs/export/chordpro",
     tags = ["Songs"],
     summary = "Export all songs as ChordPro.",
-    description = "Every live personal song, separated by `{new_song}`, each with `{title}`, `{artist}`, `{key}`, `{tempo}`, `{time}`, `{capo}`, `{duration: m:ss}` and `{meta: energy N}` when set.",
+    description = "Every live personal song, separated by `{new_song}`, each with `{title}`, `{artist}`, `{key}`, `{tempo}`, `{time}`, `{capo}`, `{duration: m:ss}` and `{meta: energy N}` when set. At most 10 per hour (`TOO_MANY_ATTEMPTS`, 429) and 2 bulk exports at once platform-wide (`SERVICE_BUSY`, 503). Refused under impersonation (`IMPERSONATION_READ_ONLY`).",
     security(("jwt_token" = [])),
     responses((status = 200, description = "ChordPro file.", content_type = "text/plain"))
 )]
@@ -389,6 +393,13 @@ pub async fn export_songs_chordpro(
     access: AccessControl,
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = access.user_id();
+
+    // Staff viewing an account read-only never walk away with its content.
+    if access.impersonator().is_some() {
+        return Err(ApiError::impersonation_read_only());
+    }
+    presets::limit(&presets::CHORDPRO_EXPORT, user_id)?;
+    let _slot = crate::controllers::backup::bulk_slot().await?;
 
     let songs = state.song_repo.export_all_chordpro(user_id).await?;
     let songs_count = songs.len();
@@ -490,6 +501,7 @@ pub async fn export_song_pdf(
     Query(query): Query<SongExportQuery>,
 ) -> Result<axum::response::Response, ApiError> {
     let user_id = access.user_id();
+    presets::limit(&presets::PDF_EXPORT, user_id)?;
     let song = exportable_song(&state, user_id, id).await?;
     let options = SongPdfOptions::from(query);
     if options.is_advanced() {
@@ -652,11 +664,15 @@ pub async fn import_chordpro(
                 None => {
                     let payload = CreateArtistPayload { name };
                     payload.validate()?;
-                    state
+                    let quota = state
                         .quota_repo
-                        .ensure_user(user_id, QuotaResource::Artists, 1)
+                        .user_guard(user_id, QuotaResource::Artists, 1)
                         .await?;
-                    state.artist_repo.create(&payload, user_id).await?.id
+                    state
+                        .artist_repo
+                        .create(&payload, user_id, &[quota])
+                        .await?
+                        .id
                 }
             }
         }
@@ -683,12 +699,15 @@ pub async fn import_chordpro(
         .song_repo
         .is_unique(&create.title, artist_id, user_id, None)
         .await?;
-    state
+    let quota = state
         .quota_repo
-        .ensure_user(user_id, QuotaResource::Songs, 1)
+        .user_guard(user_id, QuotaResource::Songs, 1)
         .await?;
 
-    let song = state.song_repo.create(&create, &[], user_id).await?;
+    let song = state
+        .song_repo
+        .create(&create, &[], user_id, &[quota])
+        .await?;
     info!(%user_id, song_id = %song.id, "Song imported from ChordPro");
 
     let mut headers = HeaderMap::new();

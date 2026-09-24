@@ -22,10 +22,15 @@ use crate::{
         user_preferences::{SUPPORTED_LANGUAGES, UpdatePreferencesPayload, UserPreferences},
     },
     moderation,
-    services::{account::too_many_attempts, notifier::notify},
-    utils::{hashing, jwt::generate_impersonation_jwt},
+    services::{
+        account::{self, too_many_attempts},
+        notifier::notify,
+    },
+    utils::{jwt::generate_impersonation_jwt, rate_limit::SlidingWindowLimiter},
     validations::{
-        image_url::validate_image_url, password::password_issues, username::validate_username,
+        image_url::validate_image_url,
+        password::{password_issues, password_issues_checked},
+        username::validate_username,
     },
 };
 use axum::{
@@ -36,12 +41,34 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use serde_json::json;
+use std::sync::LazyLock;
 use tracing::{debug, info};
 use uuid::Uuid;
 use validator::Validate;
 
 /// How long a user must wait before changing their username again.
 const USERNAME_CHANGE_COOLDOWN_DAYS: i64 = 90;
+
+/// Avatar changes per account: each new image is sent to the paid image
+/// classifier, so they are bounded per hour and per day.
+static AVATAR_HOURLY: LazyLock<SlidingWindowLimiter<Uuid>> =
+    LazyLock::new(|| SlidingWindowLimiter::new(5, std::time::Duration::from_secs(3600)));
+static AVATAR_DAILY: LazyLock<SlidingWindowLimiter<Uuid>> =
+    LazyLock::new(|| SlidingWindowLimiter::new(20, std::time::Duration::from_secs(24 * 3600)));
+
+/// An image link without its query string or fragment: `me.png?1` and
+/// `me.png?2` are the same picture (and must not cost another review).
+fn normalized_image_url(url: &str) -> &str {
+    url.split(['?', '#']).next().unwrap_or(url)
+}
+
+/// Actions only admins may take on other accounts (moderators handle
+/// content: suspensions, deactivation, usernames and avatars).
+fn require_admin_for(access: &AccessControl, what: &str) -> Result<(), ApiError> {
+    access
+        .require_admin()
+        .map_err(|_| ApiError::insufficient_role(format!("Only admins can {what}.")))
+}
 
 /// Reads the locale the frontend is currently rendering with, sent as
 /// `x-app-locale` on every server-side API call. Used only as the
@@ -122,6 +149,7 @@ async fn load_managed_target(
 pub async fn find_all_users(
     State(state): State<AppState>,
     access: AccessControl,
+    ip: ClientIp,
     Query(query): Query<UserListQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_staff()?;
@@ -131,6 +159,15 @@ pub async fn find_all_users(
     }
     .resolve();
     let search = query.search_pattern();
+    // Searching accounts (by e-mail, names) is staff access to personal
+    // data: recorded, with the search masked when it is an address.
+    if let Some(q) = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        let mut event = AuditEvent::by(&access, actions::STAFF_CONTENT_VIEWED)
+            .meta(json!({ "view": "user_search", "q": account::mask_identifier_for_staff(q) }))
+            .ip(&ip.0);
+        event.target_type = Some("user");
+        event.spawn(state.audit_repo.clone());
+    }
 
     let (users, total_items) = state
         .user_repo
@@ -190,6 +227,7 @@ pub async fn get_user_overview(
     Path(id): Path<Uuid>,
     State(state): State<AppState>,
     access: AccessControl,
+    ip: ClientIp,
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_staff()?;
 
@@ -198,6 +236,13 @@ pub async fn get_user_overview(
         .find_by_id(id)
         .await?
         .ok_or(ApiError::NotFound)?;
+    // Staff access to someone's account data is recorded (LGPD
+    // accountability).
+    AuditEvent::by(&access, actions::STAFF_CONTENT_VIEWED)
+        .target("user", id, &user.username)
+        .meta(json!({ "view": "overview" }))
+        .ip(&ip.0)
+        .spawn(state.audit_repo.clone());
 
     let (usage, quota_settings, bands) = tokio::try_join!(
         state.quota_repo.report(id),
@@ -218,7 +263,7 @@ pub async fn get_user_overview(
     path = "/api/v1/users/{id}/profile",
     tags = ["Users"],
     summary = "View another user's profile.",
-    description = "Any authenticated user can view any other user's public profile (avatar, bio, location, instruments, bands in common). Staff additionally see privileged details, including the number of open moderation flags.",
+    description = "Any authenticated user sees another account's username and avatar. The rest of the profile (names, bio, location, instruments) is shown to the account itself, to staff and to members of a band in common; everyone else gets those fields empty. Staff additionally see privileged details, including the number of open moderation flags.",
     security(("jwt_token" = [])),
     params(("id" = Uuid, Path, description = "User UUID")),
     responses(
@@ -252,12 +297,18 @@ pub async fn get_user_profile(
         0
     };
 
-    Ok(Json(user.into_profile_view(
-        access.is_staff(),
-        is_self,
-        bands_in_common,
-        open_flags,
-    )))
+    // Personal details only to people with a reason to see them: user
+    // ids leak through band rosters, suggestions and setlists.
+    let full = is_self || access.is_staff() || !bands_in_common.is_empty();
+    let mut view = user.into_profile_view(access.is_staff(), is_self, bands_in_common, open_flags);
+    if !full {
+        view.first_name = None;
+        view.last_name = None;
+        view.bio = None;
+        view.location = None;
+        view.instruments = Vec::new();
+    }
+    Ok(Json(view))
 }
 
 /// Reports per reporter per 24 hours.
@@ -447,7 +498,7 @@ pub async fn create_user(
     path = "/api/v1/users/{id}",
     tags = ["Users"],
     summary = "Update a user",
-    description = "Requires Admin or Moderator role, and the caller must outrank the target. Only admins can change roles. Passwords are changed through `/users/{id}/password-reset`.",
+    description = "Requires Admin or Moderator role, and the caller must outrank the target: nobody manages a peer, so an admin can't change another admin (demoting an admin is done with the `create_superuser --demote` command). Only admins can change roles and e-mail addresses (`INSUFFICIENT_ROLE`); moderators keep usernames, names and activation. A changed address must be verified again, and the owner is told at the previous address. Passwords are changed through `/users/{id}/password-reset`.",
     security(("jwt_token" = [])),
     params(("id" = Uuid, Path, description = "User UUID")),
     request_body = UpdateUserPayload,
@@ -467,38 +518,17 @@ pub async fn update_user(
 ) -> Result<impl IntoResponse, ApiError> {
     payload.validate()?;
 
-    // Role changes are admin-only. An admin may also demote another admin
-    // (the one exception to "never manage a peer"), so a compromised or
-    // departing admin can be stepped down without database access — as
-    // long as at least one other active admin remains.
-    let role_change_on_peer_admin = access.is_admin()
-        && payload.role.is_some()
-        && id != access.user_id()
-        && state
-            .user_repo
-            .find_by_id(id)
-            .await?
-            .is_some_and(|u| u.role == Role::Admin);
+    // Peers are never managed through the API, admins included: a rogue
+    // or compromised admin must not be able to demote another one and
+    // then take their account over. Admins are demoted with the
+    // `create_superuser --demote` command, which needs server access.
+    let target = load_managed_target(&state, &access, id).await?;
 
-    let target = if role_change_on_peer_admin {
-        if payload.username.is_some()
-            || payload.email.is_some()
-            || payload.first_name.is_some()
-            || payload.last_name.is_some()
-            || payload.status.is_some()
-        {
-            return Err(ApiError::insufficient_role(
-                "Only the role of another admin can be changed. Demote them first to edit anything else.",
-            ));
-        }
-        state
-            .user_repo
-            .find_by_id(id)
-            .await?
-            .ok_or(ApiError::NotFound)?
-    } else {
-        load_managed_target(&state, &access, id).await?
-    };
+    // Changing someone's address is a way into their account (password
+    // recovery goes there): admins only.
+    if payload.email.is_some() {
+        require_admin_for(&access, "change another account's e-mail address")?;
+    }
 
     if let Some(new_role) = &payload.role
         && *new_role != target.role
@@ -522,6 +552,36 @@ pub async fn update_user(
         .await?;
 
     let label = payload.username.as_deref().unwrap_or(&target.username);
+
+    // The owner hears about a staff e-mail change at the previous address
+    // (it may be the only way they find out).
+    let new_email = clearable(&payload.email).flatten();
+    let email_changed = payload.email.is_some()
+        && !target
+            .email
+            .as_deref()
+            .unwrap_or_default()
+            .eq_ignore_ascii_case(new_email.as_deref().unwrap_or_default());
+    if email_changed && let Some(account) = state.user_repo.find_account(id).await? {
+        let masked = new_email
+            .as_deref()
+            .map(crate::email::outbox::mask_email)
+            .unwrap_or_else(|| "-".into());
+        account::send_security_notice(
+            &state,
+            &account,
+            "email_changed_by_staff",
+            Some(masked),
+            target.email.as_deref(),
+        )
+        .await;
+        notify(
+            &state,
+            Notification::security_alert(id, "email_changed_by_staff"),
+        )
+        .await;
+        crate::controllers::account::sync_payment_customer(&state, id).await;
+    }
 
     if let Some(new_role) = &payload.role
         && *new_role != target.role
@@ -603,7 +663,7 @@ pub async fn update_user(
     path = "/api/v1/users/{id}",
     tags = ["Users"],
     summary = "Permanently delete a user",
-    description = "Irreversible — prefer deactivation or a suspension. The caller must outrank the target (moderators can only delete regular users; admins can never be deleted, only demoted first). Bands the user owned are handed to their most senior remaining member.",
+    description = "Irreversible — prefer deactivation or a suspension. Admin only (`INSUFFICIENT_ROLE`), and the caller must outrank the target (admins can never be deleted through the API). Bands the user owned are handed to their most senior remaining member.",
     security(("jwt_token" = [])),
     params(("id" = Uuid, Path, description = "User UUID")),
     responses(
@@ -618,15 +678,21 @@ pub async fn delete_user(
     ip: ClientIp,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
+    access.require_staff()?;
+    require_admin_for(&access, "delete accounts")?;
     let target = load_managed_target(&state, &access, id).await?;
 
     // Stop the card being charged before the account is gone.
     crate::services::payments::cancel_paid_subscription(&state, id).await?;
+    let customer = crate::services::payments::customer_of(&state, id).await?;
     state.user_repo.delete(id).await?;
+    crate::services::payments::forget_customer(&state, customer).await;
 
+    // No e-mail in the record: the account is gone and its address with it
+    // (LGPD data minimization); the username identifies the action.
     AuditEvent::by(&access, actions::USER_DELETED)
         .target("user", id, &target.username)
-        .meta(json!({ "role": target.role, "email": target.email }))
+        .meta(json!({ "role": target.role }))
         .ip(&ip.0)
         .record(&*state.audit_repo)
         .await;
@@ -729,7 +795,7 @@ pub async fn unban_user(
     path = "/api/v1/users/{id}/password-reset",
     tags = ["Users"],
     summary = "Set a temporary password for a user",
-    description = "Replaces the password, signs the account out everywhere and (by default) forces a change at next sign-in. The caller must outrank the target.",
+    description = "Replaces the password, signs the account out everywhere and (by default) forces a change at next sign-in. Admin only (`INSUFFICIENT_ROLE`), and the caller must outrank the target. The owner is told by e-mail and notification.",
     security(("jwt_token" = [])),
     params(("id" = Uuid, Path, description = "User UUID")),
     request_body = AdminResetPasswordPayload,
@@ -746,6 +812,8 @@ pub async fn reset_user_password(
     Path(id): Path<Uuid>,
     Json(payload): Json<AdminResetPasswordPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
+    access.require_staff()?;
+    require_admin_for(&access, "reset other accounts' passwords")?;
     let target = load_managed_target(&state, &access, id).await?;
 
     let issues = password_issues(&payload.new_password, Some(&target.username));
@@ -772,6 +840,15 @@ pub async fn reset_user_password(
         .ip(&ip.0)
         .record(&*state.audit_repo)
         .await;
+    if let Some(account) = state.user_repo.find_account(id).await? {
+        account::send_security_notice(&state, &account, "password_reset_by_staff", None, None)
+            .await;
+    }
+    notify(
+        &state,
+        Notification::security_alert(id, "password_reset_by_staff"),
+    )
+    .await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -809,7 +886,7 @@ pub async fn revoke_user_sessions(
     path = "/api/v1/users/{id}/impersonate",
     tags = ["Users"],
     summary = "View the platform as another user",
-    description = "Issues a short-lived, strictly read-only token acting as the target (every write answers `IMPERSONATION_READ_ONLY`). The caller must outrank the target. Every impersonation is recorded in the audit log.",
+    description = "Issues a short-lived, strictly read-only token acting as the target (every write answers `IMPERSONATION_READ_ONLY`, as do the bulk exports; share tokens and invite codes are withheld from its answers). Admin only (`INSUFFICIENT_ROLE`), and the caller must outrank the target. The impersonation and every request made with it are recorded in the audit log.",
     security(("jwt_token" = [])),
     params(("id" = Uuid, Path, description = "User UUID")),
     responses(
@@ -827,6 +904,8 @@ pub async fn impersonate_user(
         return Err(ApiError::impersonation_read_only());
     }
 
+    access.require_staff()?;
+    require_admin_for(&access, "view the platform as another account")?;
     load_managed_target(&state, &access, id).await?;
 
     let account = state
@@ -968,7 +1047,7 @@ pub async fn get_current_user_quotas(
     path = "/api/v1/users/me",
     tags = ["Users"],
     summary = "Update current user profile",
-    description = "Username changes are limited to one every 90 days (`USERNAME_COOLDOWN`). Empty strings clear optional fields (`bio`, `location`, `avatar_url`, names); `instruments: []` clears the list. `avatar_url` must be an `https` image link (`INVALID_IMAGE_URL`) and is reviewed automatically. The e-mail can't be changed here (`BAD_REQUEST`): use `POST /users/me/email/change`.",
+    description = "Username changes are limited to one every 90 days (`USERNAME_COOLDOWN`); a name given up by someone else in the last 90 days is `USERNAME_TAKEN`. Empty strings clear optional fields (`bio`, `location`, `avatar_url`, names); `instruments: []` clears the list. `avatar_url` must be an `https` image link (`INVALID_IMAGE_URL`) and is reviewed automatically; setting a new one needs a verified e-mail (`EMAIL_NOT_VERIFIED`, 403) and is limited to 5 changes an hour and 20 a day (`TOO_MANY_ATTEMPTS`). The e-mail can't be changed here (`BAD_REQUEST`): use `POST /users/me/email/change`.",
     request_body = UpdateCurrentUserPayload,
     security(("jwt_token" = [])),
     responses(
@@ -995,6 +1074,27 @@ pub async fn update_current_user(
         Some(Some(url)) => Some(Some(validate_image_url(&url)?)),
         other => other,
     };
+
+    // A new picture (not the same one with another query string) costs a
+    // paid review: verified accounts only, within the per-account limits.
+    let mut avatar_changed = false;
+    if let Some(Some(url)) = &avatar_url {
+        let account = state
+            .user_repo
+            .find_account(user_id)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        avatar_changed = account.avatar_url.as_deref().map(normalized_image_url)
+            != Some(normalized_image_url(url));
+        if avatar_changed {
+            account::ensure_email_verified(&account)?;
+            for limiter in [&*AVATAR_HOURLY, &*AVATAR_DAILY] {
+                if let Err(wait) = limiter.check(&user_id) {
+                    return Err(too_many_attempts(wait.as_secs() as i64));
+                }
+            }
+        }
+    }
 
     if let Some(new_username) = &payload.username {
         state
@@ -1039,11 +1139,6 @@ pub async fn update_current_user(
     }
 
     if payload.has_profile_fields() {
-        let previous_avatar = state
-            .user_repo
-            .find_by_id(user_id)
-            .await?
-            .and_then(|u| u.avatar_url);
         state
             .user_repo
             .update_profile(
@@ -1057,7 +1152,7 @@ pub async fn update_current_user(
             )
             .await?;
         if let Some(Some(url)) = &avatar_url
-            && previous_avatar.as_deref() != Some(url.as_str())
+            && avatar_changed
         {
             moderation::spawn_avatar_review(&state, user_id, url);
         }
@@ -1121,7 +1216,7 @@ pub async fn check_username_availability(
     path = "/api/v1/users/me/password",
     tags = ["Users"],
     summary = "Change current user password",
-    description = "Requires the current password. The new one must satisfy the policy and differ from the current one. Every session — including the caller's — is revoked, so the client must sign in again.",
+    description = "Requires the current password (`WRONG_PASSWORD`; at most 5 wrong passwords per 15 minutes, then `TOO_MANY_ATTEMPTS`; 10 in a day sign the account out everywhere). The new one must satisfy the policy (including the breached-password check) and differ from the current one. Every session — including the caller's — is revoked, so the client must sign in again.",
     request_body = ChangePasswordPayload,
     security(("jwt_token" = [])),
     responses(
@@ -1157,7 +1252,16 @@ pub async fn change_current_user_password(
         ));
     }
 
-    hashing::verify_password_async(&payload.current_password, &user.password_hash).await?;
+    // Through the same per-account limiter as every other confirmation:
+    // a stolen session must not become a password oracle.
+    account::check_reauth_password(
+        &state,
+        &user,
+        &payload.current_password,
+        "password_change",
+        &ip.0,
+    )
+    .await?;
 
     if payload.current_password == payload.new_password {
         return Err(ApiError::rule(
@@ -1167,7 +1271,7 @@ pub async fn change_current_user_password(
         ));
     }
 
-    let issues = password_issues(&payload.new_password, Some(&user.username));
+    let issues = password_issues_checked(&payload.new_password, Some(&user.username)).await;
     if !issues.is_empty() {
         return Err(ApiError::weak_password(&issues));
     }
@@ -1185,7 +1289,7 @@ pub async fn change_current_user_password(
         .await;
 
     if let Some(email) = user.email.clone() {
-        let locale = crate::services::account::user_locale(&state, user_id)
+        let locale = account::user_locale(&state, user_id)
             .await
             .unwrap_or_else(|_| "en".into());
         if let Err(e) = crate::email::enqueue(
@@ -1289,4 +1393,21 @@ pub async fn get_user_preferences_by_id(
 
     let prefs = state.user_prefs_repo.get_by_user_id(id, "en").await?;
     Ok((StatusCode::OK, Json(prefs)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn avatar_links_compare_without_query_or_fragment() {
+        assert_eq!(
+            normalized_image_url("https://img.example.com/me.png?1"),
+            normalized_image_url("https://img.example.com/me.png?2#x")
+        );
+        assert_ne!(
+            normalized_image_url("https://img.example.com/me.png"),
+            normalized_image_url("https://img.example.com/you.png")
+        );
+    }
 }

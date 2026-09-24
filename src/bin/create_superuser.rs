@@ -4,8 +4,13 @@ use setlyst_api::{
     database::{
         AppState,
         connection::{create_pool, run_migrations},
+        repositories::audit_repository::AuditEvent,
     },
-    models::user::{CreateUserPayload, Role, Status},
+    middlewares::authentication::STAFF_TWO_FACTOR_GRACE_MINUTES,
+    models::{
+        audit::actions,
+        user::{CreateUserPayload, Role, Status, UpdateUserPayload},
+    },
     validations::{password::password_issues, username::validate_username},
 };
 use std::io::{self, Write};
@@ -17,6 +22,14 @@ pub struct Args {
     /// Optional username. If not provided, the program will prompt for it.
     #[arg(short, long)]
     username: Option<String>,
+
+    /// Demotes the admin with this username to a regular user instead of
+    /// creating one. Admins can't change each other's role through the
+    /// API (a compromised admin could otherwise take over a peer), so
+    /// this command, which needs access to the server, is the way to step
+    /// an admin down. The last active admin can't be demoted.
+    #[arg(long, value_name = "USERNAME")]
+    demote: Option<String>,
 }
 
 /// Human-readable explanations for the password policy's issue codes.
@@ -30,6 +43,7 @@ fn describe_issue(issue: &str) -> &'static str {
         "missing_symbol" => "a symbol (e.g. ! @ # -)",
         "contains_username" => "not containing the username",
         "too_common" => "not being a commonly used password",
+        "breached" => "not appearing in a known data breach",
         _ => "meeting the password policy",
     }
 }
@@ -113,6 +127,11 @@ async fn main() {
 
     let state = AppState::new(pool);
 
+    if let Some(username) = args.demote {
+        demote(&state, &username).await;
+        return;
+    }
+
     let username = match args.username {
         Some(name) => match validate_username(&name) {
             Ok(()) => name,
@@ -151,10 +170,55 @@ async fn main() {
     }
 
     match state.user_repo.create(&user, None, false).await {
-        Ok(new_user) => println!("✅ Superuser created! ID: {}", new_user.id),
+        Ok(new_user) => {
+            println!("✅ Superuser created! ID: {}", new_user.id);
+            println!(
+                "⚠️  Staff accounts must enable two-factor authentication: sign in within {STAFF_TWO_FACTOR_GRACE_MINUTES} minutes and turn it on in Settings > Security. Until then, everything but the account settings answers STAFF_TWO_FACTOR_REQUIRED."
+            );
+            println!(
+                "⚠️  The account has no e-mail address: add and verify one in Settings (two-factor setup and password recovery need it)."
+            );
+        }
         Err(e) => {
             eprintln!("❌ Error creating superuser '{}': {e}", user.username);
             std::process::exit(1);
         }
     }
+}
+
+/// Demotes the admin `username` to a regular user (recorded in the audit
+/// log, with every session of the account signed out).
+async fn demote(state: &AppState, username: &str) {
+    let account = match state.user_repo.find_by_username(username).await {
+        Ok(Some(account)) if account.role == Role::Admin => account,
+        Ok(Some(_)) => {
+            eprintln!("❌ '{username}' is not an admin.");
+            std::process::exit(1);
+        }
+        Ok(None) => {
+            eprintln!("❌ No account named '{username}'.");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("❌ Error looking the account up: {e}");
+            std::process::exit(1);
+        }
+    };
+    let payload = UpdateUserPayload {
+        role: Some(Role::User),
+        ..Default::default()
+    };
+    if let Err(e) = state.user_repo.update(account.id, &payload, None).await {
+        eprintln!("❌ Could not demote '{username}': {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = state.user_repo.revoke_sessions(account.id).await {
+        eprintln!("⚠️  Demoted, but the sessions could not be revoked: {e}");
+    }
+    AuditEvent::new(actions::USER_ROLE_CHANGED)
+        .target("user", account.id, &account.username)
+        .meta(serde_json::json!({ "from": Role::Admin, "to": Role::User, "source": "cli" }))
+        .record(&*state.audit_repo)
+        .await;
+    println!("✅ '{username}' is now a regular user; every session was signed out.");
 }

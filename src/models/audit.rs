@@ -56,6 +56,7 @@ pub mod actions {
     pub const BILLING_SETTINGS_UPDATED: &str = "billing.settings_updated";
     pub const BILLING_PLAN_UPDATED: &str = "billing.plan_updated";
     pub const BILLING_TRIALS_GRANTED: &str = "billing.trials_granted";
+    pub const FINANCE_SYNCED: &str = "finance.synced";
     pub const PROMO_CREATED: &str = "promo.created";
     pub const PROMO_UPDATED: &str = "promo.updated";
     pub const PROMOTION_CREATED: &str = "promotion.created";
@@ -80,6 +81,57 @@ pub mod actions {
     pub const MODERATION_BAND_LOGO_REMOVED: &str = "moderation.band_logo_removed";
     pub const MODERATION_USERNAME_RESET: &str = "moderation.username_reset";
     pub const MODERATION_RESCAN: &str = "moderation.rescan";
+
+    // Account security (launch hardening).
+    /// A wrong password or re-auth code typed to confirm a sensitive
+    /// action while signed in; `meta.context` says which.
+    pub const USER_REAUTH_FAILED: &str = "user.reauth_failed";
+    /// Too many wrong confirmations in 24 hours: every session was
+    /// signed out.
+    pub const USER_REAUTH_SESSIONS_REVOKED: &str = "user.reauth_sessions_revoked";
+    pub const USER_PASSWORD_RESET_FAILED: &str = "user.password_reset_failed";
+    pub const USER_LOGIN_SUCCEEDED: &str = "user.login_succeeded";
+    pub const USER_IDENTITY_LINKED: &str = "user.identity_linked";
+    pub const USER_IDENTITY_UNLINKED: &str = "user.identity_unlinked";
+    pub const USER_RECOVERY_CODES_REGENERATED: &str = "user.recovery_codes_regenerated";
+    pub const USER_EMAIL_CHANGE_STARTED: &str = "user.email_change_started";
+    /// An unverified account lost its (never proven) address to the
+    /// person who proved they own it (Google sign-in).
+    pub const USER_EMAIL_DETACHED: &str = "user.email_detached";
+    /// First proof of ownership of the address through password recovery:
+    /// what the unproven owner set up (2FA, linked sign-ins) was removed.
+    pub const USER_SECURITY_RESET: &str = "user.security_reset";
+    pub const USER_COMMUNICATION_CHANGED: &str = "user.communication_changed";
+    /// Unverified account without content, deleted after 7 days.
+    pub const USER_UNVERIFIED_PURGED: &str = "user.unverified_purged";
+    /// A request made while viewing the platform as the target;
+    /// `meta.blocked` when it was refused (exports).
+    pub const USER_IMPERSONATED_READ: &str = "user.impersonated_read";
+    /// Staff opened private content (a song, a setlist, an account
+    /// overview).
+    pub const STAFF_CONTENT_VIEWED: &str = "staff.content_viewed";
+}
+
+/// Documents a consent can be given to (`legal_acceptances.document`).
+pub mod legal_documents {
+    pub const TERMS_OF_USE: &str = "terms_of_use";
+    pub const PRIVACY_POLICY: &str = "privacy_policy";
+    pub const AGE_DECLARATION: &str = "age_declaration";
+    pub const MARKETING_EMAIL: &str = "marketing_email";
+}
+
+/// One consent given (or withdrawn), with its evidence (LGPD art. 8, § 2).
+#[derive(Debug, Clone)]
+pub struct LegalAcceptance {
+    pub user_id: Uuid,
+    pub document: &'static str,
+    pub version: String,
+    pub accepted: bool,
+    /// `register`, `google_signup`, `accept_terms`, `settings`,
+    /// `unsubscribe_link`.
+    pub source: &'static str,
+    pub ip_address: Option<String>,
+    pub user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize, ToSchema)]

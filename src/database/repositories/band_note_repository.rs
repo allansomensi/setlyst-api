@@ -11,7 +11,9 @@ macro_rules! note_select {
         "SELECT n.id, n.band_id, n.author_id, u.username AS author_username,
                 u.avatar_url AS author_avatar_url, n.content, n.color, n.is_pinned, n.due_at,
                 n.created_at, n.updated_at,
-                (SELECT x.username FROM users x WHERE x.id = n.updated_by) AS updated_by_username
+                (SELECT x.username FROM users x WHERE x.id = n.updated_by) AS updated_by_username,
+                (SELECT m.role FROM band_members m
+                  WHERE m.band_id = n.band_id AND m.user_id = n.author_id) AS author_role
          FROM band_notes n
          LEFT JOIN users u ON u.id = n.author_id"
     };

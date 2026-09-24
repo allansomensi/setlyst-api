@@ -16,14 +16,16 @@ use crate::{
             GrantTrialsResponse, Plan, PromoCode, PromoListQuery, PromoRedemption, Promotion,
             RedeemCodePayload, RedeemResponse, RedeemRewardPayload, RedirectResponse,
             ReferralEntry, SubscriptionEvent, SubscriptionSource, UpdatePromoCodePayload,
-            UpdatePromotionPayload, UpsertPlanPayload, check_plan_code,
+            UpdatePromotionPayload, UpsertPlanPayload, WithdrawResponse, check_plan_code,
         },
+        finance::{FinanceOverview, FinanceSyncPayload, FinanceSyncResult},
         notification::Notification,
         resolve_page,
     },
     services::{
         account::too_many_attempts,
         billing::{self, add_credits, grant_plan_time, lock_user_credits},
+        finance,
         notifier::{notify, notify_all},
         payments,
     },
@@ -36,9 +38,11 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
+use serde::Deserialize;
 use serde_json::json;
 use std::{sync::LazyLock, time::Duration};
 use tracing::info;
+use utoipa::IntoParams;
 use uuid::Uuid;
 use validator::Validate;
 
@@ -64,7 +68,7 @@ fn validation(field: &'static str, message: String) -> ApiError {
     path = "/api/v1/billing/me",
     tags = ["Billing"],
     summary = "The caller's plan, features, credits and referrals.",
-    description = "`plan` is the plan in effect (`null` without one); `features` is what the caller may use right now (everything while plans are not enforced).",
+    description = "`plan` is the plan in effect (`null` without one); `features` is what the caller may use right now (everything while plans are not enforced). `withdrawal_eligible_until` is set while the paid subscription can still be withdrawn from with a full refund (`POST /billing/withdraw`); `past_due_since` while its last renewal charge is failing (the plan is kept for 14 days from then).",
     security(("jwt_token" = [])),
     responses((status = 200, description = "Billing state.", body = BillingMe))
 )]
@@ -215,7 +219,7 @@ fn payment_attempt(access: &AccessControl) -> Result<(), ApiError> {
     path = "/api/v1/billing/checkout",
     tags = ["Billing"],
     summary = "Start a paid subscription.",
-    description = "Answers the URL of a checkout page hosted by the payment provider; send the browser there. It returns to `/dashboard/settings?checkout=success` (or `=canceled`) and the subscription shows up in `/billing/me` once the provider confirms the payment (usually within seconds). A running trial carries over: the first charge waits for its end. A running promotion or a redeemed `discount` code comes off the first charge instead. Errors: `PAYMENTS_UNAVAILABLE`, `BILLING_NOT_ENFORCED`, `PLAN_NOT_FOUND`, `PLAN_NOT_PURCHASABLE`, `EMAIL_NOT_VERIFIED`, `PAID_SUBSCRIPTION_ACTIVE` (use `/billing/subscription/change`), `PAYMENT_PROVIDER_ERROR`.",
+    description = "Answers the URL of a checkout page hosted by the payment provider; send the browser there. The buyer must accept the Subscription Terms on that page (cards only). It returns to `/dashboard/settings?checkout=success` (or `=canceled`) and the subscription shows up in `/billing/me` once the provider confirms the payment (usually within seconds). A running trial carries over: the first charge waits for its end. A running promotion or a redeemed `discount` code comes off the first charge. Starting a new checkout expires the pages of earlier ones. Errors: `PAYMENTS_UNAVAILABLE`, `BILLING_NOT_ENFORCED`, `PLAN_NOT_FOUND`, `PLAN_NOT_PURCHASABLE`, `EMAIL_NOT_VERIFIED`, `PAID_SUBSCRIPTION_ACTIVE` (also when the provider already has a live subscription for the account; use `/billing/subscription/change`), `PAYMENT_PROVIDER_ERROR`.",
     request_body = CheckoutPayload,
     security(("jwt_token" = [])),
     responses(
@@ -243,12 +247,12 @@ pub async fn checkout(
     path = "/api/v1/billing/subscription/change",
     tags = ["Billing"],
     summary = "Switch the paid subscription to another plan or interval.",
-    description = "Charges the prorated difference now; the change only applies if that charge succeeds (`PAYMENT_DECLINED` otherwise, with the plan unchanged). Answers the updated billing state. Errors: `NO_PAID_SUBSCRIPTION`, `PLAN_ALREADY_ACTIVE`, `SUBSCRIPTION_PAST_DUE`, `SUBSCRIPTION_CANCELING` (renew it in the portal first), plus those of `/billing/checkout`.",
+    description = "Charges the prorated difference now; the change only applies if that charge succeeds (`PAYMENT_DECLINED` otherwise, with the plan unchanged). When the bank asks the customer to confirm the charge (3-D Secure) the answer is `PAYMENT_ACTION_REQUIRED` with `meta.hosted_invoice_url`: send the browser there; the new plan applies once confirmed. Answers the updated billing state. Errors: `NO_PAID_SUBSCRIPTION`, `PLAN_ALREADY_ACTIVE`, `SUBSCRIPTION_PAST_DUE`, `SUBSCRIPTION_CANCELING` (renew it in the portal first), plus those of `/billing/checkout`.",
     request_body = CheckoutPayload,
     security(("jwt_token" = [])),
     responses(
         (status = 200, description = "Plan changed.", body = BillingMe),
-        (status = 402, description = "The charge was declined."),
+        (status = 402, description = "The charge was declined or needs the customer's confirmation."),
         (status = 409, description = "Nothing to change."),
     )
 )]
@@ -281,6 +285,30 @@ pub async fn portal(
 ) -> Result<impl IntoResponse, ApiError> {
     payment_attempt(&access)?;
     Ok(Json(payments::open_portal(&state, access.user_id()).await?))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/billing/withdraw",
+    tags = ["Billing"],
+    summary = "Withdraw from the paid subscription (7-day right, full refund).",
+    description = "Within 7 days of the subscription's first paid invoice (or of a yearly renewal charge; see `withdrawal_eligible_until` in `/billing/me`): cancels the subscription now, refunds every charge in that window in full and e-mails a confirmation. The account then has no plan; its content stays. Errors: `WITHDRAWAL_NOT_ELIGIBLE` (`meta.eligible_until`; cancel in the portal instead), `NO_PAID_SUBSCRIPTION`, `PAYMENTS_UNAVAILABLE`, `PAYMENT_PROVIDER_ERROR` (nothing is lost: repeat the request).",
+    security(("jwt_token" = [])),
+    responses(
+        (status = 200, description = "Withdrawn and refunded.", body = WithdrawResponse),
+        (status = 409, description = "Outside the window, or no paid subscription."),
+        (status = 502, description = "The payment provider failed."),
+    )
+)]
+pub async fn withdraw(
+    State(state): State<AppState>,
+    access: AccessControl,
+    ip: ClientIp,
+) -> Result<impl IntoResponse, ApiError> {
+    payment_attempt(&access)?;
+    Ok(Json(
+        payments::withdraw(&state, access.user_id(), ip.0).await?,
+    ))
 }
 
 #[utoipa::path(
@@ -326,20 +354,34 @@ pub async fn get_settings(
     Ok(Json(state.billing_repo.get_settings().await?))
 }
 
+/// Query of `PUT /admin/billing/settings`.
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct SettingsQuery {
+    /// Switch `enforced` off even though paid subscriptions are live.
+    #[serde(default)]
+    pub force: bool,
+}
+
 #[utoipa::path(
     put,
     path = "/api/v1/admin/billing/settings",
     tags = ["Billing admin"],
     summary = "Replace the billing settings (admin).",
-    description = "`trial_plan` and every reward's `plan` must exist (`PLAN_NOT_FOUND`); reward ids must be unique. Switching `enforced` on applies plan features and limits to every account: grant trials first (`POST /admin/billing/grant-trials`).",
+    description = "`trial_plan` and every reward's `plan` must exist (`PLAN_NOT_FOUND`); reward ids must be unique. Switching `enforced` on applies plan features and limits to every account: grant trials first (`POST /admin/billing/grant-trials`). Switching it off while paid subscriptions are live answers `BILLING_HAS_PAID_SUBSCRIPTIONS` (409, `meta.live`): those customers keep being charged; repeat with `?force=true` to do it anyway.",
+    params(SettingsQuery),
     request_body = BillingSettings,
     security(("jwt_token" = [])),
-    responses((status = 200, description = "Saved settings.", body = BillingSettings))
+    responses(
+        (status = 200, description = "Saved settings.", body = BillingSettings),
+        (status = 409, description = "Paid subscriptions are live."),
+    )
 )]
 pub async fn update_settings(
     State(state): State<AppState>,
     access: AccessControl,
     ip: ClientIp,
+    Query(query): Query<SettingsQuery>,
     Json(payload): Json<BillingSettings>,
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_admin()?;
@@ -375,6 +417,22 @@ pub async fn update_settings(
     }
 
     let previous = state.billing_repo.get_settings().await?;
+    if previous.enforced && !payload.enforced && !query.force {
+        let live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM subscriptions
+             WHERE source = 'payment' AND status IN ('active', 'past_due')",
+        )
+        .fetch_one(&state.db)
+        .await?;
+        if live > 0 {
+            return Err(ApiError::rule_with_meta(
+                StatusCode::CONFLICT,
+                crate::errors::api_error::codes::BILLING_HAS_PAID_SUBSCRIPTIONS,
+                "Paid subscriptions are live and keep being charged. Confirm to switch plans off anyway.",
+                json!({ "live": live }),
+            ));
+        }
+    }
     state
         .billing_repo
         .set_settings(&payload, access.user_id())
@@ -401,6 +459,54 @@ pub async fn overview(
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_staff()?;
     Ok(Json(state.billing_repo.overview().await?))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/finance",
+    tags = ["Billing admin"],
+    summary = "Revenue, subscribers and recent payments (admin).",
+    security(("jwt_token" = [])),
+    responses((status = 200, description = "Finance report.", body = FinanceOverview))
+)]
+pub async fn finance_overview(
+    State(state): State<AppState>,
+    access: AccessControl,
+) -> Result<impl IntoResponse, ApiError> {
+    access.require_admin()?;
+    Ok(Json(finance::overview(&state).await?))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/finance/sync",
+    tags = ["Billing admin"],
+    summary = "Copy paid invoices and refunds from the payment provider into the ledger (admin). Repeat with the returned cursor until `done`.",
+    request_body = FinanceSyncPayload,
+    security(("jwt_token" = [])),
+    responses(
+        (status = 200, description = "Sync finished.", body = FinanceSyncResult),
+        (status = 409, description = "Payments are not configured."),
+        (status = 502, description = "The payment provider could not be reached.")
+    )
+)]
+pub async fn finance_sync(
+    State(state): State<AppState>,
+    access: AccessControl,
+    ip: ClientIp,
+    Json(payload): Json<FinanceSyncPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    access.require_admin()?;
+    let result = finance::sync_from_provider(&state, payload.cursor.as_deref()).await?;
+    // One entry per sync, not per call of a multi-call run.
+    if payload.cursor.is_none() {
+        AuditEvent::by(&access, actions::FINANCE_SYNCED)
+            .meta(json!({ "scanned": result.scanned, "imported": result.imported }))
+            .ip(&ip.0)
+            .record(&*state.audit_repo)
+            .await;
+    }
+    Ok(Json(result))
 }
 
 #[utoipa::path(

@@ -18,7 +18,7 @@ use validator::{Validate, ValidateEmail, ValidationError};
 /// Version of the Terms of Use / Privacy Policy currently in force (shared
 /// with the web's `LEGAL_VERSION`). Accounts whose `terms_version` differs
 /// are asked to accept the new version.
-pub const CURRENT_TERMS_VERSION: &str = "2026-09-23";
+pub const CURRENT_TERMS_VERSION: &str = "2026-09-24";
 
 /// Longest accepted e-mail address (RFC 5321 path limit).
 pub const MAX_EMAIL_LENGTH: usize = 254;
@@ -136,6 +136,9 @@ pub struct User {
     pub terms_version: Option<String>,
     pub referral_code: Option<String>,
     pub avatar_url: Option<String>,
+    /// Last password change (sign-in challenges older than this are
+    /// refused).
+    pub password_changed_at: Option<NaiveDateTime>,
 }
 
 impl User {
@@ -179,6 +182,7 @@ impl User {
             terms_version: None,
             referral_code: None,
             avatar_url: None,
+            password_changed_at: None,
         }
     }
 
@@ -275,6 +279,23 @@ pub fn validate_email_address(email: &str) -> Result<(), ValidationError> {
 /// is kept and uniqueness is checked case-insensitively instead.
 pub fn normalize_email(email: &str) -> String {
     email.trim().to_string()
+}
+
+/// The mailbox an address really delivers to, for "one per person"
+/// checks (trials): lower case, without a `+tag`, and for Gmail without
+/// dots and with `googlemail.com` folded into `gmail.com`. Never stored
+/// or used to send mail.
+pub fn canonical_email(email: &str) -> String {
+    let email = email.trim().to_lowercase();
+    let Some((local, domain)) = email.rsplit_once('@') else {
+        return email;
+    };
+    let local = local.split('+').next().unwrap_or(local);
+    let (local, domain) = match domain {
+        "gmail.com" | "googlemail.com" => (local.replace('.', ""), "gmail.com"),
+        other => (local.to_string(), other),
+    };
+    format!("{local}@{domain}")
 }
 
 fn validate_optional_locale(locale: &str) -> Result<(), ValidationError> {
@@ -421,6 +442,12 @@ pub struct RegisterPayload {
     /// Opt-in to marketing e-mails. Off unless explicitly chosen.
     #[serde(default)]
     pub marketing_opt_in: bool,
+
+    /// Must be `true` (`AGE_CONFIRMATION_REQUIRED` otherwise): the
+    /// declaration of being 18 or older, or 16 or 17 with a guardian's
+    /// authorization.
+    #[serde(default)]
+    pub age_confirmed: bool,
 
     /// The referral code of the account that invited this one.
     #[validate(custom(function = "validate_referral_code"))]
@@ -702,9 +729,17 @@ pub struct AcceptTermsPayload {
 /// Body of `DELETE /users/me`.
 #[derive(Debug, Deserialize, Serialize, ToSchema, Validate)]
 pub struct DeleteAccountPayload {
-    /// Required when the account has a password.
+    /// The current password (accounts with a password).
     #[validate(length(max = 256))]
     pub password: Option<String>,
+    /// A code from `POST /users/me/reauth/code` (accounts without a
+    /// password).
+    #[validate(length(max = 16))]
+    pub reauth_code: Option<String>,
+    /// A current authenticator code or an unused recovery code, required
+    /// when two-factor authentication is enabled.
+    #[validate(length(max = 16))]
+    pub code: Option<String>,
     /// The account's username, typed to confirm.
     #[validate(length(min = 1, max = 64))]
     pub confirmation: String,
@@ -797,6 +832,20 @@ mod tests {
         assert!(validate_location(&"a".repeat(81)).is_err());
         assert!(validate_referral_code("ABCD2345").is_ok());
         assert!(validate_referral_code("<script>").is_err());
+    }
+
+    #[test]
+    fn canonical_emails_fold_tags_dots_and_case() {
+        assert_eq!(
+            canonical_email(" Ana.Maria+x@GMail.com "),
+            "anamaria@gmail.com"
+        );
+        assert_eq!(canonical_email("a.n.a@googlemail.com"), "ana@gmail.com");
+        assert_eq!(
+            canonical_email("ana.m+promo@example.com"),
+            "ana.m@example.com"
+        );
+        assert_eq!(canonical_email("not-an-email"), "not-an-email");
     }
 
     #[test]

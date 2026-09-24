@@ -228,6 +228,7 @@ pub async fn resolve_flag(
     path = "/api/v1/admin/moderation/rescan",
     tags = ["Moderation"],
     summary = "Re-check every username, avatar and band logo (admin).",
+    description = "Usernames are re-checked right away: `flagged` counts the new flags they raised. Avatars and band logos are re-checked in the background (flags show up in the queue as they are found), skipping images already reviewed; `images_in_background` is `false` when such a scan was still running.",
     security(("jwt_token" = [])),
     responses((status = 200, description = "New flags raised.", body = RescanResponse))
 )]
@@ -237,11 +238,17 @@ pub async fn rescan(
     ip: ClientIp,
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_admin()?;
-    let flagged = moderation::rescan_all(&state).await?;
+    // Usernames are checked right away (a word list, no network); images
+    // need the classifier and continue in the background.
+    let flagged = moderation::rescan_usernames(&state).await?;
+    let images_started = moderation::spawn_image_rescan(&state);
     AuditEvent::by(&access, actions::MODERATION_RESCAN)
-        .meta(json!({ "flagged": flagged }))
+        .meta(json!({ "flagged": flagged, "images_started": images_started }))
         .ip(&ip.0)
         .record(&*state.audit_repo)
         .await;
-    Ok(Json(RescanResponse { flagged }))
+    Ok(Json(RescanResponse {
+        flagged,
+        images_in_background: images_started,
+    }))
 }

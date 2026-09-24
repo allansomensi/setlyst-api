@@ -4,7 +4,7 @@ use crate::{
     models::{quota::QuotaLimits, user_preferences::SUPPORTED_LANGUAGES},
     services::entitlements::Feature,
 };
-use chrono::NaiveDateTime;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{FromRow, Type};
@@ -325,6 +325,22 @@ fn validate_currency(value: &str) -> Result<(), ValidationError> {
     }
 }
 
+/// Smallest amount Stripe charges in BRL (R$ 0,50).
+pub const MIN_CHARGE_CENTS: i32 = 50;
+
+/// A price is either free (`0`, not sold for that interval) or at least
+/// the provider's minimum charge.
+fn validate_chargeable_price(cents: i32) -> Result<(), ValidationError> {
+    if cents == 0 || cents >= MIN_CHARGE_CENTS {
+        Ok(())
+    } else {
+        Err(error(
+            "below_minimum_charge",
+            format!("A price must be 0 (not sold) or at least {MIN_CHARGE_CENTS} cents."),
+        ))
+    }
+}
+
 /// Body of `PUT /admin/plans/{code}`. Omitted fields keep their value; a
 /// new plan needs at least `name`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Validate)]
@@ -333,9 +349,15 @@ pub struct UpsertPlanPayload {
     pub name: Option<Value>,
     #[validate(custom(function = "validate_plan_description"))]
     pub description: Option<Value>,
-    #[validate(range(min = 0, max = 100_000_000))]
+    #[validate(
+        range(min = 0, max = 100_000_000),
+        custom(function = "validate_chargeable_price")
+    )]
     pub price_monthly_cents: Option<i32>,
-    #[validate(range(min = 0, max = 1_000_000_000))]
+    #[validate(
+        range(min = 0, max = 1_000_000_000),
+        custom(function = "validate_chargeable_price")
+    )]
     pub price_yearly_cents: Option<i32>,
     #[validate(custom(function = "validate_currency"))]
     pub currency: Option<String>,
@@ -398,20 +420,35 @@ pub enum SubscriptionSource {
 
 /// Days a paid subscription keeps its plan past `current_period_end`, so a
 /// renewal confirmed late by the payment provider never interrupts access.
-pub const PAYMENT_GRACE_DAYS: i64 = 2;
+pub const RENEWAL_GRACE_DAYS: i64 = 2;
+
+/// Days a paid subscription whose renewal failed (`past_due`) keeps its
+/// plan while the provider retries the charge, counted from the failure
+/// (`past_due_since`). Matches the Subscription Terms ("novas tentativas
+/// por até 14 dias") and the Stripe retry schedule; afterwards the account
+/// has no plan and the subscription is canceled at the provider.
+pub const PAYMENT_GRACE_DAYS: i64 = 14;
+
+/// Days after a paid invoice during which the buyer may withdraw with a
+/// full refund (CDC art. 49).
+pub const WITHDRAWAL_DAYS: i64 = 7;
 
 /// `true` while a subscription with these fields grants its plan at `now`.
 pub fn subscription_in_effect(
     status: SubscriptionStatus,
     source: SubscriptionSource,
     current_period_end: Option<NaiveDateTime>,
+    past_due_since: Option<NaiveDateTime>,
     now: NaiveDateTime,
 ) -> bool {
     let grace = match source {
-        SubscriptionSource::Payment => chrono::Duration::days(PAYMENT_GRACE_DAYS),
+        SubscriptionSource::Payment => chrono::Duration::days(RENEWAL_GRACE_DAYS),
         _ => chrono::Duration::zero(),
     };
-    status.is_live() && current_period_end.is_none_or(|end| end + grace > now)
+    let retrying = status != SubscriptionStatus::PastDue
+        || past_due_since
+            .is_none_or(|since| since + chrono::Duration::days(PAYMENT_GRACE_DAYS) > now);
+    status.is_live() && retrying && current_period_end.is_none_or(|end| end + grace > now)
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize, ToSchema)]
@@ -428,12 +465,21 @@ pub struct Subscription {
     /// `monthly` or `yearly` for paid subscriptions.
     #[sqlx(default)]
     pub billing_interval: Option<String>,
+    /// When a paid subscription's renewal failed (`status = past_due`).
+    #[sqlx(default)]
+    pub past_due_since: Option<NaiveDateTime>,
 }
 
 impl Subscription {
     /// `true` while the subscription grants its plan at `now`.
     pub fn is_effective(&self, now: NaiveDateTime) -> bool {
-        subscription_in_effect(self.status, self.source, self.current_period_end, now)
+        subscription_in_effect(
+            self.status,
+            self.source,
+            self.current_period_end,
+            self.past_due_since,
+            now,
+        )
     }
 }
 
@@ -537,6 +583,37 @@ pub struct BillingMe {
     pub credits: CreditsSummary,
     pub referral: ReferralSummary,
     pub rewards: Vec<Reward>,
+    /// Until when the current paid subscription may be withdrawn from with
+    /// a full refund (`POST /billing/withdraw`): 7 days from its first paid
+    /// invoice (or from a yearly renewal charge). `null` outside that
+    /// window.
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub withdrawal_eligible_until: Option<DateTime<Utc>>,
+    /// When the last renewal charge failed, while the paid subscription is
+    /// `past_due` (the plan is kept for 14 days from here).
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub past_due_since: Option<DateTime<Utc>>,
+}
+
+/// Body of `POST /admin/users/{id}/subscription/refund`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Validate)]
+pub struct StaffRefundPayload {
+    /// Why the subscription is refunded (1 to 500 characters). Kept in the
+    /// audit log and the subscription's history.
+    #[validate(
+        length(min = 1),
+        custom(function = "crate::validations::text::validate_reason")
+    )]
+    pub reason: String,
+}
+
+/// Answer of `POST /billing/withdraw`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WithdrawResponse {
+    /// Minor units refunded to the card.
+    pub refunded_cents: i64,
+    /// ISO 4217, lower case (`brl`).
+    pub currency: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Validate)]
@@ -693,6 +770,9 @@ fn validate_promo_code(code: &str) -> Result<(), ValidationError> {
     }
 }
 
+/// Shortest custom code accepted for `discount` and `plan_grant` codes.
+pub const MIN_VALUABLE_CODE_CHARS: usize = 8;
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Validate)]
 pub struct CreatePromoCodePayload {
     /// Generated when omitted. Stored upper-case.
@@ -752,6 +832,18 @@ impl CreatePromoCodePayload {
             && end <= start
         {
             return Err("'expires_at' must be after 'starts_at'.".into());
+        }
+        // Codes worth money must not be guessable (generated codes have 10
+        // characters).
+        if matches!(self.kind, PromoKind::Discount | PromoKind::PlanGrant)
+            && self
+                .code
+                .as_deref()
+                .is_some_and(|c| c.trim().chars().count() < MIN_VALUABLE_CODE_CHARS)
+        {
+            return Err(format!(
+                "Discount and plan codes need at least {MIN_VALUABLE_CODE_CHARS} characters."
+            ));
         }
         Ok(())
     }

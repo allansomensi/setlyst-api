@@ -143,7 +143,14 @@ impl TestResponse {
 impl TestApp {
     /// Returns `None` (and prints why) when no Postgres server is reachable.
     pub async fn spawn() -> Option<Self> {
+        // CI sets REQUIRE_TEST_DATABASE so a missing or unreachable database
+        // fails the run instead of silently skipping every test.
+        let required = std::env::var("REQUIRE_TEST_DATABASE").is_ok_and(|v| !v.is_empty());
         let Some(server) = server_url() else {
+            assert!(
+                !required,
+                "REQUIRE_TEST_DATABASE is set but TEST_DATABASE_URL is not"
+            );
             eprintln!("⚠️  Skipping integration test: set TEST_DATABASE_URL to run it.");
             return None;
         };
@@ -152,6 +159,7 @@ impl TestApp {
         let mut admin = match PgConnection::connect(&admin_url).await {
             Ok(conn) => conn,
             Err(e) => {
+                assert!(!required, "cannot reach the test database: {e}");
                 eprintln!("⚠️  Skipping integration test: cannot reach Postgres ({e}).");
                 return None;
             }
@@ -292,11 +300,30 @@ impl TestApp {
         response.body["token"].as_str().unwrap().to_string()
     }
 
-    /// Seeds an account with a strong password and signs it in.
+    /// Seeds an account with a strong password and a verified e-mail
+    /// address ([`TestApp::seeded_email`]) and signs it in. Creating bands,
+    /// changing a band logo, public sharing and backup import all need a
+    /// verified address; use [`TestApp::unverified_user`] to test the
+    /// refusal.
     pub async fn user(&self, username: &str, role: Role) -> (Uuid, String) {
+        let id = self.create_user(username, STRONG_PASSWORD, role).await;
+        self.set_verified_email(id, &Self::seeded_email(username))
+            .await;
+        let token = self.login(username, STRONG_PASSWORD).await;
+        (id, token)
+    }
+
+    /// Like [`TestApp::user`], without any e-mail address (as accounts
+    /// created by staff or before e-mail was required).
+    pub async fn unverified_user(&self, username: &str, role: Role) -> (Uuid, String) {
         let id = self.create_user(username, STRONG_PASSWORD, role).await;
         let token = self.login(username, STRONG_PASSWORD).await;
         (id, token)
+    }
+
+    /// The verified address [`TestApp::user`] gives `username`.
+    pub fn seeded_email(username: &str) -> String {
+        format!("{}@seeded.setlyst.test", username.to_lowercase())
     }
 
     pub async fn artist(&self, token: &str, name: &str) -> String {
@@ -431,6 +458,7 @@ impl TestApp {
             "email": email,
             "password": STRONG_PASSWORD,
             "accept_terms": true,
+            "age_confirmed": true,
         });
         if let (Some(obj), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
             obj.extend(extra.clone());
@@ -626,5 +654,56 @@ impl TestApp {
     /// Subscriptions enforced, nobody on a plan: only admins have features.
     pub async fn enforce_billing(&self) {
         self.set_billing(json!({ "enforced": true })).await;
+    }
+}
+
+// ---------------------------------------------------------------------
+// Launch hardening helpers (raw bodies, direct outbox access).
+// ---------------------------------------------------------------------
+
+impl TestApp {
+    /// A request with an arbitrary body and content type (form posts,
+    /// oversized payloads).
+    pub async fn request_raw(
+        &self,
+        method: Method,
+        path: &str,
+        token: Option<&str>,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> TestResponse {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(format!("/api/v1{path}"))
+            .header("x-forwarded-for", next_ip())
+            .header(header::CONTENT_TYPE, content_type);
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let request = builder.body(Body::from(body)).unwrap();
+        let response = self.router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        TestResponse {
+            status,
+            headers,
+            body,
+            bytes,
+        }
+    }
+
+    /// Makes `user_id` owner of an already verified e-mail address.
+    pub async fn set_verified_email(&self, user_id: Uuid, email: &str) {
+        sqlx::query("UPDATE users SET email = $2, email_verified_at = NOW() WHERE id = $1")
+            .bind(user_id)
+            .bind(email)
+            .execute(&self.pool)
+            .await
+            .unwrap();
     }
 }

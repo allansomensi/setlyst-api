@@ -36,7 +36,7 @@ async fn every_call_is_a_valid_stripe_request() {
     let user_id = Uuid::now_v7();
 
     let customer = stripe
-        .create_customer(user_id, Some("anna@example.com"), "anna", "pt-BR")
+        .create_customer(user_id, Some("anna@example.com"), "anna", "pt-BR", 0)
         .await
         .expect("customer");
     assert!(customer.starts_with("cus_"));
@@ -53,10 +53,17 @@ async fn every_call_is_a_valid_stripe_request() {
     let price = stripe.ensure_price(&spec).await.expect("price");
     assert!(price.starts_with("price_"));
 
-    let coupon = stripe.create_coupon(20, "Launch").await.expect("coupon");
+    stripe
+        .update_customer(&customer, Some("anna.new@example.com"), "anna")
+        .await
+        .expect("update customer");
+    let coupon = stripe
+        .create_coupon(20, "Launch", &format!("setlyst-coupon-{user_id}"))
+        .await
+        .expect("coupon");
     assert!(!coupon.is_empty());
 
-    let url = stripe
+    let session = stripe
         .create_checkout(&CheckoutRequest {
             user_id,
             customer_id: customer.clone(),
@@ -69,10 +76,18 @@ async fn every_call_is_a_valid_stripe_request() {
             trial_end: Some(Utc::now().timestamp() + 10 * 86_400),
             coupon_id: None,
             redemption_id: Some(Uuid::now_v7()),
+            terms_message: Some(setlyst_api::services::payments::terms_message("pt-BR")),
+            terms_version: Some("2026-09-24".into()),
+            idempotency_key: format!("setlyst-checkout-{user_id}-1"),
         })
         .await
         .expect("checkout with trial");
-    assert!(url.starts_with("https://"));
+    assert!(session.url.starts_with("https://"));
+    assert!(session.id.starts_with("cs_"));
+    stripe
+        .expire_checkout(&session.id)
+        .await
+        .expect("expire checkout");
     stripe
         .create_checkout(&CheckoutRequest {
             user_id,
@@ -86,6 +101,9 @@ async fn every_call_is_a_valid_stripe_request() {
             trial_end: None,
             coupon_id: Some(coupon),
             redemption_id: None,
+            terms_message: None,
+            terms_version: None,
+            idempotency_key: format!("setlyst-checkout-{user_id}-2"),
         })
         .await
         .expect("checkout with a discount");
@@ -108,5 +126,26 @@ async fn every_call_is_a_valid_stripe_request() {
         .await
         .expect("change");
     assert_eq!(changed.id, subscription.id);
+    stripe
+        .list_subscriptions(Some(&customer), None)
+        .await
+        .expect("list a customer's subscriptions");
+    stripe
+        .list_subscriptions(None, None)
+        .await
+        .expect("list every subscription");
+    stripe
+        .list_subscription_invoices(&subscription.id)
+        .await
+        .expect("list invoices");
+    stripe
+        .refund("pi_123", Some(100), &format!("setlyst-withdraw-{user_id}"))
+        .await
+        .expect("refund");
+    stripe
+        .list_refunds_for_payment("pi_123")
+        .await
+        .expect("refunds of a payment");
+    stripe.payment_fees("pi_123").await.expect("fees");
     stripe.cancel_now(&subscription.id).await.expect("cancel");
 }

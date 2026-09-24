@@ -4,6 +4,7 @@
 //! listing and fanning out always agree on who is targeted.
 
 use crate::{
+    email::{EmailTemplate, OutgoingEmail, outbox::enqueue_many_in},
     errors::api_error::ApiError,
     models::announcement::{
         Announcement, AnnouncementDraft, AnnouncementReceipt, AnnouncementStats, AnnouncementStatus,
@@ -101,9 +102,9 @@ pub struct EmailRecipient {
 #[derive(Debug, Clone, Default)]
 pub struct FanOut {
     pub notifications: u64,
-    /// Verified addresses to e-mail (empty unless the announcement is sent
-    /// by e-mail).
-    pub email_recipients: Vec<EmailRecipient>,
+    /// E-mails queued (to verified addresses; zero unless the announcement
+    /// is sent by e-mail).
+    pub emails: u64,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -613,7 +614,7 @@ impl AnnouncementRepository for AnnouncementRepositoryImpl {
         if announcement.send_email && !ended {
             // Critical announcements are service notices: every targeted
             // verified address gets them.
-            result.email_recipients = sqlx::query_as::<_, EmailRecipient>(concat!(
+            let recipients = sqlx::query_as::<_, EmailRecipient>(concat!(
                 "SELECT u.id AS user_id, u.email, COALESCE(up.language, 'en') AS language
                  FROM announcements a, ",
                 audience_from!(),
@@ -626,6 +627,25 @@ impl AnnouncementRepository for AnnouncementRepositoryImpl {
             .bind(id)
             .fetch_all(&mut *tx)
             .await?;
+            // Queued in the claiming transaction: a failure here leaves the
+            // announcement undelivered (retried) instead of marked delivered
+            // with its e-mails lost.
+            let emails: Vec<OutgoingEmail> = recipients
+                .into_iter()
+                .map(|recipient| OutgoingEmail {
+                    user_id: Some(recipient.user_id),
+                    to: recipient.email,
+                    locale: recipient.language,
+                    template: EmailTemplate::Announcement {
+                        title: announcement.title.clone(),
+                        body: announcement.body.clone(),
+                        level: announcement.level.key().to_string(),
+                        cta_label: announcement.cta_label.clone(),
+                        cta_url: announcement.cta_url.clone(),
+                    },
+                })
+                .collect();
+            result.emails = enqueue_many_in(&mut tx, &emails).await?;
         }
 
         tx.commit().await?;

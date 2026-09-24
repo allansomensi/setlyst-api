@@ -17,6 +17,8 @@ pub enum VerificationPurpose {
     EmailVerification,
     PasswordReset,
     EmailChange,
+    /// Step-up re-authentication of an account without a password.
+    Reauth,
 }
 
 impl VerificationPurpose {
@@ -25,6 +27,7 @@ impl VerificationPurpose {
             VerificationPurpose::EmailVerification => "email_verification",
             VerificationPurpose::PasswordReset => "password_reset",
             VerificationPurpose::EmailChange => "email_change",
+            VerificationPurpose::Reauth => "reauth",
         }
     }
 }
@@ -52,6 +55,11 @@ pub struct LoginChallenge {
     pub attempts: i32,
     pub expires_at: NaiveDateTime,
     pub consumed_at: Option<NaiveDateTime>,
+    pub created_at: NaiveDateTime,
+    /// A Google identity (`sub`, e-mail) to link once this challenge's
+    /// second factor succeeds.
+    pub pending_link_subject: Option<String>,
+    pub pending_link_email: Option<String>,
 }
 
 /// Answer of the endpoints that send a code by e-mail.
@@ -75,9 +83,17 @@ pub struct EmailCodePayload {
 pub struct EmailChangePayload {
     #[validate(custom(function = "validate_email_address"))]
     pub new_email: String,
-    /// Required when the account has a password.
+    /// The current password (accounts with a password).
     #[validate(length(max = 256))]
     pub password: Option<String>,
+    /// A code from `POST /users/me/reauth/code` (accounts without a
+    /// password).
+    #[validate(length(max = 16))]
+    pub reauth_code: Option<String>,
+    /// A current authenticator code or an unused recovery code, required
+    /// when two-factor authentication is enabled.
+    #[validate(length(max = 16))]
+    pub code: Option<String>,
 }
 
 /// `GET /users/me/security`.
@@ -92,12 +108,15 @@ pub struct SecurityOverview {
     pub last_login_at: Option<NaiveDateTime>,
 }
 
-/// Password confirmation for sensitive changes (required when the account
-/// has a password).
+/// Proof of identity for sensitive changes: the current password
+/// (accounts with a password) or a code from `POST /users/me/reauth/code`
+/// (accounts without one).
 #[derive(Debug, Default, Deserialize, Serialize, ToSchema, Validate)]
 pub struct PasswordConfirmationPayload {
     #[validate(length(max = 256))]
     pub password: Option<String>,
+    #[validate(length(max = 16))]
+    pub reauth_code: Option<String>,
 }
 
 /// Answer of `POST /users/me/2fa/setup`.
@@ -123,6 +142,8 @@ pub struct TwoFactorCodePayload {
 pub struct TwoFactorDisablePayload {
     #[validate(length(max = 256))]
     pub password: Option<String>,
+    #[validate(length(max = 16))]
+    pub reauth_code: Option<String>,
     /// A current code from the app, or an unused recovery code.
     #[validate(length(min = 6, max = 16))]
     pub code: String,
@@ -142,4 +163,17 @@ pub struct LinkedIdentity {
     pub email: Option<String>,
     pub created_at: NaiveDateTime,
     pub last_used_at: Option<NaiveDateTime>,
+}
+
+/// Body of `POST /users/me/identities/google`: links a Google account
+/// while signed in (after a fresh proof of identity).
+#[derive(Debug, Deserialize, Serialize, ToSchema, Validate)]
+pub struct LinkGooglePayload {
+    /// The ID token (JWT) obtained from Google Identity Services.
+    #[validate(length(min = 20, max = 8192))]
+    pub id_token: String,
+    #[validate(length(max = 256))]
+    pub password: Option<String>,
+    #[validate(length(max = 16))]
+    pub reauth_code: Option<String>,
 }

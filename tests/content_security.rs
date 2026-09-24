@@ -368,7 +368,11 @@ async fn content_listings_clamp_huge_pages() {
     ] {
         let response = app.get(&path, &user).await;
         assert_eq!(response.status, StatusCode::OK, "{path}: {}", response.body);
-        assert_eq!(response.body["meta"]["current_page"], 100_000, "{path}");
+        assert_eq!(
+            response.body["meta"]["current_page"],
+            setlyst_api::models::MAX_PAGE,
+            "{path}"
+        );
     }
 }
 

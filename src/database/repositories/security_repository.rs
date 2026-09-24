@@ -16,6 +16,31 @@ fn now() -> NaiveDateTime {
     Utc::now().naive_utc()
 }
 
+/// Issuance limits of an e-mailed code, checked in the same transaction
+/// as the insert (with the account row locked), so concurrent requests
+/// can't all pass the resend interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeLimits {
+    /// Minimum seconds between two codes of the purpose.
+    pub resend_seconds: i64,
+    /// At most `max_in_window` codes per `window_seconds`.
+    pub window_seconds: i64,
+    pub max_in_window: i64,
+    /// No new code once this many wrong guesses were made on the
+    /// purpose's codes in the last 24 hours.
+    pub max_failures_per_day: i64,
+}
+
+/// Outcome of [`SecurityRepository::create_code`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeIssue {
+    Issued(Uuid),
+    /// Refused by a limit; retry after this many seconds.
+    Limited {
+        retry_after_seconds: i64,
+    },
+}
+
 /// Result of claiming a second-factor check outside sign-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecondFactorClaim {
@@ -31,7 +56,9 @@ pub trait SecurityRepository: Send + Sync {
     // --- Verification codes ---
 
     /// Stores a new code, invalidating any unconsumed code of the same
-    /// purpose for the user.
+    /// purpose for the user, unless `limits` refuse it. The limits are
+    /// checked with the account row locked, in the insert's transaction.
+    #[allow(clippy::too_many_arguments)]
     async fn create_code(
         &self,
         user_id: Uuid,
@@ -40,21 +67,23 @@ pub trait SecurityRepository: Send + Sync {
         target_email: &str,
         expires_at: NaiveDateTime,
         ip: Option<&str>,
-    ) -> Result<Uuid, ApiError>;
+        limits: CodeLimits,
+    ) -> Result<CodeIssue, ApiError>;
+    /// Counts a wrong guess on a code (for the 24-hour cap).
+    async fn record_code_failure(&self, id: Uuid) -> Result<(), ApiError>;
+    /// Wrong guesses on the user's codes of `purpose` since `since`.
+    async fn code_failures_since(
+        &self,
+        user_id: Uuid,
+        purpose: VerificationPurpose,
+        since: NaiveDateTime,
+    ) -> Result<i64, ApiError>;
     /// The newest unconsumed code of `purpose` for the user.
     async fn latest_code(
         &self,
         user_id: Uuid,
         purpose: VerificationPurpose,
     ) -> Result<Option<VerificationCode>, ApiError>;
-    /// When the newest code of `purpose` was issued, and how many were
-    /// issued since `since` (rate limiting).
-    async fn code_issuance(
-        &self,
-        user_id: Uuid,
-        purpose: VerificationPurpose,
-        since: NaiveDateTime,
-    ) -> Result<(Option<NaiveDateTime>, i64), ApiError>;
     /// Atomically claims one attempt on a code *before* it is checked:
     /// the new attempt count, or `None` when the code is consumed,
     /// expired or already out of attempts. Claiming first (in the same
@@ -77,6 +106,8 @@ pub trait SecurityRepository: Send + Sync {
     /// Stores a new challenge and invalidates every other unconsumed
     /// challenge of the user, so an account never has more than one live
     /// challenge (each fresh password sign-in can't add 5 more guesses).
+    /// `pending_link` is a Google identity (`sub`, e-mail) to link once
+    /// the challenge's second factor succeeds.
     async fn create_challenge(
         &self,
         user_id: Uuid,
@@ -84,6 +115,7 @@ pub trait SecurityRepository: Send + Sync {
         method: &str,
         expires_at: NaiveDateTime,
         ip: Option<&str>,
+        pending_link: Option<(&str, &str)>,
     ) -> Result<(), ApiError>;
     async fn find_challenge(&self, token_hash: &str) -> Result<Option<LoginChallenge>, ApiError>;
     /// Like [`SecurityRepository::claim_code_attempt`], for challenges.
@@ -109,6 +141,30 @@ pub trait SecurityRepository: Send + Sync {
     ) -> Result<SecondFactorClaim, ApiError>;
     /// A correct code: the claimed check doesn't count as a failure.
     async fn release_second_factor_check(&self, user_id: Uuid) -> Result<(), ApiError>;
+
+    // --- Re-authentication (password or e-mailed code while signed in) ---
+
+    /// Like [`SecurityRepository::claim_second_factor_check`], for
+    /// re-authentication proofs.
+    async fn claim_reauth_check(
+        &self,
+        user_id: Uuid,
+        max_failures: i32,
+        window_seconds: i64,
+    ) -> Result<SecondFactorClaim, ApiError>;
+    /// A correct proof: the claimed check doesn't count as a failure.
+    async fn release_reauth_check(&self, user_id: Uuid) -> Result<(), ApiError>;
+    /// Counts a wrong proof in the 24-hour window; returns the failures in
+    /// the window (this one included).
+    async fn record_reauth_failure(&self, user_id: Uuid) -> Result<i32, ApiError>;
+
+    // --- Trials ---
+
+    /// Claims the trial of the (hashed, canonical) address. `false` when
+    /// it was already claimed, by any account, ever.
+    async fn claim_trial(&self, email_hash: &[u8]) -> Result<bool, ApiError>;
+    /// Gives a claim back (no trial was actually started).
+    async fn release_trial_claim(&self, email_hash: &[u8]) -> Result<(), ApiError>;
 
     // --- Recovery codes ---
 
@@ -164,9 +220,46 @@ impl SecurityRepository for SecurityRepositoryImpl {
         target_email: &str,
         expires_at: NaiveDateTime,
         ip: Option<&str>,
-    ) -> Result<Uuid, ApiError> {
+        limits: CodeLimits,
+    ) -> Result<CodeIssue, ApiError> {
         let mut tx = self.db.begin().await?;
         let timestamp = now();
+        // Serializes issuance per account: concurrent requests all see
+        // the code the first one inserted.
+        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        let (last, in_window, failures): (Option<NaiveDateTime>, i64, i64) = sqlx::query_as(
+            "SELECT MAX(created_at),
+                    COUNT(*) FILTER (WHERE created_at >= $3),
+                    COALESCE(SUM(failed_attempts) FILTER (WHERE created_at >= $4), 0)
+             FROM verification_codes WHERE user_id = $1 AND purpose = $2",
+        )
+        .bind(user_id)
+        .bind(purpose)
+        .bind(timestamp - chrono::Duration::seconds(limits.window_seconds))
+        .bind(timestamp - chrono::Duration::hours(24))
+        .fetch_one(&mut *tx)
+        .await?;
+        if let Some(last) = last {
+            let wait = limits.resend_seconds - (timestamp - last).num_seconds();
+            if wait > 0 {
+                return Ok(CodeIssue::Limited {
+                    retry_after_seconds: wait,
+                });
+            }
+        }
+        if in_window >= limits.max_in_window {
+            return Ok(CodeIssue::Limited {
+                retry_after_seconds: limits.window_seconds.min(3600),
+            });
+        }
+        if failures >= limits.max_failures_per_day {
+            return Ok(CodeIssue::Limited {
+                retry_after_seconds: 3600,
+            });
+        }
         sqlx::query(
             "UPDATE verification_codes SET consumed_at = $3
              WHERE user_id = $1 AND purpose = $2 AND consumed_at IS NULL",
@@ -193,7 +286,34 @@ impl SecurityRepository for SecurityRepositoryImpl {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(id)
+        Ok(CodeIssue::Issued(id))
+    }
+
+    async fn record_code_failure(&self, id: Uuid) -> Result<(), ApiError> {
+        sqlx::query(
+            "UPDATE verification_codes SET failed_attempts = failed_attempts + 1 WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn code_failures_since(
+        &self,
+        user_id: Uuid,
+        purpose: VerificationPurpose,
+        since: NaiveDateTime,
+    ) -> Result<i64, ApiError> {
+        Ok(sqlx::query_scalar(
+            "SELECT COALESCE(SUM(failed_attempts), 0)::BIGINT FROM verification_codes
+             WHERE user_id = $1 AND purpose = $2 AND created_at >= $3",
+        )
+        .bind(user_id)
+        .bind(purpose)
+        .bind(since)
+        .fetch_one(&self.db)
+        .await?)
     }
 
     async fn latest_code(
@@ -212,24 +332,6 @@ impl SecurityRepository for SecurityRepositoryImpl {
         .bind(purpose)
         .fetch_optional(&self.db)
         .await?)
-    }
-
-    async fn code_issuance(
-        &self,
-        user_id: Uuid,
-        purpose: VerificationPurpose,
-        since: NaiveDateTime,
-    ) -> Result<(Option<NaiveDateTime>, i64), ApiError> {
-        let row: (Option<NaiveDateTime>, i64) = sqlx::query_as(
-            "SELECT MAX(created_at), COUNT(*) FILTER (WHERE created_at >= $3)
-             FROM verification_codes WHERE user_id = $1 AND purpose = $2",
-        )
-        .bind(user_id)
-        .bind(purpose)
-        .bind(since)
-        .fetch_one(&self.db)
-        .await?;
-        Ok(row)
     }
 
     async fn claim_code_attempt(
@@ -278,6 +380,7 @@ impl SecurityRepository for SecurityRepositoryImpl {
         method: &str,
         expires_at: NaiveDateTime,
         ip: Option<&str>,
+        pending_link: Option<(&str, &str)>,
     ) -> Result<(), ApiError> {
         let timestamp = now();
         let mut tx = self.db.begin().await?;
@@ -297,8 +400,9 @@ impl SecurityRepository for SecurityRepositoryImpl {
         .await?;
         sqlx::query(
             "INSERT INTO login_challenges (id, user_id, token_hash, method, attempts, expires_at,
-                                           ip_address, created_at)
-             VALUES ($1, $2, $3, $4, 0, $5, $6, $7)",
+                                           ip_address, created_at, pending_link_subject,
+                                           pending_link_email)
+             VALUES ($1, $2, $3, $4, 0, $5, $6, $7, $8, $9)",
         )
         .bind(Uuid::now_v7())
         .bind(user_id)
@@ -307,6 +411,8 @@ impl SecurityRepository for SecurityRepositoryImpl {
         .bind(expires_at)
         .bind(ip)
         .bind(timestamp)
+        .bind(pending_link.map(|(subject, _)| subject))
+        .bind(pending_link.map(|(_, email)| email))
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -315,7 +421,8 @@ impl SecurityRepository for SecurityRepositoryImpl {
 
     async fn find_challenge(&self, token_hash: &str) -> Result<Option<LoginChallenge>, ApiError> {
         Ok(sqlx::query_as::<_, LoginChallenge>(
-            "SELECT id, user_id, method, attempts, expires_at, consumed_at
+            "SELECT id, user_id, method, attempts, expires_at, consumed_at, created_at,
+                    pending_link_subject, pending_link_email
              FROM login_challenges WHERE token_hash = $1",
         )
         .bind(token_hash)
@@ -406,6 +513,100 @@ impl SecurityRepository for SecurityRepositoryImpl {
         .bind(user_id)
         .execute(&self.db)
         .await?;
+        Ok(())
+    }
+
+    async fn claim_reauth_check(
+        &self,
+        user_id: Uuid,
+        max_failures: i32,
+        window_seconds: i64,
+    ) -> Result<SecondFactorClaim, ApiError> {
+        let timestamp = now();
+        let window_start = timestamp - chrono::Duration::seconds(window_seconds);
+        // Same fixed-window upsert as the second-factor limiter.
+        let claimed: Option<i32> = sqlx::query_scalar(
+            "INSERT INTO reauth_attempts (user_id, window_started_at, failures, day_started_at, day_failures)
+             VALUES ($1, $2, 1, $2, 0)
+             ON CONFLICT (user_id) DO UPDATE SET
+                 failures = CASE WHEN reauth_attempts.window_started_at <= $3
+                                 THEN 1 ELSE reauth_attempts.failures + 1 END,
+                 window_started_at = CASE WHEN reauth_attempts.window_started_at <= $3
+                                          THEN $2 ELSE reauth_attempts.window_started_at END
+             WHERE reauth_attempts.window_started_at <= $3
+                OR reauth_attempts.failures < $4
+             RETURNING failures",
+        )
+        .bind(user_id)
+        .bind(timestamp)
+        .bind(window_start)
+        .bind(max_failures)
+        .fetch_optional(&self.db)
+        .await?;
+        if let Some(failures) = claimed {
+            return Ok(SecondFactorClaim::Allowed { failures });
+        }
+        let started: Option<NaiveDateTime> =
+            sqlx::query_scalar("SELECT window_started_at FROM reauth_attempts WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_optional(&self.db)
+                .await?;
+        let retry_after_seconds = started
+            .map(|s| (s + chrono::Duration::seconds(window_seconds) - timestamp).num_seconds())
+            .unwrap_or(window_seconds)
+            .max(1);
+        Ok(SecondFactorClaim::Limited {
+            retry_after_seconds,
+        })
+    }
+
+    async fn release_reauth_check(&self, user_id: Uuid) -> Result<(), ApiError> {
+        sqlx::query(
+            "UPDATE reauth_attempts SET failures = GREATEST(failures - 1, 0) WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn record_reauth_failure(&self, user_id: Uuid) -> Result<i32, ApiError> {
+        let timestamp = now();
+        let day_start = timestamp - chrono::Duration::hours(24);
+        Ok(sqlx::query_scalar(
+            "INSERT INTO reauth_attempts (user_id, window_started_at, failures, day_started_at, day_failures)
+             VALUES ($1, $2, 0, $2, 1)
+             ON CONFLICT (user_id) DO UPDATE SET
+                 day_failures = CASE WHEN reauth_attempts.day_started_at <= $3
+                                     THEN 1 ELSE reauth_attempts.day_failures + 1 END,
+                 day_started_at = CASE WHEN reauth_attempts.day_started_at <= $3
+                                       THEN $2 ELSE reauth_attempts.day_started_at END
+             RETURNING day_failures",
+        )
+        .bind(user_id)
+        .bind(timestamp)
+        .bind(day_start)
+        .fetch_one(&self.db)
+        .await?)
+    }
+
+    async fn claim_trial(&self, email_hash: &[u8]) -> Result<bool, ApiError> {
+        let result = sqlx::query(
+            "INSERT INTO trial_claims (email_hash, claimed_at) VALUES ($1, $2)
+             ON CONFLICT (email_hash) DO NOTHING",
+        )
+        .bind(email_hash)
+        .bind(now())
+        .execute(&self.db)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn release_trial_claim(&self, email_hash: &[u8]) -> Result<(), ApiError> {
+        sqlx::query("DELETE FROM trial_claims WHERE email_hash = $1")
+            .bind(email_hash)
+            .execute(&self.db)
+            .await?;
         Ok(())
     }
 

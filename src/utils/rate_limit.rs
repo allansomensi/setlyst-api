@@ -61,6 +61,47 @@ impl<K: Eq + Hash + Clone> SlidingWindowLimiter<K> {
     }
 }
 
+/// Shared per-account limits for heavy endpoints, so every route (whoever
+/// owns its controller) counts against the same window.
+pub mod presets {
+    use super::SlidingWindowLimiter;
+    use std::{sync::LazyLock, time::Duration};
+    use uuid::Uuid;
+
+    const HOUR: Duration = Duration::from_secs(3600);
+
+    /// `POST /backup/import`: 3 per account per hour. Each import is one
+    /// long transaction.
+    pub static BACKUP_IMPORT: LazyLock<SlidingWindowLimiter<Uuid>> =
+        LazyLock::new(|| SlidingWindowLimiter::new(3, HOUR));
+    /// `GET /backup/export`: 10 per account per hour.
+    pub static BACKUP_EXPORT: LazyLock<SlidingWindowLimiter<Uuid>> =
+        LazyLock::new(|| SlidingWindowLimiter::new(10, HOUR));
+    /// `GET /songs/export/chordpro` (the whole library): 10 per account per
+    /// hour.
+    pub static CHORDPRO_EXPORT: LazyLock<SlidingWindowLimiter<Uuid>> =
+        LazyLock::new(|| SlidingWindowLimiter::new(10, HOUR));
+    /// `GET /users/me/data-export` (LGPD): 10 per account per hour. Meant
+    /// for the account controller:
+    /// `presets::limit(&presets::DATA_EXPORT, access.user_id())?`.
+    pub static DATA_EXPORT: LazyLock<SlidingWindowLimiter<Uuid>> =
+        LazyLock::new(|| SlidingWindowLimiter::new(10, HOUR));
+    /// PDF exports by a signed-in account: 30 per minute.
+    pub static PDF_EXPORT: LazyLock<SlidingWindowLimiter<Uuid>> =
+        LazyLock::new(|| SlidingWindowLimiter::new(30, Duration::from_secs(60)));
+
+    /// Records a hit of `user_id` on `limiter`; `TOO_MANY_ATTEMPTS` (429,
+    /// `meta.retry_after_seconds`) when the window is full.
+    pub fn limit(
+        limiter: &SlidingWindowLimiter<Uuid>,
+        user_id: Uuid,
+    ) -> Result<(), crate::errors::api_error::ApiError> {
+        limiter.check(&user_id).map_err(|retry| {
+            crate::services::account::too_many_attempts(retry.as_secs().max(1) as i64)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

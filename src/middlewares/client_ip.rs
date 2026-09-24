@@ -13,6 +13,11 @@
 //!    left of the first untrusted hop may have been written by the client).
 //! 3. Otherwise → the socket peer.
 //!
+//! Rate limits are keyed by [`rate_limit_key`], not by the address itself:
+//! an IPv6 client typically controls a whole /64 (every VPS and most home
+//! connections do) and could rotate through 2^64 addresses, getting a
+//! fresh bucket each time. Audit logs keep the full address.
+//!
 //! Requests without socket information at all (the router driven
 //! in-process, as the integration tests do) have no peer to distrust: the
 //! forwarding header is then treated as coming from a trusted hop, and when
@@ -22,7 +27,7 @@
 use crate::config::Config;
 use axum::{extract::ConnectInfo, http::HeaderMap, http::Request};
 use ipnet::IpNet;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tower_governor::{GovernorError, key_extractor::KeyExtractor};
 
 pub const INTERNAL_SECRET_HEADER: &str = "x-setlyst-internal";
@@ -75,6 +80,20 @@ fn normalize(ip: IpAddr) -> IpAddr {
             .to_ipv4_mapped()
             .map(IpAddr::V4)
             .unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    }
+}
+
+/// The rate-limit bucket of a client address: IPv4 addresses as they are,
+/// IPv6 addresses truncated to their /64 network (the smallest block a
+/// single subscriber normally gets). IPv4-mapped IPv6 addresses count as
+/// their IPv4 form.
+pub fn rate_limit_key(ip: IpAddr) -> IpAddr {
+    match normalize(ip) {
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
         v4 => v4,
     }
 }
@@ -150,8 +169,9 @@ pub fn resolve_with_config(peer: Option<IpAddr>, headers: &HeaderMap) -> Option<
     }
 }
 
-/// `tower_governor` key extractor built on [`resolve_client_ip`]. Never
-/// fails: an unknown origin maps to [`UNKNOWN_CLIENT`].
+/// `tower_governor` key extractor built on [`resolve_client_ip`], bucketed
+/// with [`rate_limit_key`] (a whole IPv6 /64 shares one key). Never fails:
+/// an unknown origin maps to [`UNKNOWN_CLIENT`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClientIpKeyExtractor;
 
@@ -163,7 +183,9 @@ impl KeyExtractor for ClientIpKeyExtractor {
     }
 
     fn extract<T>(&self, req: &Request<T>) -> Result<Self::Key, GovernorError> {
-        Ok(resolve_with_config(peer_of(req), req.headers()).unwrap_or(UNKNOWN_CLIENT))
+        Ok(resolve_with_config(peer_of(req), req.headers())
+            .map(rate_limit_key)
+            .unwrap_or(UNKNOWN_CLIENT))
     }
 
     fn key_name(&self, key: &Self::Key) -> Option<String> {
@@ -329,6 +351,51 @@ mod tests {
         assert_eq!(
             resolve_client_ip(Some(ip("::ffff:203.0.113.5")), &HeaderMap::new(), &policy),
             Some(ip("203.0.113.5"))
+        );
+    }
+
+    #[test]
+    fn ipv6_clients_are_rate_limited_per_64() {
+        // Every address of one /64 lands in the same bucket...
+        assert_eq!(
+            rate_limit_key(ip("2001:db8:1:2:aaaa:bbbb:cccc:dddd")),
+            ip("2001:db8:1:2::")
+        );
+        assert_eq!(
+            rate_limit_key(ip("2001:db8:1:2::1")),
+            rate_limit_key(ip("2001:db8:1:2:ffff:ffff:ffff:ffff"))
+        );
+        // ...a neighbouring /64 does not.
+        assert_ne!(
+            rate_limit_key(ip("2001:db8:1:2::1")),
+            rate_limit_key(ip("2001:db8:1:3::1"))
+        );
+        // IPv4 (and IPv4-mapped IPv6) keep the full address.
+        assert_eq!(rate_limit_key(ip("203.0.113.7")), ip("203.0.113.7"));
+        assert_eq!(rate_limit_key(ip("::ffff:203.0.113.7")), ip("203.0.113.7"));
+        assert_ne!(
+            rate_limit_key(ip("203.0.113.7")),
+            rate_limit_key(ip("203.0.113.8"))
+        );
+    }
+
+    #[test]
+    fn the_key_extractor_buckets_while_resolution_keeps_the_full_address() {
+        let rotated = |last: &str| {
+            Request::builder()
+                .header("x-forwarded-for", format!("2001:db8:5:6::{last}"))
+                .body(())
+                .unwrap()
+        };
+        let a = ClientIpKeyExtractor.extract(&rotated("1")).unwrap();
+        let b = ClientIpKeyExtractor.extract(&rotated("beef")).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, ip("2001:db8:5:6::"));
+        // The audit path (`resolve_with_config`) still sees the exact address.
+        let req = rotated("beef");
+        assert_eq!(
+            resolve_with_config(peer_of(&req), req.headers()),
+            Some(ip("2001:db8:5:6::beef"))
         );
     }
 

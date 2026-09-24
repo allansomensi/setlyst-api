@@ -63,6 +63,9 @@ pub struct BandNoteRow {
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
     pub updated_by_username: Option<String>,
+    /// The author's current role in the band (`None` once they left).
+    #[sqlx(default)]
+    pub author_role: Option<crate::models::band::BandRole>,
 }
 
 impl BandNoteRow {

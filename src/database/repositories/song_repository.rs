@@ -1,3 +1,4 @@
+use crate::database::repositories::quota_repository::QuotaGuard;
 use crate::{
     errors::api_error::ApiError,
     models::{
@@ -56,11 +57,14 @@ pub trait SongRepository: Send + Sync {
     /// their bands) in which the song counts: personal setlists first,
     /// then by band with the repertoire first, then by title.
     async fn setlists_of(&self, id: Uuid, user_id: Uuid) -> Result<Vec<SongSetlistRef>, ApiError>;
+    /// Creates a personal song. `quota` is enforced inside the insert's
+    /// transaction (see [`QuotaGuard`]).
     async fn create(
         &self,
         payload: &CreateSongPayload,
         tags: &[String],
         user_id: Uuid,
+        quota: &[QuotaGuard],
     ) -> Result<Song, ApiError>;
     async fn update(
         &self,
@@ -299,6 +303,7 @@ impl SongRepository for SongRepositoryImpl {
         payload: &CreateSongPayload,
         tags: &[String],
         user_id: Uuid,
+        quota: &[QuotaGuard],
     ) -> Result<Song, ApiError> {
         let links = normalize_links(payload.links.as_deref().unwrap_or_default())?;
         let mut new_song = Song::new(payload, user_id);
@@ -308,6 +313,7 @@ impl SongRepository for SongRepositoryImpl {
         new_song.links = Links::from_stored(links.clone());
 
         let mut tx = self.db.begin().await?;
+        QuotaGuard::enforce_all(quota, &mut tx).await?;
 
         sqlx::query(
             "INSERT INTO songs (id, title, artist_id, user_id, band_id, forked_from, tempo, lyrics, tonality, genre, duration,

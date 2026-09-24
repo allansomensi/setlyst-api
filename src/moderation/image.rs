@@ -104,6 +104,34 @@ impl ImageVerdict {
     }
 }
 
+/// The part of an image URL that identifies the image for moderation:
+/// lowercase scheme and host plus the path, without query string or
+/// fragment. `...logo.png?v=2` is the same picture as `...logo.png`, so
+/// changing only the query must not buy another (billed) classification.
+pub fn normalize_image_url(url: &str) -> String {
+    let url = url.trim();
+    let without_fragment = url.split('#').next().unwrap_or(url);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    match without_query.split_once("://") {
+        Some((scheme, rest)) => {
+            let (host, path) = match rest.find('/') {
+                Some(i) => rest.split_at(i),
+                None => (rest, ""),
+            };
+            format!(
+                "{}://{}{}",
+                scheme.to_ascii_lowercase(),
+                host.to_ascii_lowercase(),
+                path
+            )
+        }
+        None => without_query.to_string(),
+    }
+}
+
 /// URL-only heuristics. Never touches the network.
 pub fn check_url_heuristics(url: &str) -> ImageVerdict {
     let lower = url.to_ascii_lowercase();
@@ -241,6 +269,26 @@ mod tests {
         assert_eq!(
             request.headers().get("x-goog-api-key").unwrap(),
             "secret-vision-key"
+        );
+    }
+
+    #[test]
+    fn image_urls_normalize_to_scheme_host_and_path() {
+        assert_eq!(
+            normalize_image_url("HTTPS://CDN.Example.com/Logos/A.png?v=2#x"),
+            "https://cdn.example.com/Logos/A.png"
+        );
+        assert_eq!(
+            normalize_image_url("https://cdn.example.com/a.png?1"),
+            normalize_image_url("https://cdn.example.com/a.png?2")
+        );
+        assert_ne!(
+            normalize_image_url("https://cdn.example.com/a.png"),
+            normalize_image_url("https://cdn.example.com/b.png")
+        );
+        assert_eq!(
+            normalize_image_url("https://example.com"),
+            "https://example.com"
         );
     }
 

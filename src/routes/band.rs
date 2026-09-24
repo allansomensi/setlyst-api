@@ -102,6 +102,6 @@ pub fn create_invite_routes(state: AppState) -> Router {
 
     Router::new()
         .route("/{code}/accept", post(band::accept_band_invite))
-        .layer(GovernorLayer::new(governor))
+        .layer(GovernorLayer::new(pruned!(governor)))
         .with_state(state)
 }
