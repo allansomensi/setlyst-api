@@ -35,6 +35,7 @@ async fn public_pages_only_expose_performance_data() {
             "/songs",
             &user,
             json!({ "title": "Pública", "artist_id": artist, "tags": ["segredo"], "energy": 2,
+                    "lyrics": "letra inedita nao publicada",
                     "links": [{ "url": "https://youtu.be/x" }] }),
         )
         .await;
@@ -74,7 +75,6 @@ async fn public_pages_only_expose_performance_data() {
             "duration",
             "energy",
             "links",
-            "lyrics",
             "position",
             "tempo",
             "time_signature",
@@ -93,6 +93,7 @@ async fn public_pages_only_expose_performance_data() {
         "user_id",
         "band_id",
         "segredo",
+        "letra inedita",
         "updated_by",
         "created_at",
         "publisher",

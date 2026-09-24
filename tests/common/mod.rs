@@ -511,6 +511,29 @@ impl TestApp {
         .execute(&self.pool)
         .await
         .unwrap();
+        sqlx::query(
+            "UPDATE verification_code_requests SET created_at = created_at - INTERVAL '2 minutes'
+             WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    /// Makes the live codes of the user look older than a code's lifetime
+    /// allows re-sending, so the next request issues a fresh code.
+    pub async fn expire_codes(&self, user_id: Uuid) {
+        sqlx::query(
+            "UPDATE verification_codes SET expires_at = NOW() - INTERVAL '1 minute',
+                    created_at = created_at - INTERVAL '2 minutes'
+             WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+        self.age_codes(user_id).await;
     }
 
     /// Verifies the e-mail of the signed-in user with the code already sent.

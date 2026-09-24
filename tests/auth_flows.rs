@@ -226,6 +226,9 @@ async fn sign_in_by_email_and_lockout_after_repeated_failures() {
     assert_eq!(by_email.body["two_factor_required"], false);
     assert_eq!(by_email.body["terms_accepted"], true);
     assert_eq!(by_email.body["email_verified"], false);
+    // Security notices only go to a proven address.
+    let session = by_email.body["token"].as_str().unwrap().to_string();
+    app.verify_email(&session, "locky@example.com").await;
 
     // Five wrong passwords from one network: every answer is a plain
     // INVALID_CREDENTIALS (a lock never tells a guesser anything)...
@@ -243,9 +246,18 @@ async fn sign_in_by_email_and_lockout_after_repeated_failures() {
         .await;
     assert_eq!(locked, 1);
     // ...and that network is locked out: even the right password answers
-    // like a wrong one there.
+    // like a wrong one there. (The sign-in route's own per-IP governor
+    // allows bursts of 5 and then 2 a second: a sixth request right away
+    // would get its 429 instead of the lockout's answer.)
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     let right_from_attacker = login_from(&app, attacker, "locky", STRONG_PASSWORD).await;
-    assert_eq!(right_from_attacker.code(), "INVALID_CREDENTIALS");
+    assert_eq!(
+        right_from_attacker.code(),
+        "INVALID_CREDENTIALS",
+        "{} {}",
+        right_from_attacker.status,
+        right_from_attacker.body
+    );
     // The owner, elsewhere, is not affected, and got an e-mail.
     let owner = login_from(&app, "203.0.113.10", "locky", STRONG_PASSWORD).await;
     assert_eq!(owner.status, StatusCode::OK, "{}", owner.body);
@@ -624,6 +636,8 @@ async fn email_codes_are_rate_limited_and_the_email_changes_through_a_code() {
             .unwrap()
             > 0
     );
+    // Security notices only go to a proven address.
+    app.verify_email(&token, "old@example.com").await;
 
     // Direct e-mail edits are refused.
     let direct = app
@@ -1698,6 +1712,8 @@ async fn accounts_without_a_password_confirm_sensitive_actions_with_an_emailed_c
 async fn wrong_confirmation_passwords_are_limited_and_eventually_sign_out() {
     let app = app!();
     let (user_id, token) = app.registered_user("oracle", "oracle@example.com").await;
+    // Security notices only go to a proven address.
+    app.verify_email(&token, "oracle@example.com").await;
     let change =
         |current: &str| json!({ "current_password": current, "new_password": "N3w!Password" });
 
@@ -1783,7 +1799,9 @@ async fn wrong_codes_are_capped_per_account_across_fresh_codes() {
         }
     }
 
-    // Ten wrong codes in a day: no new code, and nothing is checked.
+    // Ten wrong codes in a day: no new code, and nothing is checked. The
+    // answer is the plain `INVALID_CODE` of an unknown identifier (a 429
+    // would say the account exists).
     app.age_codes(user_id).await;
     forgot().await;
     assert_eq!(codes_sent().await, 2, "no third code");
@@ -1793,8 +1811,18 @@ async fn wrong_codes_are_capped_per_account_across_fresh_codes() {
             json!({ "identifier": "capped", "code": "123456", "new_password": "N3w!Password" }),
         )
         .await;
-    assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(refused.code(), "TOO_MANY_ATTEMPTS");
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused.code(), "INVALID_CODE");
+    assert!(refused.body.get("meta").is_none(), "{}", refused.body);
+    let audited = app
+        .wait_for_count(
+            "SELECT COUNT(*) FROM audit_logs WHERE action = 'user.password_reset_failed'
+             AND target_id = $1 AND metadata->>'reason' = 'TOO_MANY_ATTEMPTS'",
+            user_id,
+            1,
+        )
+        .await;
+    assert_eq!(audited, 1, "the real reason is audited");
 }
 
 async fn identity_count(app: &TestApp, id: Uuid) -> i64 {

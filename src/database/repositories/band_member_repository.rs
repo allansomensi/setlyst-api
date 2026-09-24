@@ -172,6 +172,18 @@ async fn delete_membership(
     .bind(user_id)
     .execute(&mut *tx)
     .await?;
+    // Nor can the band still fork the ex-member's personal song through a
+    // suggestion they made while a member: the offer leaves with them.
+    sqlx::query(
+        "UPDATE band_song_suggestions
+         SET status = 'withdrawn', resolved_at = $3, updated_at = $3
+         WHERE band_id = $1 AND suggested_by = $2 AND status = 'open'",
+    )
+    .bind(band_id)
+    .bind(user_id)
+    .bind(chrono::Utc::now().naive_utc())
+    .execute(&mut *tx)
+    .await?;
     Ok(())
 }
 
@@ -308,6 +320,9 @@ impl BandMemberRepository for BandMemberRepositoryImpl {
         if previous >= actor || (role >= actor && actor != BandRole::Owner) {
             error!(%band_id, %actor_id, %user_id, "Band role change outside the actor's authority.");
             return Err(ApiError::Forbidden);
+        }
+        if role == previous {
+            return Err(ApiError::NotModified);
         }
         // The same conditions again in the write itself: defense in depth
         // should the lock ever be bypassed.
@@ -458,6 +473,10 @@ impl BandMemberRepository for BandMemberRepositoryImpl {
         if promoted.rows_affected() != 1 {
             return Err(ownership_changed());
         }
+        // Invites the previous owner minted carry an authority they no
+        // longer have (an `admin` invite in particular, which an admin can
+        // never create): revoked, like on any other demotion.
+        revoke_invites_of(&mut tx, band_id, current_owner_id).await?;
 
         tx.commit().await?;
 

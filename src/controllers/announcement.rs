@@ -213,6 +213,21 @@ pub async fn admin_get(
     Ok(Json(with_stats(&state, announcement).await?))
 }
 
+/// Publishing is admin-only, and so is everything that changes what was
+/// published: a moderator may draft, but not rewrite, retarget or take
+/// down what an admin put in front of every user.
+fn require_admin_once_published(
+    access: &AccessControl,
+    current: &crate::models::announcement::Announcement,
+) -> Result<(), ApiError> {
+    if current.published_at.is_some() {
+        access.require_admin().map_err(|_| {
+            ApiError::insufficient_role("Only admins can change published announcements.")
+        })?;
+    }
+    Ok(())
+}
+
 #[utoipa::path(
     patch,
     path = "/api/v1/admin/announcements/{id}",
@@ -238,6 +253,7 @@ pub async fn admin_update(
     access.require_staff()?;
     payload.validate()?;
     let current = load(&state, id).await?;
+    require_admin_once_published(&access, &current)?;
     let status = current.compute_status(chrono::Utc::now().naive_utc());
     let locked =
         |message: &str| ApiError::rule(StatusCode::CONFLICT, codes::ANNOUNCEMENT_LOCKED, message);
@@ -323,6 +339,7 @@ pub async fn admin_delete(
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_staff()?;
     let current = load(&state, id).await?;
+    require_admin_once_published(&access, &current)?;
     if current.published_at.is_none() {
         state.announcement_repo.delete(id).await?;
         AuditEvent::by(&access, actions::ANNOUNCEMENT_DELETED)
@@ -416,7 +433,8 @@ pub async fn admin_archive(
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_staff()?;
-    load(&state, id).await?;
+    let current = load(&state, id).await?;
+    require_admin_once_published(&access, &current)?;
     let archived = state
         .announcement_repo
         .archive(id, access.user_id())

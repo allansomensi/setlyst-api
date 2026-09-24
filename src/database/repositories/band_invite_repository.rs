@@ -230,6 +230,23 @@ impl BandInviteRepository for BandInviteRepositoryImpl {
 
         let mut tx = self.db.begin().await?;
 
+        // The band row is locked before the invite row, in the same order
+        // as membership changes (which lock the band, then revoke the
+        // invites of a demoted or removed member); the opposite order
+        // would deadlock a redemption against such a change.
+        let band_id: Option<Uuid> =
+            sqlx::query_scalar("SELECT band_id FROM band_invites WHERE code = $1")
+                .bind(code.trim().to_uppercase())
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(band_id) = band_id else {
+            return Err(invalid());
+        };
+        sqlx::query("SELECT id FROM bands WHERE id = $1 FOR UPDATE")
+            .bind(band_id)
+            .execute(&mut *tx)
+            .await?;
+
         let invite = sqlx::query_as::<_, BandInvite>(
             "SELECT * FROM band_invites WHERE code = $1 FOR UPDATE",
         )
@@ -244,11 +261,6 @@ impl BandInviteRepository for BandInviteRepositoryImpl {
         if invite.revoked_at.is_some() || expired || exhausted {
             return Err(invalid());
         }
-
-        sqlx::query("SELECT id FROM bands WHERE id = $1 FOR UPDATE")
-            .bind(invite.band_id)
-            .execute(&mut *tx)
-            .await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 11))")
             .bind(user_id)
             .execute(&mut *tx)

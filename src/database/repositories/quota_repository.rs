@@ -55,13 +55,7 @@ impl QuotaGuard {
         if self.adding <= 0 {
             return Ok(());
         }
-        sqlx::query(
-            "SELECT pg_advisory_xact_lock(hashtextextended('quota:' || $1 || ':' || $2::text, 0))",
-        )
-        .bind(self.resource.key())
-        .bind(self.scope_id)
-        .execute(&mut *conn)
-        .await?;
+        lock_scope(&mut *conn, self.resource, self.scope_id).await?;
         let limit = limits.get(self.resource);
         let used = count_in(&mut *conn, self.resource, self.scope_id).await?;
         if used + self.adding > limit {
@@ -81,6 +75,25 @@ impl QuotaGuard {
         }
         Ok(())
     }
+}
+
+/// Takes the transaction-scoped advisory lock creations of `resource` in
+/// the scope are serialized under (`quota:<resource>:<scope>`), for code
+/// that counts and inserts on its own (restores, imports, copies) and must
+/// see the same count a concurrent [`QuotaGuard::enforce`] sees.
+pub async fn lock_scope(
+    conn: &mut PgConnection,
+    resource: QuotaResource,
+    scope_id: Uuid,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('quota:' || $1 || ':' || $2::text, 0))",
+    )
+    .bind(resource.key())
+    .bind(scope_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 /// How many of `resource` the scope (a user, band or setlist) holds.

@@ -21,7 +21,12 @@ pub fn create_routes(state: AppState) -> Router {
 /// Mounted separately (outside the `authenticate` middleware) — see
 /// `routes/mod.rs`.
 pub fn create_public_routes(state: AppState) -> Router {
+    // The answer carries the gig's setlist with lyrics: limited per client
+    // like the public setlist view.
     Router::new()
         .route("/{token}", get(gig::get_public_gig))
+        .layer(client_governor!(
+            crate::routes::governor_presets::PUBLIC_SHARE_READ
+        ))
         .with_state(state)
 }

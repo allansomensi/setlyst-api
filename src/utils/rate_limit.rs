@@ -89,6 +89,11 @@ pub mod presets {
     /// PDF exports by a signed-in account: 30 per minute.
     pub static PDF_EXPORT: LazyLock<SlidingWindowLimiter<Uuid>> =
         LazyLock::new(|| SlidingWindowLimiter::new(30, Duration::from_secs(60)));
+    /// Band membership changes by one account (role changes, removals):
+    /// 60 per hour. Each one notifies the member concerned, so a loop of
+    /// them is a notification (and e-mail) bombing tool.
+    pub static BAND_MEMBER_CHANGES: LazyLock<SlidingWindowLimiter<Uuid>> =
+        LazyLock::new(|| SlidingWindowLimiter::new(60, HOUR));
 
     /// Records a hit of `user_id` on `limiter`; `TOO_MANY_ATTEMPTS` (429,
     /// `meta.retry_after_seconds`) when the window is full.

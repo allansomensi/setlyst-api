@@ -74,7 +74,11 @@ pub trait SuggestionRepository: Send + Sync {
     ) -> Result<Option<SuggestionRow>, ApiError>;
     /// Creates it with the suggester's own up-vote. `ALREADY_EXISTS` when
     /// the same song is already open for the same setlist.
-    async fn create(&self, new: &NewSuggestion<'_>) -> Result<Uuid, ApiError>;
+    /// Inserts the suggestion with the suggester's own upvote, unless the
+    /// suggester already made `max_per_day` in the band in the last 24
+    /// hours (`TOO_MANY_ATTEMPTS`): counted under a per-(band, suggester)
+    /// lock, so concurrent requests can't all pass the count.
+    async fn create(&self, new: &NewSuggestion<'_>, max_per_day: i64) -> Result<Uuid, ApiError>;
     /// Casts or changes a vote on an open suggestion (`SUGGESTION_CLOSED`
     /// otherwise). Returns the `(up, down)` counts that decide automatic
     /// acceptance: votes of current members other than the suggester.
@@ -158,10 +162,31 @@ impl SuggestionRepository for SuggestionRepositoryImpl {
         Ok(row)
     }
 
-    async fn create(&self, new: &NewSuggestion<'_>) -> Result<Uuid, ApiError> {
+    async fn create(&self, new: &NewSuggestion<'_>, max_per_day: i64) -> Result<Uuid, ApiError> {
         let id = Uuid::new_v4();
         let now = Utc::now().naive_utc();
         let mut tx = self.db.begin().await?;
+        // Each suggestion notifies every member: bounded per suggester and
+        // band, with the count and the insert serialized.
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended('suggestion:' || $1::text || ':' || $2::text, 0))",
+        )
+        .bind(new.band_id)
+        .bind(new.suggested_by)
+        .execute(&mut *tx)
+        .await?;
+        let recent: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM band_song_suggestions
+             WHERE band_id = $1 AND suggested_by = $2 AND created_at > $3",
+        )
+        .bind(new.band_id)
+        .bind(new.suggested_by)
+        .bind(now - chrono::Duration::hours(24))
+        .fetch_one(&mut *tx)
+        .await?;
+        if recent >= max_per_day {
+            return Err(crate::services::account::too_many_attempts(3600));
+        }
         sqlx::query(
             "INSERT INTO band_song_suggestions
                 (id, band_id, setlist_id, song_id, song_title, artist_name, suggested_by, note, status, created_at, updated_at)

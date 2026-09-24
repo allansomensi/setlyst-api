@@ -7,7 +7,7 @@ use crate::{
         AppState,
         repositories::{
             audit_repository::AuditEvent,
-            security_repository::{CodeIssue, CodeLimits, SecondFactorClaim},
+            security_repository::{CodeIssue, CodeLimits, SecondFactorClaim, UNKNOWN_REQUESTER},
             user_repository::NewAccount,
         },
     },
@@ -25,7 +25,7 @@ use crate::{
     services::notifier::notify,
     utils::{
         codes::{lowercase_suffix, normalize_recovery_code, numeric_code, random_in},
-        crypto::{decrypt, hash_code, random_token, sha256_hex, verify_code},
+        crypto::{decrypt, encrypt, hash_code, random_token, sha256_hex, verify_code},
         hashing::verify_password_async,
         jwt::generate_jwt,
         totp,
@@ -44,8 +44,8 @@ pub const CODE_TTL_MINUTES: i64 = 15;
 /// Lifetime of a re-authentication code (shorter: it confirms one action
 /// the owner is performing right now).
 pub const REAUTH_CODE_TTL_MINUTES: i64 = 10;
-/// Re-authentication codes per account per hour.
-pub const REAUTH_CODES_PER_HOUR: i64 = 5;
+/// Re-authentication codes per account per hour, all networks together.
+pub const REAUTH_CODES_PER_HOUR: i64 = 10;
 /// Wrong guesses on the codes of one purpose, per account and 24 hours,
 /// across fresh codes: past this, codes are neither checked nor issued.
 pub const CODE_DAILY_FAILURE_CAP: i64 = 10;
@@ -58,10 +58,23 @@ pub const REAUTH_WINDOW_SECONDS: i64 = 15 * 60;
 pub const REAUTH_DAILY_FAILURES_BEFORE_SIGN_OUT: i32 = 10;
 /// Wrong guesses allowed per code.
 pub const CODE_MAX_ATTEMPTS: i32 = 5;
-/// Minimum time between two codes of the same purpose.
+/// Minimum time between two requests of the same purpose for one account
+/// (whoever makes them: at most one e-mail a minute to the owner).
 pub const CODE_RESEND_SECONDS: i64 = 60;
-/// Codes of one purpose per account per 24 hours.
-pub const CODE_DAILY_LIMIT: i64 = 10;
+/// Requests for codes of one purpose per account per 24 hours, all
+/// networks together (the most e-mails a stranger's requests can put in
+/// the owner's inbox in a day; a request while a code is live re-sends
+/// the same code, see [`send_code`]).
+pub const CODE_DAILY_LIMIT: i64 = 20;
+/// ...and from one client network (IPv4 address or IPv6 /64): the
+/// allowance of the owner is never used up by one stranger.
+pub const CODE_DAILY_LIMIT_PER_NETWORK: i64 = 5;
+/// Re-authentication code requests per account per hour, and per network.
+pub const REAUTH_CODES_PER_HOUR_PER_NETWORK: i64 = 5;
+/// A live code with less than this share of its lifetime left is replaced
+/// by a fresh one instead of being re-sent (so a re-sent code is always
+/// usable for a while).
+const CODE_RESEND_MIN_REMAINING_FRACTION: i64 = 2;
 /// Lifetime of a second-factor sign-in challenge.
 pub const CHALLENGE_TTL_MINUTES: i64 = 5;
 pub const CHALLENGE_MAX_ATTEMPTS: i32 = 5;
@@ -357,25 +370,47 @@ pub fn code_ttl_minutes(purpose: VerificationPurpose) -> i64 {
     }
 }
 
-/// Issuance limits of the codes of `purpose`: one a minute, and 10 a day
-/// (5 an hour for re-authentication codes); none at all once the day's
-/// wrong guesses reach [`CODE_DAILY_FAILURE_CAP`].
-fn code_limits(purpose: VerificationPurpose) -> CodeLimits {
-    let (window_seconds, max_in_window) = match purpose {
-        VerificationPurpose::Reauth => (3600, REAUTH_CODES_PER_HOUR),
-        _ => (24 * 3600, CODE_DAILY_LIMIT),
+/// Issuance limits of the codes of `purpose`: one a minute per account,
+/// [`CODE_DAILY_LIMIT_PER_NETWORK`] a day per client network and
+/// [`CODE_DAILY_LIMIT`] a day per account ([`REAUTH_CODES_PER_HOUR`] an
+/// hour for re-authentication codes); none at all once the day's wrong
+/// guesses reach [`CODE_DAILY_FAILURE_CAP`].
+pub fn code_limits(purpose: VerificationPurpose) -> CodeLimits {
+    let (window_seconds, max_per_requester_in_window, max_in_window) = match purpose {
+        VerificationPurpose::Reauth => (
+            3600,
+            REAUTH_CODES_PER_HOUR_PER_NETWORK,
+            REAUTH_CODES_PER_HOUR,
+        ),
+        _ => (24 * 3600, CODE_DAILY_LIMIT_PER_NETWORK, CODE_DAILY_LIMIT),
     };
     CodeLimits {
         resend_seconds: CODE_RESEND_SECONDS,
         window_seconds,
+        max_per_requester_in_window,
         max_in_window,
         max_failures_per_day: CODE_DAILY_FAILURE_CAP,
     }
 }
 
-/// Issues a new e-mailed code, enforcing the resend interval, the daily
-/// (hourly for re-auth) limit and the daily failure cap, and enqueues the
-/// e-mail built by `template`.
+/// The key code requests are counted under: the client network (IPv4
+/// address, IPv6 /64), or [`UNKNOWN_REQUESTER`] when it isn't known.
+pub fn code_requester(ip: Option<&str>) -> String {
+    ip.and_then(|ip| ip.trim().parse::<IpAddr>().ok())
+        .map(|ip| crate::middlewares::client_ip::rate_limit_key(ip).to_string())
+        .unwrap_or_else(|| UNKNOWN_REQUESTER.to_string())
+}
+
+/// E-mails a code for `purpose` to `target_email`, enforcing the resend
+/// interval and the per-network and per-account allowances (see
+/// [`code_limits`]) and the daily failure cap.
+///
+/// While a code for the same purpose and address is still valid (with at
+/// least half its lifetime left), the *same* code is sent again rather
+/// than a new one issued: password recovery takes anyone's request for
+/// any account, and a stranger's request must not invalidate the code
+/// the owner is about to type. The code is kept encrypted at rest for
+/// that (`verification_codes.code_enc`), and wiped once consumed.
 pub async fn send_code(
     state: &AppState,
     user: &User,
@@ -386,26 +421,39 @@ pub async fn send_code(
     template: impl FnOnce(String) -> EmailTemplate,
 ) -> Result<CodeSentResponse, ApiError> {
     let timestamp = now();
-    let code = numeric_code();
-    let expires_at = timestamp + Duration::minutes(code_ttl_minutes(purpose));
-    match state
+    let ttl = Duration::minutes(code_ttl_minutes(purpose));
+    let fresh = numeric_code();
+    let (code, expires_at) = match state
         .security_repo
         .create_code(
             user.id,
             purpose,
-            &hash_code(purpose.key(), &code),
+            &hash_code(purpose.key(), &fresh),
+            &encrypt(fresh.as_bytes())?,
             target_email,
-            expires_at,
+            timestamp + ttl,
+            ttl / CODE_RESEND_MIN_REMAINING_FRACTION as i32,
             ip,
+            &code_requester(ip),
             code_limits(purpose),
         )
         .await?
     {
-        CodeIssue::Issued(_) => {}
+        CodeIssue::Issued(_) => (fresh, timestamp + ttl),
+        CodeIssue::Resent {
+            code_enc,
+            expires_at,
+            ..
+        } => {
+            let stored = decrypt(&code_enc)?;
+            let stored = String::from_utf8(stored)
+                .map_err(|_| ApiError::ServerError(axum::Error::new("stored code is not text")))?;
+            (stored, expires_at)
+        }
         CodeIssue::Limited {
             retry_after_seconds,
         } => return Err(too_many_attempts(retry_after_seconds)),
-    }
+    };
     enqueue(
         &state.db,
         &OutgoingEmail {
@@ -742,8 +790,10 @@ pub async fn start_verified_trial(
 }
 
 /// Queues a [`EmailTemplate::SecurityNotice`] of `kind` to `to` (the
-/// account's address when `None`), in the account's language. Never
-/// fails the request.
+/// account's address when `None` — only once it is verified: nothing but
+/// codes is ever sent to an address nobody has proven, or a settings
+/// change looped on a throw-away account would mail whoever it names),
+/// in the account's language. Never fails the request.
 pub async fn send_security_notice(
     state: &AppState,
     user: &User,
@@ -751,7 +801,10 @@ pub async fn send_security_notice(
     detail: Option<String>,
     to: Option<&str>,
 ) {
-    let Some(to) = to.map(str::to_string).or_else(|| user.email.clone()) else {
+    let Some(to) = to
+        .map(str::to_string)
+        .or_else(|| user.email.clone().filter(|_| user.email_verified()))
+    else {
         return;
     };
     let locale = user_locale(state, user.id)

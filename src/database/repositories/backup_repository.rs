@@ -1,4 +1,5 @@
 use crate::{
+    database::repositories::quota_repository::lock_scope,
     errors::api_error::{ApiError, codes},
     models::{
         backup::{
@@ -6,7 +7,7 @@ use crate::{
             BackupSetlistSong, BackupSong, BackupTour, ImportSummary,
         },
         link::{LinkInput, StoredLink},
-        quota::QuotaLimits,
+        quota::{QuotaLimits, QuotaResource},
         song::clean_text,
     },
     validations::{link::normalize_links, tag::normalize_tags},
@@ -374,6 +375,21 @@ impl BackupRepository for BackupRepositoryImpl {
         sqlx::query("SET LOCAL statement_timeout = '20s'")
             .execute(&mut *tx)
             .await?;
+        // Under the locks every creation in the account takes, so the
+        // final quota check below and a concurrent `POST /songs` (or
+        // restore) can't both pass on the same count.
+        if limits.is_some() {
+            for resource in [
+                QuotaResource::Songs,
+                QuotaResource::Artists,
+                QuotaResource::Setlists,
+                QuotaResource::Gigs,
+                QuotaResource::Tags,
+                QuotaResource::Tours,
+            ] {
+                lock_scope(&mut tx, resource, user_id).await?;
+            }
+        }
 
         // Artists: the account's existing ones by name, the rest inserted
         // in one statement.
@@ -491,14 +507,25 @@ impl BackupRepository for BackupRepositoryImpl {
             song_id_map.insert(song.id, resolved_id);
         }
         if !tag_song_ids.is_empty() {
+            // A song merged into an existing one keeps the existing tags
+            // and takes the file's only up to the per-song limit.
             sqlx::query(
                 "INSERT INTO song_tags (song_id, tag, created_at)
-                 SELECT t.song_id, t.tag, $3 FROM UNNEST($1::uuid[], $2::text[]) AS t(song_id, tag)
+                 SELECT t.song_id, t.tag, $3
+                 FROM UNNEST($1::uuid[], $2::text[]) WITH ORDINALITY AS t(song_id, tag, ord)
+                 WHERE t.tag NOT IN (SELECT tag FROM song_tags st WHERE st.song_id = t.song_id)
+                   AND (SELECT COUNT(*) FROM song_tags st WHERE st.song_id = t.song_id)
+                       + (SELECT COUNT(*) FROM UNNEST($1::uuid[], $2::text[]) WITH ORDINALITY
+                             AS u(song_id, tag, ord)
+                          WHERE u.song_id = t.song_id AND u.ord < t.ord
+                            AND u.tag NOT IN (SELECT tag FROM song_tags st WHERE st.song_id = u.song_id))
+                       < $4
                  ON CONFLICT DO NOTHING",
             )
             .bind(&tag_song_ids)
             .bind(&tag_values)
             .bind(now)
+            .bind(crate::validations::tag::MAX_TAGS_PER_SONG as i64)
             .execute(&mut *tx)
             .await?;
         }

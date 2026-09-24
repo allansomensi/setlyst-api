@@ -1,5 +1,5 @@
 use crate::database::repositories::{
-    quota_repository::QuotaGuard,
+    quota_repository::{QuotaGuard, lock_scope},
     song_repository::{like_pattern, song_columns},
 };
 use crate::{
@@ -7,7 +7,7 @@ use crate::{
     models::{
         band::BandRole,
         link::Links,
-        quota::QuotaLimits,
+        quota::{QuotaLimits, QuotaResource},
         setlist::{
             CreateSetlistPayload, Setlist, SetlistItem, SetlistItemRef, SetlistItemType,
             SetlistMarker, SetlistMarkerType, UpdateSetlistPayload,
@@ -173,11 +173,15 @@ pub trait SetlistRepository: Send + Sync {
         page: i64,
         size: i64,
     ) -> Result<(Vec<SongWithArtist>, i64), ApiError>;
-    /// Live songs with their position in the running order (public pages).
+    /// Live songs with their position in the running order (public pages),
+    /// at most the first `max_songs`.
     async fn get_positioned_songs(
         &self,
         setlist_id: Uuid,
+        max_songs: i64,
     ) -> Result<Vec<(i32, SongWithArtist)>, ApiError>;
+    /// How many live songs and markers the setlist holds.
+    async fn count_items(&self, setlist_id: Uuid) -> Result<i64, ApiError>;
     async fn reorder_songs(&self, setlist_id: Uuid, song_ids: &[Uuid]) -> Result<(), ApiError>;
     /// Creates an independent personal copy of a setlist the caller can
     /// view: title (optionally overridden), description, links and every
@@ -784,10 +788,12 @@ impl SetlistRepository for SetlistRepositoryImpl {
         quota: &[QuotaGuard],
     ) -> Result<(), ApiError> {
         let mut tx = self.db.begin().await?;
-        QuotaGuard::enforce_all(quota, &mut tx).await?;
 
         // Serializes concurrent appends to the same setlist, so two songs
-        // added at once can't land on the same position.
+        // added at once can't land on the same position. Always the
+        // setlist row first and the quota locks second, in the same order
+        // as `create_marker` (the opposite order would deadlock a song
+        // and a block being appended at once).
         let row: Option<(Option<Uuid>, bool)> = sqlx::query_as(
             "SELECT band_id, is_repertoire FROM setlists WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
         )
@@ -797,6 +803,7 @@ impl SetlistRepository for SetlistRepositoryImpl {
         let Some((band_id, is_repertoire)) = row else {
             return Err(ApiError::NotFound);
         };
+        QuotaGuard::enforce_all(quota, &mut tx).await?;
 
         append_song(&mut tx, setlist_id, song_id).await?;
 
@@ -887,13 +894,28 @@ impl SetlistRepository for SetlistRepositoryImpl {
     async fn get_positioned_songs(
         &self,
         setlist_id: Uuid,
+        max_songs: i64,
     ) -> Result<Vec<(i32, SongWithArtist)>, ApiError> {
         Ok(self
-            .song_rows(setlist_id)
+            .song_rows_limited(setlist_id, Some(max_songs.max(0)))
             .await?
             .into_iter()
             .map(|row| (row.position, row.song))
             .collect())
+    }
+
+    async fn count_items(&self, setlist_id: Uuid) -> Result<i64, ApiError> {
+        Ok(sqlx::query_scalar(concat!(
+            "SELECT (SELECT COUNT(*) FROM songs s
+                     INNER JOIN setlist_songs ss ON s.id = ss.song_id
+                     INNER JOIN setlists st ON st.id = ss.setlist_id
+                     WHERE ss.setlist_id = $1 AND ",
+            scoped_songs!(),
+            ") + (SELECT COUNT(*) FROM setlist_markers WHERE setlist_id = $1)"
+        ))
+        .bind(setlist_id)
+        .fetch_one(&self.db)
+        .await?)
     }
 
     async fn reorder_songs(&self, setlist_id: Uuid, song_ids: &[Uuid]) -> Result<(), ApiError> {
@@ -941,18 +963,21 @@ impl SetlistRepository for SetlistRepositoryImpl {
             .take(240)
             .collect();
 
-        // Plain reads, before the write transaction.
-        let source_songs = self.song_rows(id).await?;
-        let source_markers = self.get_markers(id).await?;
-
+        // The size check comes first, from a count: a repertoire can hold
+        // thousands of songs with their lyrics, which must not be loaded
+        // only to be refused.
         if let Some(limits) = limits
-            && (source_songs.len() + source_markers.len()) as i64 > limits.setlist_items
+            && self.count_items(id).await? > limits.setlist_items
         {
             return Err(ApiError::quota_exceeded(
                 "setlist_items",
                 limits.setlist_items,
             ));
         }
+
+        // Plain reads, before the write transaction.
+        let source_songs = self.song_rows(id).await?;
+        let source_markers = self.get_markers(id).await?;
 
         let mut tx = self.db.begin().await?;
         QuotaGuard::enforce_all(quota, &mut tx).await?;
@@ -1004,6 +1029,12 @@ impl SetlistRepository for SetlistRepositoryImpl {
         .execute(&mut *tx)
         .await?;
 
+        // The forker counts the caller's songs and artists once and adds
+        // to the counts as it copies: serialized with every other creation
+        // in those scopes (a concurrent copy or `POST /songs` would
+        // otherwise pass on the same stale count).
+        lock_scope(&mut tx, QuotaResource::Songs, user_id).await?;
+        lock_scope(&mut tx, QuotaResource::Artists, user_id).await?;
         let mut forker = PersonalForker::new(&mut tx, user_id, limits).await?;
         let mut song_ids: Vec<Uuid> = Vec::with_capacity(source_songs.len());
         let mut positions: Vec<i32> = Vec::with_capacity(source_songs.len());

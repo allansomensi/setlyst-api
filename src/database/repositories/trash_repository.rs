@@ -8,9 +8,10 @@
 //! filled up in the meantime.
 
 use crate::{
+    database::repositories::quota_repository::lock_scope,
     errors::api_error::{ApiError, codes},
     models::{
-        quota::QuotaLimits,
+        quota::{QuotaLimits, QuotaResource},
         trash::{TrashItem, TrashType},
     },
 };
@@ -575,6 +576,31 @@ async fn check_restore_quotas(
         TrashType::Tour => (0, 0, 1),
         _ => (0, 0, 0),
     };
+
+    // Under the same locks every creation in the scope takes, so a
+    // restore and a concurrent create (or two restores) can't both pass on
+    // the same count. Always in the resource order below, like the guards.
+    let scope_id = row.band_id.unwrap_or(row.user_id);
+    let resources: &[(QuotaResource, i64)] = match row.band_id {
+        None => &[
+            (QuotaResource::Songs, songs),
+            (QuotaResource::Artists, artists),
+            (QuotaResource::Setlists, setlists),
+            (QuotaResource::Gigs, gigs),
+            (QuotaResource::Tours, tours),
+        ],
+        Some(_) => &[
+            (QuotaResource::BandSongs, songs),
+            (QuotaResource::BandSetlists, setlists),
+            (QuotaResource::BandGigs, gigs),
+            (QuotaResource::BandTours, tours),
+        ],
+    };
+    for (resource, adding) in resources {
+        if *adding > 0 {
+            lock_scope(tx, *resource, scope_id).await?;
+        }
+    }
 
     let (used_songs, used_artists, used_setlists, used_gigs, used_tours): (
         i64,

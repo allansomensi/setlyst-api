@@ -623,7 +623,19 @@ pub async fn upsert_plan(
 // Staff: a user's subscription and credits
 // ---------------------------------------------------------------------
 
-async fn target_label(state: &AppState, id: Uuid) -> Result<String, ApiError> {
+/// The username of the account a staff billing action targets. Never
+/// the caller's own (an admin must not grant themselves a plan, credits
+/// or a refund; another admin does it, and the audit log says who).
+async fn target_label(
+    state: &AppState,
+    access: &AccessControl,
+    id: Uuid,
+) -> Result<String, ApiError> {
+    if id == access.user_id() {
+        return Err(ApiError::cannot_target_self(
+            "You can't perform this action on your own account.",
+        ));
+    }
     Ok(state
         .user_repo
         .find_by_id(id)
@@ -678,7 +690,7 @@ pub async fn grant_user_subscription(
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_admin()?;
     payload.validate()?;
-    let label = target_label(&state, id).await?;
+    let label = target_label(&state, &access, id).await?;
     let note = payload
         .note
         .as_deref()
@@ -726,7 +738,7 @@ pub async fn revoke_user_subscription(
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_admin()?;
-    let label = target_label(&state, id).await?;
+    let label = target_label(&state, &access, id).await?;
     if !billing::revoke_subscription(&state, id, access.user_id()).await? {
         return Err(ApiError::NotFound);
     }
@@ -758,7 +770,7 @@ pub async fn adjust_user_credits(
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_admin()?;
     payload.validate()?;
-    let label = target_label(&state, id).await?;
+    let label = target_label(&state, &access, id).await?;
     let mut tx = state.db.begin().await?;
     lock_user_credits(&mut tx, id).await?;
     if payload.amount < 0 {

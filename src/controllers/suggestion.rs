@@ -16,7 +16,6 @@ use crate::{
         },
     },
     services::{
-        account::too_many_attempts,
         entitlements::{Feature, ensure_feature},
         notifier::notify,
     },
@@ -279,32 +278,23 @@ pub async fn create_suggestion(
         ));
     }
 
-    // Each suggestion notifies every member: bounded per member and band.
-    let recent: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM band_song_suggestions
-         WHERE band_id = $1 AND suggested_by = $2 AND created_at > $3",
-    )
-    .bind(band_id)
-    .bind(user_id)
-    .bind(chrono::Utc::now().naive_utc() - chrono::Duration::hours(24))
-    .fetch_one(&state.db)
-    .await?;
-    if recent >= MAX_SUGGESTIONS_PER_DAY {
-        return Err(too_many_attempts(3600));
-    }
-
+    // Each suggestion notifies every member: bounded per member and band
+    // (counted in the insert's transaction, see the repository).
     let note = clean_note(payload.note.as_deref());
     let id = state
         .suggestion_repo
-        .create(&NewSuggestion {
-            band_id,
-            setlist_id: setlist.id,
-            song_id: song.id,
-            song_title: &song.title,
-            artist_name: &song.artist_name,
-            suggested_by: user_id,
-            note: note.as_deref(),
-        })
+        .create(
+            &NewSuggestion {
+                band_id,
+                setlist_id: setlist.id,
+                song_id: song.id,
+                song_title: &song.title,
+                artist_name: &song.artist_name,
+                suggested_by: user_id,
+                note: note.as_deref(),
+            },
+            MAX_SUGGESTIONS_PER_DAY,
+        )
         .await?;
     info!(%user_id, %band_id, suggestion_id = %id, "Song suggested");
 

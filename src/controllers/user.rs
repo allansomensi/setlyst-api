@@ -572,7 +572,7 @@ pub async fn update_user(
             &account,
             "email_changed_by_staff",
             Some(masked),
-            target.email.as_deref(),
+            target.email.as_deref().filter(|_| target.email_verified),
         )
         .await;
         notify(
@@ -981,6 +981,11 @@ pub async fn update_user_quotas(
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_admin()?;
     payload.validate()?;
+    if id == access.user_id() {
+        return Err(ApiError::cannot_target_self(
+            "You can't change your own quotas.",
+        ));
+    }
 
     let target = state
         .user_repo
@@ -1288,7 +1293,8 @@ pub async fn change_current_user_password(
         .record(&*state.audit_repo)
         .await;
 
-    if let Some(email) = user.email.clone() {
+    // Only a proven address is told (an unverified one may be anyone's).
+    if let Some(email) = user.email.clone().filter(|_| user.email_verified()) {
         let locale = account::user_locale(&state, user_id)
             .await
             .unwrap_or_else(|_| "en".into());

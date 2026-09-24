@@ -1346,6 +1346,73 @@ pub async fn reward_referrer_on_payment(
     Ok(())
 }
 
+/// Days after a referral reward within which the referred account's
+/// refunded (withdrawn, refunded by staff or disputed) first payment
+/// takes the reward back.
+pub const REFERRAL_CLAWBACK_DAYS: i64 = 30;
+
+/// Called when the paid subscription of `referred_id` ends with a refund
+/// or a dispute: a reward paid on that payment within
+/// [`REFERRAL_CLAWBACK_DAYS`] is reversed (the referrer's credits are
+/// debited, going negative if they were already spent, and the referral
+/// is marked rejected), so a "referred" account that pays and withdraws
+/// can't mint credits for its referrer.
+pub async fn reverse_referral_reward(
+    state: &AppState,
+    referred_id: Uuid,
+    reason: &str,
+) -> Result<(), ApiError> {
+    let mut tx = state.db.begin().await?;
+    let Some((referral_id, referrer_id)): Option<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT id, referrer_id FROM referrals
+         WHERE referred_id = $1 AND status = 'rewarded'
+           AND rewarded_at >= $2
+         FOR UPDATE",
+    )
+    .bind(referred_id)
+    .bind(now() - chrono::Duration::days(REFERRAL_CLAWBACK_DAYS))
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        return Ok(());
+    };
+    lock_user_credits(&mut tx, referrer_id).await?;
+    let granted: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(amount), 0)::bigint FROM credit_ledger
+         WHERE user_id = $1 AND reference_id = $2
+           AND reason IN ('referral_referrer', 'referral_reversed')",
+    )
+    .bind(referrer_id)
+    .bind(referral_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let claimed = sqlx::query(
+        "UPDATE referrals SET status = 'rejected', note = $2 WHERE id = $1 AND status = 'rewarded'",
+    )
+    .bind(referral_id)
+    .bind(format!("reward_reversed:{reason}"))
+    .execute(&mut *tx)
+    .await?;
+    if claimed.rows_affected() == 0 {
+        return Ok(());
+    }
+    if granted > 0 {
+        add_credits(
+            &mut tx,
+            referrer_id,
+            -(granted.min(i32::MAX as i64) as i32),
+            "referral_reversed",
+            Some(referral_id),
+            Some(reason),
+            None,
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    warn!(referral_id = %referral_id, %referrer_id, reversed = granted, reason, "Referral reward reversed");
+    Ok(())
+}
+
 /// Ends the subscription of `user_id` now (staff action).
 pub async fn revoke_subscription(
     state: &AppState,

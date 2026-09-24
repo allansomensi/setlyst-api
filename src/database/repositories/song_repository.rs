@@ -96,12 +96,15 @@ pub trait SongRepository: Send + Sync {
     /// resolved. The caller must already have authorized access to `id`.
     async fn find_with_artist_name(&self, id: Uuid) -> Result<Option<SongWithArtist>, ApiError>;
     /// Creates (or reuses) the band-owned copy of `source` under `band_id`.
+    /// `quota` (the band's song limit) is enforced in the insert's
+    /// transaction, so concurrent forks can't take the band over it.
     async fn create_band_copy(
         &self,
         source: &SongWithArtist,
         band_id: Uuid,
         artist_id: Uuid,
         creator_id: Uuid,
+        quota: &[QuotaGuard],
     ) -> Result<Song, ApiError>;
     /// Whether `band_id` already holds a copy forked from `source_id`.
     async fn has_band_fork(&self, band_id: Uuid, source_id: Uuid) -> Result<bool, ApiError>;
@@ -665,9 +668,24 @@ impl SongRepository for SongRepositoryImpl {
         band_id: Uuid,
         artist_id: Uuid,
         creator_id: Uuid,
+        quota: &[QuotaGuard],
     ) -> Result<Song, ApiError> {
         let new_song = Song::fork_for_band(source, band_id, artist_id, creator_id);
         let mut tx = self.db.begin().await?;
+
+        // An existing copy (checked again under the lock) costs nothing;
+        // a new one counts against the band's song quota.
+        let existing: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM songs
+             WHERE band_id = $1 AND forked_from = $2 AND deleted_at IS NULL",
+        )
+        .bind(band_id)
+        .bind(source.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if existing.is_none() {
+            QuotaGuard::enforce_all(quota, &mut tx).await?;
+        }
 
         // If this exact source song was already forked into this band,
         // reuse that copy instead of creating a duplicate — atomically, via

@@ -386,6 +386,25 @@ pub trait PaymentGateway: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// The customer's account balance in minor units: negative is a credit
+    /// the provider applies to the customer's next invoices (an immediate
+    /// downgrade books the unused part of the period there).
+    async fn customer_balance(&self, _customer_id: &str) -> Result<i64, PaymentError> {
+        Ok(0)
+    }
+
+    /// Removes `amount` (minor units, positive) of credit from the
+    /// customer's balance. The same `idempotency_key` never debits twice.
+    async fn debit_customer_credit(
+        &self,
+        _customer_id: &str,
+        _amount: i64,
+        _currency: &str,
+        _idempotency_key: &str,
+    ) -> Result<(), PaymentError> {
+        Ok(())
+    }
+
     /// Stripe's fee on a payment, when its balance transaction exists.
     async fn payment_fees(
         &self,

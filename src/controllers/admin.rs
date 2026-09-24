@@ -1026,6 +1026,13 @@ pub async fn refund_user_subscription(
     if reason.is_empty() {
         return Err(ApiError::BadRequest("A reason is required.".into()));
     }
+    // Never one's own charges (outside the buyer's own withdrawal window
+    // that would be a self-granted refund); another admin does it.
+    if id == access.user_id() {
+        return Err(ApiError::cannot_target_self(
+            "You can't refund your own subscription here.",
+        ));
+    }
     if state.user_repo.find_by_id(id).await?.is_none() {
         return Err(ApiError::NotFound);
     }

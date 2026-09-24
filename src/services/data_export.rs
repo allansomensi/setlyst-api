@@ -203,10 +203,14 @@ pub async fn personal_data(state: &AppState, user_id: Uuid) -> Result<Value, Api
                  FROM moderation_flags WHERE reported_by = $1 ORDER BY created_at",
                 user_id).await?,
         },
-        // The last 30 days (older ones are deleted by the outbox retention).
+        // The last 30 days (older ones are deleted by the outbox retention),
+        // to the account's own address only: what went to an address the
+        // owner asked to switch to (a code, or the notice its holder gets
+        // instead) would tell whether that address has an account.
         "emails_sent": rows(state,
             "SELECT template, to_email, status, created_at, sent_at FROM email_outbox
              WHERE user_id = $1 AND created_at > NOW() - INTERVAL '30 days'
+               AND LOWER(to_email) = LOWER((SELECT email FROM users WHERE id = $1))
              ORDER BY created_at",
             user_id).await?,
         // Consents given and withdrawn (terms, privacy notice, age

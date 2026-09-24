@@ -18,7 +18,10 @@ use crate::{
         entitlements::{Feature, ensure_feature},
         notifier::notify,
     },
-    utils::{rate_limit::SlidingWindowLimiter, share_token::token_fingerprint},
+    utils::{
+        rate_limit::{SlidingWindowLimiter, presets},
+        share_token::token_fingerprint,
+    },
 };
 use axum::{
     Json,
@@ -425,10 +428,12 @@ pub async fn update_band_member_role(
         error!(%user_id, "A member cannot change their own role.");
         return Err(ApiError::Forbidden);
     }
+    presets::limit(&presets::BAND_MEMBER_CHANGES, user_id)?;
 
     // The hierarchy (caller `admin`+, target below the caller, only the
     // owner grants `admin`) is checked under the band lock, together with
-    // the write.
+    // the write. Setting the role the member already has changes nothing
+    // (`NotModified`), and in particular notifies nobody.
     let target_role = state
         .band_member_repo
         .change_role(band_id, user_id, target_user_id, payload.role)
@@ -539,6 +544,9 @@ pub async fn remove_band_member(
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = access.user_id();
     debug!(%user_id, %band_id, %target_user_id, "Processing request to remove band member");
+    if target_user_id != user_id {
+        presets::limit(&presets::BAND_MEMBER_CHANGES, user_id)?;
+    }
 
     // Leaving, or removing someone ranking below the caller: checked under
     // the band lock, together with the delete.

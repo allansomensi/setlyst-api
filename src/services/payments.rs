@@ -1384,6 +1384,9 @@ async fn handle_charge_refunded(
     .await?;
     tx.commit().await?;
     info!(%user_id, subscription = %subscription_id, "Fully refunded subscription canceled");
+    if let Err(e) = billing::reverse_referral_reward(state, user_id, "refunded").await {
+        error!(%user_id, error = %e, "Could not reverse the referral reward");
+    }
     after_change(state, user_id, change).await;
     Ok(())
 }
@@ -1421,6 +1424,9 @@ async fn handle_dispute(
     .await?;
     tx.commit().await?;
     warn!(%user_id, subscription = %subscription_id, "Payment disputed; subscription canceled");
+    if let Err(e) = billing::reverse_referral_reward(state, user_id, "disputed").await {
+        error!(%user_id, error = %e, "Could not reverse the referral reward");
+    }
     after_change(state, user_id, change).await;
     Ok(())
 }
@@ -1555,6 +1561,28 @@ async fn refund_and_end(
         .or(invoices.first())
         .map(|i| i.currency.to_ascii_lowercase())
         .unwrap_or_else(|| "brl".to_string());
+
+    // A credit on the customer's balance is the unused part of a period
+    // an immediate downgrade gave back; refunding the charge that funded
+    // it in full *and* leaving the credit would pay the buyer twice (and
+    // the credit would fund a later subscription for free). It is
+    // cancelled before the refund, so the buyer ends up exactly where they
+    // started: every charge refunded, nothing left to spend.
+    if let Some(customer_id) = customer_of(state, user_id).await? {
+        let balance = payments.gateway.customer_balance(&customer_id).await?;
+        if balance < 0 {
+            info!(%user_id, credit = -balance, "Cancelling the customer's credit before the refund");
+            payments
+                .gateway
+                .debit_customer_credit(
+                    &customer_id,
+                    -balance,
+                    &currency,
+                    &format!("setlyst-withdraw-credit-{subscription_id}-{}", -balance),
+                )
+                .await?;
+        }
+    }
     for invoice in &to_refund {
         let Some(payment_intent) = &invoice.payment_intent_id else {
             warn!(invoice = %invoice.id, "Paid invoice without a payment; not refunded");
@@ -1641,6 +1669,11 @@ async fn refund_and_end(
     .record(&*state.audit_repo)
     .await;
     info!(%user_id, subscription = %subscription_id, refunded, kind, "Paid subscription refunded and canceled");
+    if refunded > 0
+        && let Err(e) = billing::reverse_referral_reward(state, user_id, kind).await
+    {
+        error!(%user_id, error = %e, "Could not reverse the referral reward");
+    }
     after_change(state, user_id, change).await;
     Ok(WithdrawResponse {
         refunded_cents: refunded,

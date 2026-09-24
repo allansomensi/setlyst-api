@@ -1117,9 +1117,11 @@ pub(crate) async fn band_song_for(
     if let Some(existing) = state.song_repo.find_band_fork(band_id, source.id).await? {
         return Ok(existing);
     }
-    state
+    // Fails fast here; enforced again, under the band's quota lock, in the
+    // copy's transaction (concurrent forks must not add up past it).
+    let band_quota = state
         .quota_repo
-        .ensure_band(band_id, QuotaResource::BandSongs, 1)
+        .band_guard(band_id, QuotaResource::BandSongs, 1)
         .await?;
 
     let band_artist = state
@@ -1134,7 +1136,7 @@ pub(crate) async fn band_song_for(
 
     let forked = state
         .song_repo
-        .create_band_copy(source, band_id, band_artist.id, actor_id)
+        .create_band_copy(source, band_id, band_artist.id, actor_id, &[band_quota])
         .await?;
 
     info!(
@@ -1397,7 +1399,7 @@ pub async fn disable_setlist_sharing(
     path = "/api/v1/public/setlists/{token}",
     tags = ["Setlists"],
     summary = "View a publicly shared setlist.",
-    description = "No authentication required. The token itself is the only access control — anyone who has it can view the setlist read-only. Answers 404 as well once the owner's plan no longer includes `public_sharing` (for band content: neither the creator's nor the band owner's plan).",
+    description = "No authentication required. The token itself is the only access control — anyone who has it can view the setlist read-only: the running order (title, artist, tempo, key, duration, energy, time signature, capo, links) and the markers, never the lyrics. At most the first 2 000 songs. Answers 404 as well once the owner's plan no longer includes `public_sharing` (for band content: neither the creator's nor the band owner's plan). Rate-limited per client IP (bursts of 30, then one every 2 s).",
     params(("token" = String, Path, description = "The setlist's public share token")),
     responses(
         (status = 200, description = "Setlist retrieved successfully.", body = PublicSetlist),
@@ -1431,12 +1433,19 @@ async fn shared_setlist(state: &AppState, token: &str) -> Result<Setlist, ApiErr
     Ok(setlist)
 }
 
-/// The public (anonymous) view of a setlist: dedicated DTOs only.
+/// Songs of a shared setlist an anonymous read returns at most (a band
+/// repertoire can hold as many as the band's song quota).
+pub const MAX_PUBLIC_SHARE_SONGS: i64 = 2_000;
+
+/// The public (anonymous) view of a setlist: dedicated DTOs only (no
+/// lyrics, see [`PublicSong`]), at most [`MAX_PUBLIC_SHARE_SONGS`] songs.
 pub(crate) async fn public_setlist(
     state: &AppState,
     setlist: Setlist,
 ) -> Result<PublicSetlist, ApiError> {
-    let songs = state.setlist_repo.get_positioned_songs(setlist.id);
+    let songs = state
+        .setlist_repo
+        .get_positioned_songs(setlist.id, MAX_PUBLIC_SHARE_SONGS);
     let markers = state.setlist_repo.get_markers(setlist.id);
     let (songs, markers) = tokio::try_join!(songs, markers)?;
 

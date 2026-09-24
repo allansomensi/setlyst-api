@@ -601,7 +601,7 @@ pub async fn verify(
     path = "/api/v1/auth/password/forgot",
     tags = ["Auth"],
     summary = "Request a password recovery code.",
-    description = "Always answers `202 {}`, whether or not the account exists (no enumeration). When `identifier` (username or e-mail) matches an active account with an e-mail address, a 6-digit code valid for 15 minutes is sent to that address (at most one per minute). Rate-limited per IP.",
+    description = "Always answers `202 {}`, whether or not the account exists (no enumeration). When `identifier` (username or e-mail) matches an active account with an e-mail address, a 6-digit code valid for 15 minutes is sent to that address (at most one per minute, 5 per day per client network and 20 per day per account; while a code is still valid, asking again re-sends the same one, so a stranger's request never invalidates the owner's code). Rate-limited per IP.",
     request_body = ForgotPasswordPayload,
     responses((status = 202, description = "Accepted."))
 )]
@@ -656,7 +656,7 @@ pub async fn forgot_password(
     path = "/api/v1/auth/password/reset",
     tags = ["Auth"],
     summary = "Set a new password with a recovery code.",
-    description = "Checks the code first (`INVALID_CODE`, without any count of the attempts left; `CODE_EXPIRED`; 5 attempts per code and 10 wrong codes per account per day, then `TOO_MANY_ATTEMPTS`; an unknown identifier answers like a wrong code, in the same time), then the password policy (`WEAK_PASSWORD`, which leaves the code usable for another try), then sets the password, signs the account out everywhere, clears every lockout and marks the e-mail as verified. When that is the first proof that the owner controls the address, two-factor authentication and linked sign-in providers set up before are removed. Rate-limited per IP.",
+    description = "Checks the code first (`INVALID_CODE`, without any count of the attempts left: 5 attempts per code and 10 wrong codes per account per day, after which nothing is checked; an expired code, an exhausted account and an unknown identifier all answer like a wrong code, in the same time), then the password policy (`WEAK_PASSWORD`, which leaves the code usable for another try), then sets the password, signs the account out everywhere, clears every lockout and marks the e-mail as verified. When that is the first proof that the owner controls the address, two-factor authentication and linked sign-in providers set up before are removed. Rate-limited per IP.",
     request_body = ResetPasswordPayload,
     responses(
         (status = 200, description = "Password changed; sign in again.", body = ReauthRequiredResponse),
@@ -717,7 +717,12 @@ pub async fn reset_password(
             .await;
     }
 
-    if let Some(email) = &user.email {
+    // The code proved the address (or it was verified before).
+    if let Some(email) = user
+        .email
+        .as_ref()
+        .filter(|_| verifies_email || user.email_verified())
+    {
         let locale = account::user_locale(&state, user.id).await?;
         if let Err(e) = enqueue(
             &state.db,
@@ -754,8 +759,10 @@ pub async fn reset_password(
 
 /// The account and its (still unconsumed) recovery code. An unknown or
 /// inactive account answers exactly like an account without a live code,
-/// and no answer says how many attempts are left (that count would tell
-/// which identifiers have an account).
+/// and no answer says how many attempts are left, whether the code
+/// expired or whether the account is out of attempts (any of those would
+/// tell which identifiers have an account; the audit log keeps the real
+/// reason).
 async fn check_reset_code(
     state: &AppState,
     payload: &ResetPasswordPayload,
@@ -784,9 +791,9 @@ async fn check_reset_code(
                 .meta(json!({ "reason": e.code() }))
                 .ip(&ip.0)
                 .spawn(state.audit_repo.clone());
-            Err(match e.code() {
-                codes::INVALID_CODE => invalid_code_plain(),
-                _ => e,
+            Err(match e {
+                ApiError::DatabaseError(_) | ApiError::ServerError(_) => e,
+                _ => invalid_code_plain(),
             })
         }
     }
@@ -915,6 +922,12 @@ pub async fn google_sign_in(
     // The account has no usable password: the hash is of a random secret
     // nobody knows. Recovery sets a real one.
     let password_hash = hash_password(&random_token(32)).await?;
+    // Only an address Google is authoritative for counts as proven; any
+    // other is verified with a code like a password sign-up (Google only
+    // checked it when the Google account was created, and a recovered
+    // mailbox must be able to reclaim the account: the first proof of the
+    // address through password recovery then removes the Google link).
+    let email_proven = identity.is_authoritative_for_email();
     let user = account::create_account(
         &state,
         AccountDraft {
@@ -922,7 +935,7 @@ pub async fn google_sign_in(
             email: identity.email.clone(),
             password_hash,
             password_set: false,
-            email_verified: true,
+            email_verified: email_proven,
             first_name: identity
                 .given_name
                 .clone()
@@ -967,26 +980,48 @@ pub async fn google_sign_in(
         ),
     )
     .await;
-    if let Err(e) = enqueue(
-        &state.db,
-        &OutgoingEmail {
-            user_id: Some(user.id),
-            to: identity.email.clone(),
-            locale,
-            template: EmailTemplate::Welcome {
-                username: user.username.clone(),
+    if email_proven {
+        if let Err(e) = enqueue(
+            &state.db,
+            &OutgoingEmail {
+                user_id: Some(user.id),
+                to: identity.email.clone(),
+                locale,
+                template: EmailTemplate::Welcome {
+                    username: user.username.clone(),
+                },
             },
-        },
-    )
-    .await
-    {
-        error!(user_id = %user.id, error = %e, "Could not queue the welcome e-mail");
+        )
+        .await
+        {
+            error!(user_id = %user.id, error = %e, "Could not queue the welcome e-mail");
+        }
+        // The e-mail is verified by Google: the referral qualifies and the
+        // trial starts now.
+        billing::qualify_referral(&state, user.id).await?;
+        account::start_verified_trial(&state, user.id, &identity.email).await?;
+    } else {
+        // Welcome, referral and trial follow the verification.
+        let username = user.username.clone();
+        if let Err(e) = account::send_code(
+            &state,
+            &user,
+            VerificationPurpose::EmailVerification,
+            &identity.email,
+            &locale,
+            ip.addr(),
+            |code| EmailTemplate::EmailVerificationCode {
+                username,
+                code,
+                expires_minutes: CODE_TTL_MINUTES,
+            },
+        )
+        .await
+        {
+            error!(user_id = %user.id, error = %e, "Could not send the verification code");
+        }
     }
-    // The e-mail is verified by Google: the referral qualifies and the
-    // trial starts now.
-    billing::qualify_referral(&state, user.id).await?;
-    account::start_verified_trial(&state, user.id, &identity.email).await?;
-    info!(user_id = %user.id, "Account created with Google");
+    info!(user_id = %user.id, proven = email_proven, "Account created with Google");
     finish_google_sign_in(&state, user, None, true, &ip).await
 }
 

@@ -674,6 +674,16 @@ impl PaymentGateway for StripeGateway {
         price_id: &str,
     ) -> Result<GatewaySubscription, PaymentError> {
         let path = format!("/v1/subscriptions/{}", checked_id(subscription_id)?);
+        // One key per change: it only has to cover the retry inside
+        // `call`. A key built from the subscription, item and price alone
+        // would make Stripe replay the first answer of "A → B" for every
+        // later "A → B" of the same subscription (the item id never
+        // changes), so a customer going B → A → B would be recorded on B
+        // while still paying for A.
+        let key = format!(
+            "setlyst-change-{subscription_id}-{price_id}-{}",
+            uuid::Uuid::now_v7()
+        );
         let body = self
             .call(
                 Method::POST,
@@ -690,12 +700,23 @@ impl PaymentGateway for StripeGateway {
                         "latest_invoice.payments.data.payment.payment_intent",
                     ),
                 ],
-                Some(&format!(
-                    "setlyst-change-{subscription_id}-{price_id}-{item_id}"
-                )),
+                Some(&key),
             )
             .await?;
-        parse_subscription(&body)
+        let updated = parse_subscription(&body)?;
+        if updated.price_id != price_id {
+            // Stripe answered with another price (a replayed or racing
+            // change): never mirror that as if it were this change.
+            return Err(PaymentError {
+                status: None,
+                code: Some("price_mismatch".into()),
+                message: format!(
+                    "subscription {subscription_id} is on {} after a change to {price_id}",
+                    updated.price_id
+                ),
+            });
+        }
+        Ok(updated)
     }
 
     async fn get_paid_invoice(&self, id: &str) -> Result<Option<GatewayInvoice>, PaymentError> {
@@ -747,6 +768,41 @@ impl PaymentGateway for StripeGateway {
             .call(Method::POST, "/v1/refunds", &params, Some(idempotency_key))
             .await?;
         parse_refund(&body).ok_or_else(|| PaymentError::transport("unreadable Stripe refund"))
+    }
+
+    async fn customer_balance(&self, customer_id: &str) -> Result<i64, PaymentError> {
+        let path = format!("/v1/customers/{}", checked_id(customer_id)?);
+        let body = self.call(Method::GET, &path, &[], None).await?;
+        Ok(body.get("balance").and_then(Value::as_i64).unwrap_or(0))
+    }
+
+    async fn debit_customer_credit(
+        &self,
+        customer_id: &str,
+        amount: i64,
+        currency: &str,
+        idempotency_key: &str,
+    ) -> Result<(), PaymentError> {
+        if amount <= 0 {
+            return Ok(());
+        }
+        let path = format!(
+            "/v1/customers/{}/balance_transactions",
+            checked_id(customer_id)?
+        );
+        // A positive amount is a debit: it cancels that much credit.
+        self.call(
+            Method::POST,
+            &path,
+            &[
+                param("amount", amount),
+                param("currency", currency),
+                param("description", "Credit cancelled: subscription refunded"),
+            ],
+            Some(idempotency_key),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn list_refunds_for_payment(

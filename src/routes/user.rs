@@ -14,9 +14,19 @@ pub fn create_routes(state: AppState) -> Router {
     let reauth_routes = Router::new()
         .route("/me/reauth/code", post(account::send_reauth_code))
         .layer(client_governor!(governor_presets::REAUTH_CODE));
+    // Linking and unlinking a sign-in provider each notify the owner (and
+    // hit Google's key set): nobody needs more than a few per minute, and
+    // a script looping them must not be able to fill the outbox.
+    let identity_routes = Router::new()
+        .route(
+            "/me/identities/{provider}",
+            post(account::link_google).delete(account::unlink_identity),
+        )
+        .layer(client_governor!(governor_presets::IDENTITY_LINK));
 
     Router::new()
         .merge(reauth_routes)
+        .merge(identity_routes)
         .route("/", get(user::find_all_users).post(user::create_user))
         .route(
             "/me",
@@ -55,10 +65,6 @@ pub fn create_routes(state: AppState) -> Router {
             post(account::regenerate_recovery_codes),
         )
         .route("/me/identities", get(account::list_identities))
-        .route(
-            "/me/identities/{provider}",
-            post(account::link_google).delete(account::unlink_identity),
-        )
         .route(
             "/me/communication",
             get(account::get_communication).put(account::update_communication),

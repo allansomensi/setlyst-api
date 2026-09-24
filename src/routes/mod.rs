@@ -61,6 +61,14 @@ pub mod governor_presets {
     /// client, on top of the per-account limits (1 a minute, 5 an hour)
     /// enforced by the code issuer.
     pub const REAUTH_CODE: (Duration, u32) = (Duration::from_secs(12), 5);
+    /// Linking/unlinking a sign-in provider: 5 at once, then one a minute
+    /// per client.
+    pub const IDENTITY_LINK: (Duration, u32) = (Duration::from_secs(60), 5);
+    /// Anonymous reads of a shared setlist or gig (`/public/...`): 30 at
+    /// once, then one every 2 s per client. Each answer carries a whole
+    /// running order with lyrics, so it is the most expensive anonymous
+    /// read the API has.
+    pub const PUBLIC_SHARE_READ: (Duration, u32) = (Duration::from_secs(2), 30);
 }
 
 pub mod admin;

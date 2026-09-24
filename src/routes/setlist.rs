@@ -87,8 +87,14 @@ pub fn create_public_routes(state: AppState) -> Router {
         )
         .layer(GovernorLayer::new(pruned!(pdf_governor)));
 
-    Router::new()
+    // The JSON view carries the whole running order with lyrics: limited
+    // per client too, so a few addresses can't turn a shared link into a
+    // bandwidth and memory amplifier.
+    let view = Router::new()
         .route("/{token}", get(setlist::get_public_setlist))
-        .merge(pdf)
-        .with_state(state)
+        .layer(client_governor!(
+            crate::routes::governor_presets::PUBLIC_SHARE_READ
+        ));
+
+    Router::new().merge(view).merge(pdf).with_state(state)
 }

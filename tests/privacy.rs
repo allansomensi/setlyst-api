@@ -205,9 +205,11 @@ async fn every_reference_to_an_account_is_exported_or_excluded_on_purpose() {
         "totp_recovery_codes.user_id",
         "second_factor_attempts.user_id",
         // Short-lived abuse counters (wiped within a day) and lockout
-        // bookkeeping; the sign-in attempts themselves are in `security_log`.
+        // bookkeeping; the sign-in attempts themselves are in `security_log`
+        // and the codes requested (with their address) in `one_time_codes`.
         "login_failures.user_id",
         "reauth_attempts.user_id",
+        "verification_code_requests.user_id",
         // Provider references for Checkout pages, expired within a day;
         // the resulting subscription and payments are exported.
         "checkout_sessions.user_id",

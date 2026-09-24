@@ -112,7 +112,8 @@ pub async fn invalidate_pending(
     .execute(&mut **tx)
     .await?;
     sqlx::query(
-        "UPDATE verification_codes SET consumed_at = $2 WHERE user_id = $1 AND consumed_at IS NULL",
+        "UPDATE verification_codes SET consumed_at = $2, code_enc = NULL
+         WHERE user_id = $1 AND consumed_at IS NULL",
     )
     .bind(user_id)
     .bind(timestamp)
@@ -282,7 +283,9 @@ pub trait UserRepository: Send + Sync {
     async fn bands_in_common(&self, a: Uuid, b: Uuid) -> Result<Vec<BandInCommon>, ApiError>;
     async fn set_pending_totp(&self, id: Uuid, secret_enc: &str) -> Result<(), ApiError>;
     /// Promotes the pending secret; `step` is the TOTP step just used.
-    async fn enable_totp(&self, id: Uuid, step: i64) -> Result<(), ApiError>;
+    /// Promotes the pending secret. `false` when there was none (already
+    /// enabled, or by a concurrent request).
+    async fn enable_totp(&self, id: Uuid, step: i64) -> Result<bool, ApiError>;
     async fn disable_totp(&self, id: Uuid) -> Result<(), ApiError>;
     /// Records `step` as used. `false` when it (or a later one) already
     /// was: the code is a replay.
@@ -1372,19 +1375,19 @@ impl UserRepository for UserRepositoryImpl {
         Ok(())
     }
 
-    async fn enable_totp(&self, id: Uuid, step: i64) -> Result<(), ApiError> {
-        sqlx::query(
+    async fn enable_totp(&self, id: Uuid, step: i64) -> Result<bool, ApiError> {
+        let result = sqlx::query(
             "UPDATE users
              SET totp_secret_enc = totp_pending_secret_enc, totp_enabled_at = $2, totp_last_step = $3,
                  totp_pending_secret_enc = NULL, totp_pending_created_at = NULL
-             WHERE id = $1 AND totp_pending_secret_enc IS NOT NULL",
+             WHERE id = $1 AND totp_pending_secret_enc IS NOT NULL AND totp_secret_enc IS NULL",
         )
         .bind(id)
         .bind(now())
         .bind(step)
         .execute(&self.db)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
     async fn disable_totp(&self, id: Uuid) -> Result<(), ApiError> {

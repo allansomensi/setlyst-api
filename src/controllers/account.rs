@@ -89,17 +89,31 @@ async fn require_second_factor_if_enabled(
     }
 }
 
+/// Queues `template` to the account's address, once it is verified:
+/// nothing but codes is ever sent to an address nobody has proven (a
+/// settings change looped on a throw-away account would otherwise mail
+/// whoever it names).
 async fn send_security_email(state: &AppState, user: &User, template: EmailTemplate) {
-    let Some(email) = user.email.clone() else {
+    let Some(email) = user.email.clone().filter(|_| user.email_verified()) else {
         return;
     };
-    let locale = account::user_locale(state, user.id)
+    queue_account_email(state, user.id, email, template).await;
+}
+
+/// Queues `template` to `email`, an address the account has proven.
+async fn queue_account_email(
+    state: &AppState,
+    user_id: uuid::Uuid,
+    email: String,
+    template: EmailTemplate,
+) {
+    let locale = account::user_locale(state, user_id)
         .await
         .unwrap_or_else(|_| "en".into());
     if let Err(e) = enqueue(
         &state.db,
         &OutgoingEmail {
-            user_id: Some(user.id),
+            user_id: Some(user_id),
             to: email,
             locale,
             template,
@@ -107,7 +121,7 @@ async fn send_security_email(state: &AppState, user: &User, template: EmailTempl
     )
     .await
     {
-        error!(user_id = %user.id, error = %e, "Could not queue a security e-mail");
+        error!(%user_id, error = %e, "Could not queue a security e-mail");
     }
 }
 
@@ -199,7 +213,7 @@ pub async fn get_security(
     path = "/api/v1/users/me/reauth/code",
     tags = ["Account"],
     summary = "E-mail a re-authentication code.",
-    description = "For accounts without a password (created with Google): sends a 6-digit code, valid for 10 minutes and usable once, to the account's verified address. Sensitive actions (e-mail change, 2FA setup and removal, unlinking Google, account deletion) accept it as `reauth_code`. At most one a minute and 5 an hour (`TOO_MANY_ATTEMPTS`, `meta.retry_after_seconds`). `EMAIL_NOT_VERIFIED` (409) without a verified address.",
+    description = "For accounts without a password (created with Google): sends a 6-digit code, valid for 10 minutes and usable once, to the account's verified address. Sensitive actions (e-mail change, 2FA setup and removal, unlinking Google, account deletion) accept it as `reauth_code`. At most one a minute, 5 an hour per client network and 10 an hour per account (`TOO_MANY_ATTEMPTS`, `meta.retry_after_seconds`); while a code is still valid, asking again re-sends the same code. `EMAIL_NOT_VERIFIED` (409) without a verified address.",
     security(("jwt_token" = [])),
     responses(
         (status = 202, description = "Code sent.", body = serde_json::Value),
@@ -248,7 +262,7 @@ pub async fn send_reauth_code(
     path = "/api/v1/users/me/email/verification",
     tags = ["Account"],
     summary = "Send an e-mail verification code.",
-    description = "Sends a 6-digit code (valid 15 minutes) to the current address. At most one per minute and 10 per day (`TOO_MANY_ATTEMPTS`, `meta.retry_after_seconds`). `EMAIL_REQUIRED` without an address, `EMAIL_ALREADY_VERIFIED` when already verified.",
+    description = "Sends a 6-digit code (valid 15 minutes) to the current address. At most one per minute, 5 per day per client network and 20 per day per account (`TOO_MANY_ATTEMPTS`, `meta.retry_after_seconds`); while a code is still valid, asking again re-sends the same code. `EMAIL_REQUIRED` without an address, `EMAIL_ALREADY_VERIFIED` when already verified.",
     security(("jwt_token" = [])),
     responses(
         (status = 202, description = "Code sent.", body = CodeSentResponse),
@@ -338,9 +352,11 @@ pub async fn verify_email(
         info!(user_id = %user.id, "E-mail verified");
         billing::qualify_referral(&state, user.id).await?;
         account::start_verified_trial(&state, user.id, &code.target_email).await?;
-        send_security_email(
+        // The code just proved the address.
+        queue_account_email(
             &state,
-            &user,
+            user.id,
+            code.target_email.clone(),
             EmailTemplate::Welcome {
                 username: user.username.clone(),
             },
@@ -616,7 +632,7 @@ async fn issue_recovery_codes(state: &AppState, user: &User) -> Result<Vec<Strin
     path = "/api/v1/users/me/2fa/enable",
     tags = ["Account"],
     summary = "Confirm and enable two-factor authentication.",
-    description = "`code` is a current code from the authenticator app for the secret from `/2fa/setup` (`INVALID_TWO_FACTOR_CODE`; `CODE_EXPIRED` when the setup is older than 15 minutes or missing). Returns 10 recovery codes, shown only this once.",
+    description = "`code` is a current code from the authenticator app for the secret from `/2fa/setup` (`INVALID_TWO_FACTOR_CODE` with `meta.attempts_left`, 5 wrong codes per 15 minutes then `TOO_MANY_ATTEMPTS`; `CODE_EXPIRED` when the setup is older than 15 minutes or missing). Returns 10 recovery codes, shown only this once.",
     request_body = TwoFactorCodePayload,
     security(("jwt_token" = [])),
     responses(
@@ -651,12 +667,50 @@ pub async fn enable_two_factor(
         return Err(account::code_expired());
     }
     let secret = account::decrypt_totp_secret(user.id, pending)?;
+    // Through the same per-account limiter as every other second-factor
+    // check: a stolen session must not get to brute-force the pending
+    // secret during the setup window (and walk away with the recovery
+    // codes).
+    let failures = match state
+        .security_repo
+        .claim_second_factor_check(
+            user.id,
+            account::SECOND_FACTOR_MAX_FAILURES,
+            account::SECOND_FACTOR_WINDOW_SECONDS,
+        )
+        .await?
+    {
+        crate::database::repositories::security_repository::SecondFactorClaim::Allowed {
+            failures,
+        } => failures,
+        crate::database::repositories::security_repository::SecondFactorClaim::Limited {
+            retry_after_seconds,
+        } => return Err(account::too_many_attempts(retry_after_seconds)),
+    };
     let unix = Utc::now().timestamp().max(0) as u64;
     let Some(step) = totp::verify(&secret, &payload.code, unix, None) else {
-        return Err(invalid_two_factor_code(None));
+        AuditEvent::by(&access, actions::USER_SECOND_FACTOR_FAILED)
+            .target("user", user.id, &user.username)
+            .meta(json!({ "context": "two_factor_enable", "failures": failures }))
+            .ip(&ip.0)
+            .spawn(state.audit_repo.clone());
+        return Err(invalid_two_factor_code(Some(
+            account::SECOND_FACTOR_MAX_FAILURES - failures,
+        )));
     };
+    state
+        .security_repo
+        .release_second_factor_check(user.id)
+        .await?;
 
-    state.user_repo.enable_totp(user.id, step).await?;
+    if !state.user_repo.enable_totp(user.id, step).await? {
+        // A concurrent request enabled it first (with its own codes).
+        return Err(ApiError::rule(
+            StatusCode::CONFLICT,
+            codes::TWO_FACTOR_ALREADY_ENABLED,
+            "Two-factor authentication is already enabled.",
+        ));
+    }
     let codes = issue_recovery_codes(&state, &user).await?;
 
     AuditEvent::by(&access, actions::USER_TWO_FACTOR_ENABLED)
@@ -1234,7 +1288,7 @@ pub async fn delete_current_user(
     // cascade away), so the goodbye reaches the owner. Withdrawn if the
     // deletion fails.
     let locale = account::user_locale(&state, user.id).await?;
-    let goodbye = match user.email.clone() {
+    let goodbye = match user.email.clone().filter(|_| user.email_verified()) {
         Some(email) => Some(
             enqueue(
                 &state.db,

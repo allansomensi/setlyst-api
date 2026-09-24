@@ -486,8 +486,11 @@ async fn moderators_handle_content_but_not_takeovers_or_mass_mail() {
     let app = app!();
     let (_, admin) = app.user("power.admin", Role::Admin).await;
     let (_, moderator) = app.user("limited.mod", Role::Moderator).await;
-    let (user_id, _) = app
+    let (user_id, customer) = app
         .registered_user("customer.one", "customer.one@example.com")
+        .await;
+    // Security notices only go to a proven address.
+    app.verify_email(&customer, "customer.one@example.com")
         .await;
 
     for (response, what) in [

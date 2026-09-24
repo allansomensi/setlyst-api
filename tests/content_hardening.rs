@@ -612,23 +612,27 @@ async fn one_click_unsubscribe_accepts_a_form_post() {
 
 #[tokio::test]
 async fn codes_are_capped_per_address_and_sent_before_bulk_mail() {
+    use setlyst_api::email::outbox::CODE_EMAILS_PER_ADDRESS_PER_DAY;
     use setlyst_api::email::{
         EmailTemplate, OutgoingEmail,
         outbox::{enqueue, enqueue_many},
         worker::process_batch,
     };
     let app = app!();
-    let code = |n: u32| OutgoingEmail {
+    // A code that can be sent to an arbitrary address (sign-up), unlike a
+    // recovery code, which only ever goes to the account's own address
+    // and is bounded by the issuer instead.
+    let code = |n: i64| OutgoingEmail {
         user_id: None,
         to: "Victim@Example.com".into(),
         locale: "en".into(),
-        template: EmailTemplate::PasswordResetCode {
+        template: EmailTemplate::EmailVerificationCode {
             username: "victim".into(),
             code: format!("{n:06}"),
             expires_minutes: 15,
         },
     };
-    for n in 0..5 {
+    for n in 0..(CODE_EMAILS_PER_ADDRESS_PER_DAY + 3) {
         enqueue(&app.pool, &code(n)).await.unwrap();
     }
     let queued: i64 = sqlx::query_scalar(
@@ -637,7 +641,10 @@ async fn codes_are_capped_per_address_and_sent_before_bulk_mail() {
     .fetch_one(&app.pool)
     .await
     .unwrap();
-    assert_eq!(queued, 3, "per-address cap on one-time codes");
+    assert_eq!(
+        queued, CODE_EMAILS_PER_ADDRESS_PER_DAY,
+        "per-address cap on one-time codes"
+    );
 
     // A large announcement queued first still goes out after the codes.
     let bulk: Vec<OutgoingEmail> = (0..40)
@@ -665,7 +672,7 @@ async fn codes_are_capped_per_address_and_sent_before_bulk_mail() {
         .await
         .unwrap();
     let pending_codes: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM email_outbox WHERE template = 'password_reset_code' AND status = 'pending'",
+        "SELECT COUNT(*) FROM email_outbox WHERE template = 'email_verification_code' AND status = 'pending'",
     )
     .fetch_one(&app.pool)
     .await

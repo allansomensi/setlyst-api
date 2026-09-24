@@ -798,11 +798,14 @@ pub struct PublicSong {
     pub energy: Option<i16>,
     pub time_signature: Option<String>,
     pub capo: Option<i16>,
-    pub lyrics: Option<String>,
     pub links: Links,
 }
 
 impl PublicSong {
+    /// Whoever holds a share link gets the running order, never the
+    /// lyrics (they may be someone's copyrighted or unpublished work, and
+    /// the public PDF already promises as much) — which also keeps an
+    /// anonymous read small whatever the setlist holds.
     pub fn from_song(position: i32, song: SongWithArtist) -> Self {
         Self {
             position,
@@ -814,7 +817,6 @@ impl PublicSong {
             energy: song.energy,
             time_signature: song.time_signature,
             capo: song.capo,
-            lyrics: song.lyrics,
             links: song.links,
         }
     }

@@ -21,10 +21,16 @@ fn now() -> NaiveDateTime {
 /// can't all pass the resend interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodeLimits {
-    /// Minimum seconds between two codes of the purpose.
+    /// Minimum seconds between two requests of the purpose for the
+    /// account, whoever makes them.
     pub resend_seconds: i64,
-    /// At most `max_in_window` codes per `window_seconds`.
+    /// Requests are counted over `window_seconds`...
     pub window_seconds: i64,
+    /// ...at most this many per requester, and...
+    pub max_per_requester_in_window: i64,
+    /// ...this many for the account altogether (what bounds the mail the
+    /// owner's inbox can receive because of strangers' requests). Must be
+    /// at least `max_per_requester_in_window`.
     pub max_in_window: i64,
     /// No new code once this many wrong guesses were made on the
     /// purpose's codes in the last 24 hours.
@@ -32,14 +38,24 @@ pub struct CodeLimits {
 }
 
 /// Outcome of [`SecurityRepository::create_code`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodeIssue {
+    /// A new code was stored.
     Issued(Uuid),
-    /// Refused by a limit; retry after this many seconds.
-    Limited {
-        retry_after_seconds: i64,
+    /// A code for the same purpose and address is still live, so nothing
+    /// new was issued: send `code_enc` (the stored code, encrypted) again.
+    Resent {
+        id: Uuid,
+        code_enc: String,
+        expires_at: NaiveDateTime,
     },
+    /// Refused by a limit; retry after this many seconds.
+    Limited { retry_after_seconds: i64 },
 }
+
+/// The requester key of a code request when the client network is
+/// unknown.
+pub const UNKNOWN_REQUESTER: &str = "unknown";
 
 /// Result of claiming a second-factor check outside sign-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,18 +71,27 @@ pub enum SecondFactorClaim {
 pub trait SecurityRepository: Send + Sync {
     // --- Verification codes ---
 
-    /// Stores a new code, invalidating any unconsumed code of the same
-    /// purpose for the user, unless `limits` refuse it. The limits are
-    /// checked with the account row locked, in the insert's transaction.
+    /// Records a request for a code of `purpose` by `requester` (the
+    /// client network, or [`UNKNOWN_REQUESTER`]) and either stores the new
+    /// code (invalidating any unconsumed code of the same purpose for the
+    /// user) or, when a code for the same purpose and `target_email` is
+    /// still valid with at least `min_remaining` of its lifetime left,
+    /// answers [`CodeIssue::Resent`] with that code so the caller sends it
+    /// again: a stranger's request can then never invalidate the code the
+    /// owner is about to type. `limits` are checked with the account row
+    /// locked, in the same transaction.
     #[allow(clippy::too_many_arguments)]
     async fn create_code(
         &self,
         user_id: Uuid,
         purpose: VerificationPurpose,
         code_hash: &str,
+        code_enc: &str,
         target_email: &str,
         expires_at: NaiveDateTime,
+        min_remaining: chrono::Duration,
         ip: Option<&str>,
+        requester: &str,
         limits: CodeLimits,
     ) -> Result<CodeIssue, ApiError>;
     /// Counts a wrong guess on a code (for the 24-hour cap).
@@ -217,9 +242,12 @@ impl SecurityRepository for SecurityRepositoryImpl {
         user_id: Uuid,
         purpose: VerificationPurpose,
         code_hash: &str,
+        code_enc: &str,
         target_email: &str,
         expires_at: NaiveDateTime,
+        min_remaining: chrono::Duration,
         ip: Option<&str>,
+        requester: &str,
         limits: CodeLimits,
     ) -> Result<CodeIssue, ApiError> {
         let mut tx = self.db.begin().await?;
@@ -230,16 +258,22 @@ impl SecurityRepository for SecurityRepositoryImpl {
             .bind(user_id)
             .execute(&mut *tx)
             .await?;
-        let (last, in_window, failures): (Option<NaiveDateTime>, i64, i64) = sqlx::query_as(
+        let window_start = timestamp - chrono::Duration::seconds(limits.window_seconds);
+        // The resend interval is per account (one e-mail a minute, from
+        // anyone); the allowance is per requester, so one stranger can't
+        // use up the owner's, under an account-wide ceiling that bounds
+        // the mail the owner's inbox can receive from strangers.
+        let (last, by_requester, total): (Option<NaiveDateTime>, i64, i64) = sqlx::query_as(
             "SELECT MAX(created_at),
-                    COUNT(*) FILTER (WHERE created_at >= $3),
-                    COALESCE(SUM(failed_attempts) FILTER (WHERE created_at >= $4), 0)
-             FROM verification_codes WHERE user_id = $1 AND purpose = $2",
+                    COUNT(*) FILTER (WHERE requester = $3),
+                    COUNT(*)
+             FROM verification_code_requests
+             WHERE user_id = $1 AND purpose = $2 AND created_at >= $4",
         )
         .bind(user_id)
         .bind(purpose)
-        .bind(timestamp - chrono::Duration::seconds(limits.window_seconds))
-        .bind(timestamp - chrono::Duration::hours(24))
+        .bind(requester)
+        .bind(window_start)
         .fetch_one(&mut *tx)
         .await?;
         if let Some(last) = last {
@@ -250,18 +284,64 @@ impl SecurityRepository for SecurityRepositoryImpl {
                 });
             }
         }
-        if in_window >= limits.max_in_window {
+        if by_requester >= limits.max_per_requester_in_window || total >= limits.max_in_window {
             return Ok(CodeIssue::Limited {
                 retry_after_seconds: limits.window_seconds.min(3600),
             });
         }
+        let failures: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(failed_attempts), 0)::BIGINT FROM verification_codes
+             WHERE user_id = $1 AND purpose = $2 AND created_at >= $3",
+        )
+        .bind(user_id)
+        .bind(purpose)
+        .bind(timestamp - chrono::Duration::hours(24))
+        .fetch_one(&mut *tx)
+        .await?;
         if failures >= limits.max_failures_per_day {
             return Ok(CodeIssue::Limited {
                 retry_after_seconds: 3600,
             });
         }
         sqlx::query(
-            "UPDATE verification_codes SET consumed_at = $3
+            "INSERT INTO verification_code_requests (id, user_id, purpose, requester, created_at)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(user_id)
+        .bind(purpose)
+        .bind(requester)
+        .bind(timestamp)
+        .execute(&mut *tx)
+        .await?;
+
+        // A live code for the same address, with enough life left to be
+        // typed, is sent again rather than replaced.
+        let live: Option<(Uuid, String, NaiveDateTime)> = sqlx::query_as(
+            "SELECT id, code_enc, expires_at FROM verification_codes
+             WHERE user_id = $1 AND purpose = $2 AND consumed_at IS NULL
+               AND code_enc IS NOT NULL AND LOWER(target_email) = LOWER($3)
+               AND expires_at >= $4
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(purpose)
+        .bind(target_email)
+        .bind(timestamp + min_remaining)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((id, code_enc, expires_at)) = live {
+            tx.commit().await?;
+            return Ok(CodeIssue::Resent {
+                id,
+                code_enc,
+                expires_at,
+            });
+        }
+
+        sqlx::query(
+            "UPDATE verification_codes SET consumed_at = $3, code_enc = NULL
              WHERE user_id = $1 AND purpose = $2 AND consumed_at IS NULL",
         )
         .bind(user_id)
@@ -271,14 +351,15 @@ impl SecurityRepository for SecurityRepositoryImpl {
         .await?;
         let id = Uuid::now_v7();
         sqlx::query(
-            "INSERT INTO verification_codes (id, user_id, purpose, code_hash, target_email, attempts,
-                                             expires_at, ip_address, created_at)
-             VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8)",
+            "INSERT INTO verification_codes (id, user_id, purpose, code_hash, code_enc, target_email,
+                                             attempts, expires_at, ip_address, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8, $9)",
         )
         .bind(id)
         .bind(user_id)
         .bind(purpose)
         .bind(code_hash)
+        .bind(code_enc)
         .bind(target_email)
         .bind(expires_at)
         .bind(ip)
@@ -364,7 +445,8 @@ impl SecurityRepository for SecurityRepositoryImpl {
 
     async fn consume_code(&self, id: Uuid) -> Result<bool, ApiError> {
         let result = sqlx::query(
-            "UPDATE verification_codes SET consumed_at = $2 WHERE id = $1 AND consumed_at IS NULL",
+            "UPDATE verification_codes SET consumed_at = $2, code_enc = NULL
+             WHERE id = $1 AND consumed_at IS NULL",
         )
         .bind(id)
         .bind(now())
@@ -740,6 +822,20 @@ impl SecurityRepository for SecurityRepositoryImpl {
             .execute(&self.db)
             .await?
             .rows_affected();
+        // Requests only matter for their window (a day at most).
+        sqlx::query("DELETE FROM verification_code_requests WHERE created_at < $1")
+            .bind(cutoff)
+            .execute(&self.db)
+            .await?;
+        // A live code that expired keeps its hash for the failure count,
+        // never the code itself.
+        sqlx::query(
+            "UPDATE verification_codes SET code_enc = NULL
+             WHERE code_enc IS NOT NULL AND (expires_at < $1 OR consumed_at IS NOT NULL)",
+        )
+        .bind(now())
+        .execute(&self.db)
+        .await?;
         let challenges = sqlx::query("DELETE FROM login_challenges WHERE expires_at < $1")
             .bind(cutoff)
             .execute(&self.db)
