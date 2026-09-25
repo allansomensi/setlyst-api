@@ -1,7 +1,11 @@
 use crate::utils::rate_limit::presets;
 use crate::{
     controllers::pin::{mark_one, mark_pinned},
-    database::{AppState, repositories::song_repository::SongFilter},
+    controllers::setlist::sync_band_copy_from,
+    database::{
+        AppState,
+        repositories::song_repository::{BandCopyScope, SongFilter},
+    },
     errors::api_error::{ApiError, codes},
     export::{
         chordpro::{chordpro_filename, render_song, render_songs},
@@ -20,8 +24,8 @@ use crate::{
         quota::QuotaResource,
         resolve_page,
         song::{
-            CreateSongPayload, RenameTagPayload, Song, SongExport, SongListQuery, SongSetlistRef,
-            TagCount, Tonality, UpdateSongPayload,
+            BandCopyStatus, CreateSongPayload, RenameTagPayload, Song, SongExport, SongListQuery,
+            SongSetlistRef, TagCount, Tonality, UpdateSongPayload,
         },
     },
     services::entitlements::{Feature, ensure_feature, has_feature},
@@ -138,6 +142,122 @@ pub async fn find_song_setlists(
         .await?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(state.song_repo.setlists_of(id, user_id).await?))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/songs/{id}/band-copies",
+    tags = ["Songs"],
+    summary = "Band copies of one of the caller's songs.",
+    description = "A band plays its own copy of a member's song, so editing the original never changes the band's version behind its back. This tells the member who contributed a song how each copy compares to their original (`has_updates`, `band_edited`) and whether they may update it (`can_update`, see `POST /songs/{id}/sync`).\n\nFor a personal song: its copies in the caller's bands. For a band's copy: that copy, when its original is the caller's (otherwise an empty list: other members' songs stay private).",
+    params(("id" = Uuid, Path, description = "The song ID")),
+    security(("jwt_token" = [])),
+    responses(
+        (status = 200, description = "Band copies, by band name.", body = [BandCopyStatus]),
+        (status = 404, description = "Song not found.")
+    )
+)]
+pub async fn find_song_band_copies(
+    Path(id): Path<Uuid>,
+    State(state): State<AppState>,
+    access: AccessControl,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+    let song = state
+        .song_repo
+        .find_by_id(id, user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let scope = match song.band_id {
+        Some(_) => BandCopyScope::Copy(id),
+        None => BandCopyScope::Source(id),
+    };
+    Ok(Json(state.song_repo.band_copies(user_id, scope).await?))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/bands/{id}/song-updates",
+    tags = ["Songs"],
+    summary = "Band songs the caller can bring up to date.",
+    description = "The band's copies of the caller's personal songs whose original has changes the copy lacks (see `GET /songs/{id}/band-copies`). Any member.",
+    params(("id" = Uuid, Path, description = "The band ID")),
+    security(("jwt_token" = [])),
+    responses(
+        (status = 200, description = "Outdated band copies, by band name.", body = [BandCopyStatus]),
+        (status = 404, description = "Band not found, or the caller isn't a member.")
+    )
+)]
+pub async fn find_band_song_updates(
+    Path(band_id): Path<Uuid>,
+    State(state): State<AppState>,
+    access: AccessControl,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+    state
+        .band_repo
+        .role_of(band_id, user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let mut copies = state
+        .song_repo
+        .band_copies(user_id, BandCopyScope::Band(band_id))
+        .await?;
+    copies.retain(|copy| copy.has_updates);
+    Ok(Json(copies))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/songs/{id}/sync",
+    tags = ["Songs"],
+    summary = "Update a band's copy of a song from its original.",
+    description = "Replaces the band's copy's title, artist, fields, links and tags with those of the personal song it was copied from; edits the band made to its copy are replaced (`band_edited`). Only the member who contributed the song, while that original still exists (`SONG_ORIGINAL_UNAVAILABLE`, 409), with the band's `manage_songs` permission. The copy keeps its place in every setlist.",
+    params(("id" = Uuid, Path, description = "The band's copy")),
+    security(("jwt_token" = [])),
+    responses(
+        (status = 200, description = "The copy, now in step with its original.", body = BandCopyStatus),
+        (status = 403, description = "Not allowed to manage the band's songs."),
+        (status = 404, description = "Song not found."),
+        (status = 409, description = "No original of the caller's to update from.")
+    )
+)]
+pub async fn sync_band_song(
+    Path(id): Path<Uuid>,
+    State(state): State<AppState>,
+    access: AccessControl,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+    state.song_repo.can_manage(id, user_id).await?;
+
+    let original_unavailable = || {
+        ApiError::rule(
+            StatusCode::CONFLICT,
+            codes::SONG_ORIGINAL_UNAVAILABLE,
+            "Only the member who added this song to the band can update it from their own version, while it still exists.",
+        )
+    };
+    let status = state
+        .song_repo
+        .band_copies(user_id, BandCopyScope::Copy(id))
+        .await?
+        .pop()
+        .ok_or_else(original_unavailable)?;
+    let source = state
+        .song_repo
+        .find_with_artist_name(status.source_id)
+        .await?
+        .ok_or_else(original_unavailable)?;
+
+    sync_band_copy_from(&state, status.band_id, id, &source, user_id).await?;
+
+    let updated = state
+        .song_repo
+        .band_copies(user_id, BandCopyScope::Copy(id))
+        .await?
+        .pop()
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(updated))
 }
 
 #[utoipa::path(

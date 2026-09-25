@@ -156,7 +156,9 @@ async fn add_suggested_song(
         source.performance_notes = None;
     }
 
-    let band_song = band_song_for(state, row.band_id, &source, actor_id).await?;
+    let band_song = band_song_for(state, row.band_id, &source, actor_id)
+        .await?
+        .id;
     if !state.setlist_repo.has_song(setlist.id, band_song).await? {
         let quota = if setlist.is_repertoire {
             None

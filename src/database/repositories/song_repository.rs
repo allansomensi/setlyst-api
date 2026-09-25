@@ -5,8 +5,8 @@ use crate::{
         band::BandRole,
         link::Links,
         song::{
-            CreateSongPayload, Song, SongExport, SongSetlistRef, SongWithArtist, TagCount,
-            UpdateSongPayload, clean_text,
+            BandCopyStatus, CreateSongPayload, Song, SongExport, SongSetlistRef, SongWithArtist,
+            TagCount, UpdateSongPayload, clean_text,
         },
     },
     validations::link::normalize_links,
@@ -26,10 +26,21 @@ macro_rules! song_columns {
          COALESCE((SELECT array_agg(st.tag ORDER BY st.tag) FROM song_tags st WHERE st.song_id = s.id), '{}') AS tags,
          s.updated_by,
          (SELECT u.username FROM users u WHERE u.id = s.updated_by) AS updated_by_username,
-         s.created_at, s.updated_at"
+         s.source_synced_at, s.created_at, s.updated_at"
     };
 }
 pub(crate) use song_columns;
+
+/// Which band copies [`SongRepository::band_copies`] looks at.
+#[derive(Debug, Clone, Copy)]
+pub enum BandCopyScope {
+    /// One band copy.
+    Copy(Uuid),
+    /// Every band copy of one personal song.
+    Source(Uuid),
+    /// Every copy one band holds.
+    Band(Uuid),
+}
 
 /// Filters for listing a user's personal songs.
 #[derive(Debug, Default, Clone)]
@@ -114,6 +125,24 @@ pub trait SongRepository: Send + Sync {
         band_id: Uuid,
         source_id: Uuid,
     ) -> Result<Option<Uuid>, ApiError>;
+    /// Band copies of `user_id`'s live personal songs, in bands they
+    /// belong to, with how each compares to its original (see
+    /// [`BandCopyStatus`]). Ordered by band name.
+    async fn band_copies(
+        &self,
+        user_id: Uuid,
+        scope: BandCopyScope,
+    ) -> Result<Vec<BandCopyStatus>, ApiError>;
+    /// Replaces a band copy's content (title, fields, links, tags) with
+    /// `source`'s, pointing it at the band's `artist_id`, and marks it as
+    /// matching its original again.
+    async fn sync_band_copy(
+        &self,
+        copy_id: Uuid,
+        source: &SongWithArtist,
+        artist_id: Uuid,
+        actor_id: Uuid,
+    ) -> Result<(), ApiError>;
     /// The caller's personal tag vocabulary with usage counts.
     async fn list_tags(&self, user_id: Uuid) -> Result<Vec<TagCount>, ApiError>;
     /// Renames (or merges into an existing) tag across the caller's
@@ -692,8 +721,9 @@ impl SongRepository for SongRepositoryImpl {
         // the partial unique index on (band_id, forked_from).
         let (song_id, inserted): (Uuid, bool) = sqlx::query_as(
             "INSERT INTO songs (id, title, artist_id, user_id, band_id, forked_from, tempo, lyrics, tonality, genre, duration,
-                                energy, time_signature, capo, tuning, performance_notes, links, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+                                energy, time_signature, capo, tuning, performance_notes, links, created_at, updated_at,
+                                source_synced_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $19)
              ON CONFLICT (band_id, forked_from)
                 WHERE band_id IS NOT NULL AND forked_from IS NOT NULL AND deleted_at IS NULL
              DO UPDATE SET updated_at = songs.updated_at
@@ -747,6 +777,90 @@ impl SongRepository for SongRepositoryImpl {
         .fetch_optional(&self.db)
         .await?;
         Ok(id)
+    }
+
+    async fn band_copies(
+        &self,
+        user_id: Uuid,
+        scope: BandCopyScope,
+    ) -> Result<Vec<BandCopyStatus>, ApiError> {
+        let (copy_id, source_id, band_id) = match scope {
+            BandCopyScope::Copy(id) => (Some(id), None, None),
+            BandCopyScope::Source(id) => (None, Some(id), None),
+            BandCopyScope::Band(id) => (None, None, Some(id)),
+        };
+        // Admins and owners always manage songs; other roles as the band
+        // configured (as in `can_manage`).
+        let copies = sqlx::query_as::<_, BandCopyStatus>(
+            "SELECT c.id AS song_id, c.band_id, b.name AS band_name, src.id AS source_id,
+                    src.updated_at > COALESCE(c.source_synced_at, c.created_at) AS has_updates,
+                    c.updated_at > COALESCE(c.source_synced_at, c.created_at) AS band_edited,
+                    (bm.role IN ('admin', 'owner') OR COALESCE(brp.allowed, FALSE)) AS can_update,
+                    c.source_synced_at AS synced_at
+             FROM songs c
+             INNER JOIN songs src ON src.id = c.forked_from
+                 AND src.user_id = $1 AND src.band_id IS NULL AND src.deleted_at IS NULL
+             INNER JOIN bands b ON b.id = c.band_id
+             INNER JOIN band_members bm ON bm.band_id = c.band_id AND bm.user_id = $1
+             LEFT JOIN band_role_permissions brp
+                 ON brp.band_id = c.band_id AND brp.role = bm.role AND brp.permission = 'manage_songs'
+             WHERE c.band_id IS NOT NULL AND c.deleted_at IS NULL
+               AND ($2::uuid IS NULL OR c.id = $2)
+               AND ($3::uuid IS NULL OR c.forked_from = $3)
+               AND ($4::uuid IS NULL OR c.band_id = $4)
+             ORDER BY LOWER(b.name), b.id",
+        )
+        .bind(user_id)
+        .bind(copy_id)
+        .bind(source_id)
+        .bind(band_id)
+        .fetch_all(&self.db)
+        .await?;
+        Ok(copies)
+    }
+
+    async fn sync_band_copy(
+        &self,
+        copy_id: Uuid,
+        source: &SongWithArtist,
+        artist_id: Uuid,
+        actor_id: Uuid,
+    ) -> Result<(), ApiError> {
+        let now = chrono::Utc::now().naive_utc();
+        let mut tx = self.db.begin().await?;
+        // `updated_at` and `source_synced_at` get the same instant: the copy
+        // matches its original, with no band edits on top.
+        let result = sqlx::query(
+            "UPDATE songs SET title = $2, artist_id = $3, tempo = $4, lyrics = $5, tonality = $6,
+                    genre = $7, duration = $8, energy = $9, time_signature = $10, capo = $11,
+                    tuning = $12, performance_notes = $13, links = $14,
+                    updated_at = $15, updated_by = $16, source_synced_at = $15
+             WHERE id = $1 AND band_id IS NOT NULL AND deleted_at IS NULL",
+        )
+        .bind(copy_id)
+        .bind(&source.title)
+        .bind(artist_id)
+        .bind(source.tempo)
+        .bind(&source.lyrics)
+        .bind(source.tonality)
+        .bind(source.genre)
+        .bind(source.duration)
+        .bind(source.energy)
+        .bind(&source.time_signature)
+        .bind(source.capo)
+        .bind(&source.tuning)
+        .bind(&source.performance_notes)
+        .bind(sqlx::types::Json(source.links.to_stored()))
+        .bind(now)
+        .bind(actor_id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(ApiError::NotFound);
+        }
+        replace_tags(&mut tx, copy_id, &source.tags).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn list_tags(&self, user_id: Uuid) -> Result<Vec<TagCount>, ApiError> {

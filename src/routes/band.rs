@@ -1,5 +1,5 @@
 use crate::{
-    controllers::{band, band_note, gig, setlist, suggestion, tour},
+    controllers::{band, band_note, gig, setlist, song, suggestion, tour},
     database::AppState,
     middlewares::client_ip::ClientIpKeyExtractor,
 };
@@ -55,6 +55,10 @@ pub fn create_routes(state: AppState) -> Router {
         .route(
             "/{id}/repertoire",
             axum::routing::get(setlist::find_band_repertoire),
+        )
+        .route(
+            "/{id}/song-updates",
+            axum::routing::get(song::find_band_song_updates),
         )
         .route("/{id}/tours", axum::routing::get(tour::find_band_tours))
         .route(

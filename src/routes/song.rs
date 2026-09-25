@@ -18,6 +18,8 @@ pub fn create_routes(state: AppState) -> Router {
             patch(song::rename_song_tag).delete(song::delete_song_tag),
         )
         .route("/{id}/setlists", get(song::find_song_setlists))
+        .route("/{id}/band-copies", get(song::find_song_band_copies))
+        .route("/{id}/sync", post(song::sync_band_song))
         .route("/{id}/export/pdf", get(song::export_song_pdf))
         .route("/{id}/export/chordpro", get(song::export_song_chordpro))
         // Lyrics make song bodies the largest ordinary payloads.

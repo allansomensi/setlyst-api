@@ -214,6 +214,9 @@ use utoipa::{
         // Songs
         song::find_song_by_id,
         song::find_song_setlists,
+        song::find_song_band_copies,
+        song::find_band_song_updates,
+        song::sync_band_song,
         song::find_all_songs,
         song::create_song,
         song::update_song,

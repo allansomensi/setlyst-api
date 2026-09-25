@@ -491,6 +491,10 @@ pub struct Song {
     /// Whether the *caller* pinned this song to their home screen.
     #[sqlx(default)]
     pub is_pinned: bool,
+    /// Band copies: when the copy last matched its original (see
+    /// [`SongOrigin`]). `None` for personal songs.
+    #[sqlx(default)]
+    pub source_synced_at: Option<NaiveDateTime>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -508,6 +512,30 @@ pub struct SongSetlistRef {
     pub band_name: Option<String>,
     /// The song's position in that setlist.
     pub position: i32,
+}
+
+/// A band's copy of one of the caller's personal songs, and whether the two
+/// have drifted apart since the copy last matched its original.
+///
+/// Only the member who contributed a song sees these: another member's
+/// personal catalog stays private.
+#[derive(ToSchema, Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct BandCopyStatus {
+    /// The band's copy.
+    pub song_id: Uuid,
+    pub band_id: Uuid,
+    pub band_name: String,
+    /// The caller's personal song it was copied from.
+    pub source_id: Uuid,
+    /// The original has changes the band's copy doesn't have yet.
+    pub has_updates: bool,
+    /// The band edited its copy since it last matched the original:
+    /// updating it from the original replaces those edits.
+    pub band_edited: bool,
+    /// The caller may update the copy (the band's `manage_songs`).
+    pub can_update: bool,
+    /// When the copy last matched its original.
+    pub synced_at: Option<NaiveDateTime>,
 }
 
 /// Accepted time signatures.
@@ -672,6 +700,7 @@ impl Song {
             updated_by: None,
             updated_by_username: None,
             is_pinned: false,
+            source_synced_at: None,
             created_at: now,
             updated_at: now,
         }
@@ -710,6 +739,7 @@ impl Song {
             updated_by: None,
             updated_by_username: None,
             is_pinned: false,
+            source_synced_at: Some(now),
             created_at: now,
             updated_at: now,
         }
@@ -722,6 +752,7 @@ impl Song {
         let mut song = Self::fork_for_band(source, Uuid::nil(), artist_id, user_id);
         song.band_id = None;
         song.forked_from = None;
+        song.source_synced_at = None;
         song
     }
 }
@@ -779,6 +810,8 @@ pub struct SongWithArtist {
     pub updated_by: Option<Uuid>,
     #[sqlx(default)]
     pub updated_by_username: Option<String>,
+    #[sqlx(default)]
+    pub source_synced_at: Option<NaiveDateTime>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }

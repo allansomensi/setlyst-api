@@ -1843,6 +1843,7 @@ mod tests {
             tags: vec!["balada".to_string()],
             updated_by: None,
             updated_by_username: None,
+            source_synced_at: None,
             created_at: now,
             updated_at: now,
         }

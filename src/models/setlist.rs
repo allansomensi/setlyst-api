@@ -99,6 +99,35 @@ pub struct AddSongToSetlistPayload {
     pub song_id: Uuid,
 }
 
+/// What became of the band's copy when one of the caller's personal songs
+/// was added to a band setlist.
+#[derive(ToSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BandCopyOutcome {
+    /// The song was copied into the band.
+    Created,
+    /// The band's copy was already in step with the original.
+    Reused,
+    /// The band's copy was untouched since it was made, and was brought up
+    /// to date with the original's latest changes.
+    Updated,
+    /// The band's copy was used as it is, although the original has
+    /// changes it lacks: the band edited its copy too (updating would
+    /// replace those edits), or the caller can't edit the band's songs.
+    /// `POST /songs/{id}/sync` takes the original's version.
+    Outdated,
+}
+
+/// `POST /setlists/{id}/songs`.
+#[derive(ToSchema, Debug, Clone, Serialize, Deserialize)]
+pub struct AddedSetlistSong {
+    /// The song now in the setlist: in a band setlist, the band's copy.
+    pub song_id: Uuid,
+    /// Band setlists, when a personal song was added: what became of the
+    /// band's copy.
+    pub band_copy: Option<BandCopyOutcome>,
+}
+
 /// Optional title override when duplicating a setlist. When omitted, the
 /// backend derives one from the original title (see
 /// `SetlistRepository::duplicate`).

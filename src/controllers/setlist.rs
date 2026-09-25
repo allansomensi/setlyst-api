@@ -1,6 +1,9 @@
 use crate::{
     controllers::pin::{mark_one, mark_pinned},
-    database::{AppState, repositories::quota_repository::QuotaGuard},
+    database::{
+        AppState,
+        repositories::{quota_repository::QuotaGuard, song_repository::BandCopyScope},
+    },
     errors::api_error::ApiError,
     export::{
         limiter::{MAX_PDF_ITEMS, ensure_pdf_fits, render_pdf},
@@ -15,13 +18,13 @@ use crate::{
         band::{BandPermission, BandRole},
         quota::QuotaResource,
         setlist::{
-            AddSongToSetlistPayload, CreateSetlistBlockPayload, CreateSetlistBreakPayload,
-            CreateSetlistPayload, DuplicateSetlistPayload, DuplicateSetlistResponse, PublicMarker,
-            PublicSetlist, ReorderSetlistItemsPayload, ReorderSetlistSongsPayload, Setlist,
-            SetlistItem, SetlistMarker, UpdateSetlistBlockPayload, UpdateSetlistBreakPayload,
-            UpdateSetlistPayload,
+            AddSongToSetlistPayload, AddedSetlistSong, BandCopyOutcome, CreateSetlistBlockPayload,
+            CreateSetlistBreakPayload, CreateSetlistPayload, DuplicateSetlistPayload,
+            DuplicateSetlistResponse, PublicMarker, PublicSetlist, ReorderSetlistItemsPayload,
+            ReorderSetlistSongsPayload, Setlist, SetlistItem, SetlistMarker,
+            UpdateSetlistBlockPayload, UpdateSetlistBreakPayload, UpdateSetlistPayload,
         },
-        song::PublicSong,
+        song::{PublicSong, SongWithArtist},
     },
     services::entitlements::{Feature, ensure_feature, has_feature, shared_content_visible},
     utils::share_token::token_fingerprint,
@@ -437,7 +440,7 @@ pub async fn delete_setlist(
     path = "/api/v1/setlists/{id}/songs",
     tags = ["Setlists"],
     summary = "Add a song to a setlist.",
-    description = "Adds a specific song to the end of a setlist.",
+    description = "Adds a specific song to the end of a setlist.\n\nA band setlist never links to a member's personal song: the band gets its own copy of it (and every song of a band setlist is in the band's repertoire too). When the band already has a copy of that song, it is reused, and brought up to date with the original if the band never edited it (`band_copy: updated`); a copy the band edited is left as it is (`band_copy: outdated`, see `POST /songs/{id}/sync`).",
     params(("id" = Uuid, Path, description = "The ID of the setlist")),
     request_body = AddSongToSetlistPayload,
     security(
@@ -445,7 +448,7 @@ pub async fn delete_setlist(
         ("jwt_token" = [])
     ),
     responses(
-        (status = 201, description = "Song added to setlist successfully", body = String),
+        (status = 201, description = "Song added to setlist successfully", body = AddedSetlistSong),
         (status = 404, description = "Setlist or song not found.")
     )
 )]
@@ -491,21 +494,22 @@ pub async fn add_song_to_setlist(
     // this decouples the band's setlist from that member's account, so
     // editing or deleting their own original later can never take the
     // song out from under the rest of the band.
-    let song_id_to_link = match setlist.band_id {
+    let (song_id_to_link, band_copy) = match setlist.band_id {
         Some(band_id) => {
             let source = state
                 .song_repo
                 .find_with_artist_name(payload.song_id)
                 .await?
                 .ok_or(ApiError::NotFound)?;
-            band_song_for(&state, band_id, &source, user_id).await?
+            let band_song = band_song_for(&state, band_id, &source, user_id).await?;
+            (band_song.id, band_song.copy.map(|copy| (copy, source)))
         }
         None => {
             if source_song.band_id.is_some() {
                 // Band copies stay inside their band.
                 return Err(ApiError::NotFound);
             }
-            payload.song_id
+            (payload.song_id, None)
         }
     };
 
@@ -527,16 +531,30 @@ pub async fn add_song_to_setlist(
         .await?;
     state.setlist_repo.touch(setlist_id, user_id).await?;
 
+    // Adding their song again is how a member brings the band up to date
+    // with it: an existing copy the band never edited takes the
+    // original's latest version.
+    let band_copy = match band_copy {
+        Some((BandCopyOutcome::Reused, source)) => {
+            Some(refresh_band_copy(&state, song_id_to_link, &source, user_id).await?)
+        }
+        other => other.map(|(copy, _)| copy),
+    };
+
     info!(
         %user_id,
         %setlist_id,
         song_id = %song_id_to_link,
+        ?band_copy,
         "Song added to setlist successfully"
     );
 
     Ok((
         StatusCode::CREATED,
-        Json("Song added to setlist successfully"),
+        Json(AddedSetlistSong {
+            song_id: song_id_to_link,
+            band_copy,
+        }),
     ))
 }
 
@@ -545,7 +563,7 @@ pub async fn add_song_to_setlist(
     path = "/api/v1/setlists/{id}/songs/{song_id}",
     tags = ["Setlists"],
     summary = "Remove a song from a setlist.",
-    description = "Removes a specific song from a setlist.",
+    description = "Removes a specific song from a setlist.\n\nEvery song a band plays is in its repertoire, so taking a song out of the repertoire takes it out of the band: the band's song moves to the band's trash (it leaves every band setlist, and restoring it puts it back). This also needs the band's `manage_songs` permission.",
     params(
         ("id" = Uuid, Path, description = "The ID of the setlist"),
         ("song_id" = Uuid, Path, description = "The ID of the song to remove")
@@ -574,6 +592,30 @@ pub async fn remove_song_from_setlist(
     );
 
     state.setlist_repo.can_manage(setlist_id, user_id).await?;
+    let setlist = state
+        .setlist_repo
+        .find_by_id(setlist_id, user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    if setlist.is_repertoire {
+        if !state.setlist_repo.has_song(setlist_id, song_id).await? {
+            return Err(ApiError::NotFound);
+        }
+        state.song_repo.can_manage(song_id, user_id).await?;
+        // The song keeps its place in every setlist while it is in the
+        // trash, so restoring it undoes this completely.
+        state.song_repo.trash(song_id, user_id).await?;
+        state.setlist_repo.touch(setlist_id, user_id).await?;
+        info!(
+            %user_id,
+            %setlist_id,
+            %song_id,
+            "Song removed from the band's repertoire and moved to the trash"
+        );
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
     state.setlist_repo.remove_song(setlist_id, song_id).await?;
     state.setlist_repo.touch(setlist_id, user_id).await?;
 
@@ -1101,6 +1143,14 @@ async fn item_room(
     ))
 }
 
+/// A band's song, resolved by [`band_song_for`].
+pub(crate) struct BandSong {
+    pub id: Uuid,
+    /// `Created` or `Reused` when `source` was a personal song; `None` when
+    /// it already was the band's.
+    pub copy: Option<BandCopyOutcome>,
+}
+
 /// The band's copy of `source` for `band_id`, forking the caller's personal
 /// song into the band (and resolving its artist) when needed. Band setlists
 /// never link directly to a member's personal song: this decouples the
@@ -1109,18 +1159,24 @@ async fn item_room(
 pub(crate) async fn band_song_for(
     state: &AppState,
     band_id: Uuid,
-    source: &crate::models::song::SongWithArtist,
+    source: &SongWithArtist,
     actor_id: Uuid,
-) -> Result<Uuid, ApiError> {
+) -> Result<BandSong, ApiError> {
     if source.band_id == Some(band_id) {
-        return Ok(source.id);
+        return Ok(BandSong {
+            id: source.id,
+            copy: None,
+        });
     }
     if source.band_id.is_some() {
         // Another band's copy can't be pulled into this band.
         return Err(ApiError::NotFound);
     }
     if let Some(existing) = state.song_repo.find_band_fork(band_id, source.id).await? {
-        return Ok(existing);
+        return Ok(BandSong {
+            id: existing,
+            copy: Some(BandCopyOutcome::Reused),
+        });
     }
     // Fails fast here; enforced again, under the band's quota lock, in the
     // copy's transaction (concurrent forks must not add up past it).
@@ -1148,7 +1204,67 @@ pub(crate) async fn band_song_for(
         %actor_id, %band_id, source_song_id = %source.id, forked_song_id = %forked.id,
         "Forked a personal song into an independent band copy"
     );
-    Ok(forked.id)
+    Ok(BandSong {
+        id: forked.id,
+        copy: Some(BandCopyOutcome::Created),
+    })
+}
+
+/// Brings the band's existing copy `copy_id` up to date with `source`, the
+/// actor's own original, when that is safe: the band never edited its copy
+/// (nothing of theirs is lost) and the actor may edit the band's songs.
+/// Anyone else's original is left alone (`Reused`).
+async fn refresh_band_copy(
+    state: &AppState,
+    copy_id: Uuid,
+    source: &SongWithArtist,
+    actor_id: Uuid,
+) -> Result<BandCopyOutcome, ApiError> {
+    let Some(status) = state
+        .song_repo
+        .band_copies(actor_id, BandCopyScope::Copy(copy_id))
+        .await?
+        .pop()
+    else {
+        return Ok(BandCopyOutcome::Reused);
+    };
+    if !status.has_updates {
+        return Ok(BandCopyOutcome::Reused);
+    }
+    if status.band_edited || !status.can_update {
+        return Ok(BandCopyOutcome::Outdated);
+    }
+    sync_band_copy_from(state, status.band_id, copy_id, source, actor_id).await?;
+    Ok(BandCopyOutcome::Updated)
+}
+
+/// Replaces the band copy `copy_id`'s content with `source`'s (resolving
+/// the source's artist to the band's own). The caller checks permissions.
+pub(crate) async fn sync_band_copy_from(
+    state: &AppState,
+    band_id: Uuid,
+    copy_id: Uuid,
+    source: &SongWithArtist,
+    actor_id: Uuid,
+) -> Result<(), ApiError> {
+    let band_artist = state
+        .artist_repo
+        .find_or_create_for_band(
+            band_id,
+            &source.artist_name,
+            actor_id,
+            Some(source.artist_id),
+        )
+        .await?;
+    state
+        .song_repo
+        .sync_band_copy(copy_id, source, band_artist.id, actor_id)
+        .await?;
+    info!(
+        %actor_id, %band_id, source_song_id = %source.id, band_song_id = %copy_id,
+        "Updated a band's copy of a song from its original"
+    );
+    Ok(())
 }
 
 /// Renders a setlist to PDF on the blocking pool, behind the global PDF

@@ -101,6 +101,9 @@ pub mod codes {
     pub const RESTORE_CONFLICT: &str = "RESTORE_CONFLICT";
     pub const CHORDPRO_INVALID: &str = "CHORDPRO_INVALID";
     pub const CHORDPRO_TOO_LARGE: &str = "CHORDPRO_TOO_LARGE";
+    /// A band's copy of a song can only be updated from its original by the
+    /// member who contributed it, while that original still exists. 409.
+    pub const SONG_ORIGINAL_UNAVAILABLE: &str = "SONG_ORIGINAL_UNAVAILABLE";
 
     // Moderation.
     /// The flag was already resolved (actioned or dismissed) by someone else.
