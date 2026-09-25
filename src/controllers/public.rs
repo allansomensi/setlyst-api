@@ -1,4 +1,5 @@
-//! Public endpoints (no session): legal version, plans, release notes and
+//! Public endpoints (no session): legal version, billing mode, plans,
+//! release notes and
 //! e-mail unsubscribe.
 
 use crate::{
@@ -11,12 +12,13 @@ use crate::{
     models::{
         audit::{LegalAcceptance, actions, legal_documents},
         auth::access::ClientIp,
-        billing::PublicPlan,
+        billing::{PublicBillingMode, PublicPlan},
         communication::{Category, UnsubscribeInfo, UnsubscribePayload, UnsubscribeQuery},
+        quota::QuotaLimits,
         release_note::ReleaseNote,
         user::CURRENT_TERMS_VERSION,
     },
-    services::account::user_agent,
+    services::{account::user_agent, entitlements::Entitlements},
 };
 use axum::{
     Json,
@@ -50,6 +52,33 @@ pub async fn legal_version() -> impl IntoResponse {
     Json(LegalVersion {
         version: CURRENT_TERMS_VERSION.to_string(),
     })
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/public/billing",
+    tags = ["Public"],
+    summary = "Whether the platform is in its beta, and the free tiers.",
+    description = "`beta` is `true` while plans aren't enforced: every feature is free for every verified account, within `beta_limits`. Accounts that haven't verified their e-mail get `unverified_limits` and almost no features, beta or not. Once plans are enforced, accounts without a plan get `free_limits` and `free_features`, and the sign-up trial (`trial_days` of `trial_plan`) starts when the e-mail is verified.",
+    responses((status = 200, description = "Billing mode.", body = PublicBillingMode))
+)]
+pub async fn billing_mode(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let settings = state.billing_repo.get_settings().await?;
+    let free = Entitlements {
+        enforced: true,
+        is_staff: false,
+        email_verified: true,
+        plan: None,
+    };
+    Ok(Json(PublicBillingMode {
+        beta: !settings.enforced,
+        trial_days: settings.trial_days,
+        trial_plan: settings.trial_plan,
+        beta_limits: state.quota_repo.get_defaults().await?,
+        free_limits: QuotaLimits::FREE,
+        free_features: free.features(),
+        unverified_limits: QuotaLimits::UNVERIFIED,
+    }))
 }
 
 #[utoipa::path(

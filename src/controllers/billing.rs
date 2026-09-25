@@ -100,6 +100,7 @@ pub async fn redeem_code(
     access: AccessControl,
     Json(payload): Json<RedeemCodePayload>,
 ) -> Result<impl IntoResponse, ApiError> {
+    reject_staff(&access)?;
     payload.validate()?;
     if let Err(retry) = REDEEM_LIMITER.check(&access.user_id()) {
         return Err(too_many_attempts(retry.as_secs() as i64));
@@ -152,6 +153,7 @@ pub async fn redeem_reward(
     access: AccessControl,
     Json(payload): Json<RedeemRewardPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
+    reject_staff(&access)?;
     payload.validate()?;
     billing::redeem_reward(&state, access.user_id(), payload.reward_id.trim()).await?;
     Ok(Json(billing::billing_me(&state, access.user_id()).await?))
@@ -203,6 +205,16 @@ pub async fn history(
 // Payments
 // ---------------------------------------------------------------------
 
+/// Admins and moderators already have everything: they don't buy,
+/// redeem or change plans (`STAFF_CANNOT_SUBSCRIBE`).
+fn reject_staff(access: &AccessControl) -> Result<(), ApiError> {
+    if access.is_staff() {
+        Err(billing::staff_cannot_subscribe())
+    } else {
+        Ok(())
+    }
+}
+
 /// Checkouts, plan changes and portal sessions per account per hour: each
 /// one calls the payment provider.
 static PAYMENT_LIMITER: LazyLock<SlidingWindowLimiter<Uuid>> =
@@ -236,6 +248,7 @@ pub async fn checkout(
     access: AccessControl,
     Json(payload): Json<CheckoutPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
+    reject_staff(&access)?;
     payment_attempt(&access)?;
     Ok(Json(
         payments::start_checkout(&state, access.user_id(), &payload).await?,
@@ -261,6 +274,7 @@ pub async fn change_subscription(
     access: AccessControl,
     Json(payload): Json<CheckoutPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
+    reject_staff(&access)?;
     payment_attempt(&access)?;
     Ok(Json(
         payments::change_plan(&state, access.user_id(), &payload).await?,

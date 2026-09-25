@@ -88,6 +88,9 @@ pub mod codes {
     /// Plans can't stop being enforced while paid subscriptions are live
     /// (repeat with `?force=true`).
     pub const BILLING_HAS_PAID_SUBSCRIPTIONS: &str = "BILLING_HAS_PAID_SUBSCRIPTIONS";
+    /// Admins and moderators can't buy or be granted plans: they already
+    /// have every feature and no quotas.
+    pub const STAFF_CANNOT_SUBSCRIBE: &str = "STAFF_CANNOT_SUBSCRIBE";
 
     // Content.
     pub const INVALID_LINK: &str = "INVALID_LINK";

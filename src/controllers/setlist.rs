@@ -999,7 +999,7 @@ pub async fn delete_setlist_marker(
     path = "/api/v1/setlists/{id}/export/pdf",
     tags = ["Setlists"],
     summary = "Export a setlist to PDF.",
-    description = "Generates and returns a PDF file containing the setlist's songs, blocks and breaks. Supports localization via query params.\n\n**Advanced options** (plan feature `advanced_pdf`, `FEATURE_NOT_IN_PLAN` otherwise): `columns=2`, the songbook (`include_lyrics=true`, with `page_break_per_song`), `watermark=false` and `margins` other than `normal`. Everything else (what to show, `compact`, `font_scale`, paper, orientation, chord mode, language, page numbers, subtitle) is available to every plan.\n\nAt most 200 items, and a songbook of at most 250 000 characters of lyrics and notes (`PDF_TOO_LARGE`, 413, `meta.reason` = `items` | `songbook`). At most 3 PDFs render at once; when busy for 10 s the answer is `SERVICE_BUSY` (503, `meta.retry_after_seconds`). Refused under impersonation (`IMPERSONATION_READ_ONLY`).",
+    description = "Generates and returns a PDF file containing the setlist's songs, blocks and breaks. Supports localization via query params. Without the plan feature `pdf_export` (the free tier) the export always carries the watermark (`watermark=false` is ignored).\n\n**Advanced options** (plan feature `advanced_pdf`, `FEATURE_NOT_IN_PLAN` otherwise): `columns=2`, the songbook (`include_lyrics=true`, with `page_break_per_song`), `watermark=false` and `margins` other than `normal`. Everything else (what to show, `compact`, `font_scale`, paper, orientation, chord mode, language, page numbers, subtitle) is available to every plan.\n\nAt most 200 items, and a songbook of at most 250 000 characters of lyrics and notes (`PDF_TOO_LARGE`, 413, `meta.reason` = `items` | `songbook`). At most 3 PDFs render at once; when busy for 10 s the answer is `SERVICE_BUSY` (503, `meta.retry_after_seconds`). Refused under impersonation (`IMPERSONATION_READ_ONLY`).",
     params(
         ("id" = Uuid, Path, description = "The ID of the setlist to export"),
         ExportQuery
@@ -1043,7 +1043,12 @@ pub async fn export_setlist_pdf(
         .await?
         .ok_or(ApiError::NotFound)?;
 
-    let options = PdfExportOptions::from(query);
+    let mut options = PdfExportOptions::from(query);
+    // Without a plan that includes PDF export (the free tier), setlists
+    // still export, always with the watermark.
+    if !has_feature(&state, user_id, Feature::PdfExport).await? {
+        options.watermark = true;
+    }
     if options.is_advanced() {
         ensure_feature(&state, user_id, Feature::AdvancedPdf).await?;
     }

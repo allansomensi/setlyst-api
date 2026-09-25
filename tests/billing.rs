@@ -2,8 +2,8 @@
 
 mod common;
 
-use axum::http::StatusCode;
-use common::{STRONG_PASSWORD, TestApp};
+use axum::http::{Method, StatusCode};
+use common::TestApp;
 use serde_json::json;
 use setlyst_api::{
     models::user::Role,
@@ -37,9 +37,26 @@ async fn without_enforcement_everything_is_allowed_and_defaults_apply() {
     let app = app!();
     let (user_id, token) = app.registered_user("free.rider", "free@example.com").await;
 
+    // Until the address is verified, the beta is very limited.
     let me = app.get("/billing/me", &token).await;
     assert_eq!(me.status, StatusCode::OK, "{}", me.body);
+    assert_eq!(me.body["access"], "unverified");
+    assert_eq!(me.body["email_verified"], false);
+    assert_eq!(me.body["features"]["create_bands"], false);
+    assert_eq!(me.body["features"]["pdf_export"], false);
+    let refused = ensure_feature(&app.state, user_id, Feature::Tours)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), "EMAIL_NOT_VERIFIED");
+    let quotas = app.get("/users/me/quotas", &token).await;
+    assert_eq!(limit(&quotas.body, "songs"), 20, "unverified tier");
+    assert_eq!(limit(&quotas.body, "bands_owned"), 0);
+
+    app.verify_email(&token, "free@example.com").await;
+    let me = app.get("/billing/me", &token).await;
     assert_eq!(me.body["enforced"], false);
+    assert_eq!(me.body["access"], "beta");
+    assert_eq!(me.body["can_subscribe"], true);
     assert!(me.body["plan"].is_null());
     assert!(
         me.body["subscription"].is_null(),
@@ -65,6 +82,17 @@ async fn without_enforcement_everything_is_allowed_and_defaults_apply() {
 
     let quotas = app.get("/users/me/quotas", &token).await;
     assert_eq!(limit(&quotas.body, "songs"), 1000, "platform default");
+
+    // The public mode says so.
+    let mode = app
+        .request(Method::GET, "/public/billing", None, None)
+        .await;
+    assert_eq!(mode.status, StatusCode::OK, "{}", mode.body);
+    assert_eq!(mode.body["beta"], true);
+    assert_eq!(mode.body["beta_limits"]["songs"], 1000);
+    assert_eq!(mode.body["free_limits"]["bands_owned"], 1);
+    assert_eq!(mode.body["free_features"]["tours"], false);
+    assert_eq!(mode.body["unverified_limits"]["songs"], 20);
 }
 
 #[tokio::test]
@@ -95,14 +123,19 @@ async fn enforcement_applies_plans_trials_and_limits() {
     assert_eq!(me.body["plan"]["code"], "pro");
     assert_eq!(me.body["features"]["priority_support"], true);
 
-    // Accounts without a plan get nothing, and default quotas.
-    let bare = app
-        .create_user("bare.user", STRONG_PASSWORD, Role::User)
-        .await;
-    let bare_token = app.login("bare.user", STRONG_PASSWORD).await;
+    // Accounts without a plan get the free tier: one band, no tours, no
+    // PDF or report exports.
+    let (bare, bare_token) = app.user("bare.user", Role::User).await;
     let bare_me = app.get("/billing/me", &bare_token).await;
     assert!(bare_me.body["plan"].is_null());
+    assert_eq!(bare_me.body["access"], "free");
     assert_eq!(bare_me.body["features"]["tours"], false);
+    assert_eq!(bare_me.body["features"]["pdf_export"], false);
+    assert_eq!(bare_me.body["features"]["analytics_export"], false);
+    assert_eq!(bare_me.body["features"]["create_bands"], true);
+    let free_quotas = app.get("/users/me/quotas", &bare_token).await;
+    assert_eq!(limit(&free_quotas.body, "bands_owned"), 1);
+    assert_eq!(limit(&free_quotas.body, "tours"), 0);
     let refused = ensure_feature(&app.state, bare, Feature::Tours)
         .await
         .unwrap_err();
@@ -133,7 +166,7 @@ async fn enforcement_applies_plans_trials_and_limits() {
     assert_eq!(granted.body["subscription"]["plan_code"], "basic");
     assert_eq!(granted.body["subscription"]["source"], "admin");
     let quotas = app.get("/users/me/quotas", &bare_token).await;
-    assert_eq!(limit(&quotas.body, "songs"), 300);
+    assert_eq!(limit(&quotas.body, "songs"), 250);
     assert_eq!(limit(&quotas.body, "tours"), 0);
     app.put(
         &format!("/users/{bare}/quotas"),
@@ -174,7 +207,7 @@ async fn enforcement_applies_plans_trials_and_limits() {
     assert_eq!(history.body[0]["kind"], "revoked");
 
     // Moderators may look but not grant.
-    let (_, moderator) = app.user("billing.mod", Role::Moderator).await;
+    let (mod_id, moderator) = app.user("billing.mod", Role::Moderator).await;
     assert_eq!(
         app.get(&format!("/admin/users/{bare}/subscription"), &moderator)
             .await
@@ -194,9 +227,41 @@ async fn enforcement_applies_plans_trials_and_limits() {
     let overview = app.get("/admin/billing/overview", &moderator).await;
     assert_eq!(overview.body["enforced"], true);
 
-    // Grant trials to everyone without a subscription.
-    app.create_user("later.user", STRONG_PASSWORD, Role::User)
+    // Staff have everything already and can't subscribe to anything.
+    let mod_me = app.get("/billing/me", &moderator).await;
+    assert_eq!(mod_me.body["access"], "staff");
+    assert_eq!(mod_me.body["can_subscribe"], false);
+    assert!(
+        mod_me.body["features"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|v| v == true)
+    );
+    let mod_quotas = app.get("/users/me/quotas", &moderator).await;
+    assert_eq!(mod_quotas.body["unlimited"], true);
+    let staff_grant = app
+        .put(
+            &format!("/admin/users/{mod_id}/subscription"),
+            &admin,
+            json!({ "plan_code": "pro", "days": 30 }),
+        )
         .await;
+    assert_eq!(staff_grant.code(), "STAFF_CANNOT_SUBSCRIBE");
+    let staff_checkout = app
+        .post(
+            "/billing/checkout",
+            &moderator,
+            json!({ "plan_code": "pro", "interval": "monthly" }),
+        )
+        .await;
+    assert_eq!(staff_checkout.code(), "STAFF_CANNOT_SUBSCRIBE");
+
+    // Grant trials to everyone without a subscription.
+    // Staff and unverified accounts are left out (the latter get their
+    // trial once they verify).
+    let (later, later_token) = app.user("later.user", Role::User).await;
+    let (unverified, _) = app.unverified_user("later.unverified", Role::User).await;
     let trials = app
         .post("/admin/billing/grant-trials", &admin, json!({ "days": 7 }))
         .await;
@@ -205,6 +270,19 @@ async fn enforcement_applies_plans_trials_and_limits() {
         "{}",
         trials.body
     );
+    assert_eq!(
+        app.get("/billing/me", &later_token).await.body["subscription"]["status"],
+        "trialing"
+    );
+    for (id, expected) in [(later, true), (unverified, false), (mod_id, false)] {
+        let has: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM subscriptions WHERE user_id = $1)")
+                .bind(id)
+                .fetch_one(&app.pool)
+                .await
+                .unwrap();
+        assert_eq!(has, expected, "{id}");
+    }
 }
 
 #[tokio::test]

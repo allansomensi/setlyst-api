@@ -123,7 +123,7 @@ async fn songs_carry_performance_fields_and_validated_links() {
 #[tokio::test]
 async fn songs_export_to_chordpro_and_pdf() {
     let app = app!();
-    let (_, user) = app.user("exporter", Role::User).await;
+    let (user_id, user) = app.user("exporter", Role::User).await;
     let artist = app.artist(&user, "Jobim").await;
     let song = app
         .post(
@@ -177,8 +177,21 @@ async fn songs_export_to_chordpro_and_pdf() {
             .contains("song-")
     );
 
-    // Advanced options need the plan feature; basic ones don't.
+    // Without a plan there are no PDFs; a paid plan exports them, and
+    // advanced options need a bigger plan.
     app.enforce_billing().await;
+    let free = app
+        .get(&format!("/songs/{id}/export/pdf?font_scale=150"), &user)
+        .await;
+    assert_eq!(free.code(), "FEATURE_NOT_IN_PLAN");
+    assert_eq!(free.body["meta"]["feature"], "pdf_export");
+    let (_, admin) = app.user("exportadmin", Role::Admin).await;
+    app.put(
+        &format!("/admin/users/{user_id}/subscription"),
+        &admin,
+        json!({ "plan_code": "basic", "days": 30 }),
+    )
+    .await;
     let advanced = app
         .get(&format!("/songs/{id}/export/pdf?columns=2"), &user)
         .await;

@@ -3,7 +3,10 @@
 //! The platform runs on modest infrastructure, so every kind of content a
 //! user can create is capped. Limits come from platform-wide defaults
 //! (editable by admins) and can be overridden per user, or lifted entirely
-//! with the `unlimited` flag. Admins are always unlimited.
+//! with the `unlimited` flag. Staff (admins and moderators) are always
+//! unlimited. Which base applies depends on the account's `AccessTier`:
+//! a plan's limits, the platform defaults (the beta), [`QuotaLimits::FREE`]
+//! or [`QuotaLimits::UNVERIFIED`].
 //!
 //! Limits are grouped by what they count:
 //!
@@ -140,26 +143,69 @@ pub struct QuotaLimits {
 }
 
 impl Default for QuotaLimits {
-    /// Generous for a working musician or band, small enough that a
-    /// single abusive account can't meaningfully load the database.
+    /// The platform defaults: what every verified account gets while plans
+    /// aren't enforced (the beta, where everything is free). Enough for a
+    /// working musician or band, small enough that a single account can't
+    /// meaningfully load the database.
     fn default() -> Self {
         Self {
             songs: 1_000,
             artists: 500,
-            setlists: 200,
+            setlists: 150,
             gigs: 500,
-            tags: 100,
-            bands_owned: 5,
-            band_memberships: 20,
-            band_members: 30,
-            band_setlists: 300,
+            tags: 80,
+            bands_owned: 3,
+            band_memberships: 10,
+            band_members: 15,
+            band_setlists: 150,
             band_gigs: 500,
-            band_songs: 2_000,
-            setlist_items: 150,
-            tours: 50,
-            band_tours: 50,
+            band_songs: 1_500,
+            setlist_items: 120,
+            tours: 15,
+            band_tours: 15,
         }
     }
+}
+
+impl QuotaLimits {
+    /// Accounts that haven't verified their e-mail address yet (and have
+    /// no plan): enough to try the app, nothing worth creating throwaway
+    /// accounts for.
+    pub const UNVERIFIED: QuotaLimits = QuotaLimits {
+        songs: 20,
+        artists: 10,
+        setlists: 2,
+        gigs: 3,
+        tags: 5,
+        bands_owned: 0,
+        band_memberships: 1,
+        band_members: 1,
+        band_setlists: 2,
+        band_gigs: 3,
+        band_songs: 20,
+        setlist_items: 25,
+        tours: 0,
+        band_tours: 0,
+    };
+
+    /// Verified accounts without a plan once plans are enforced: one band,
+    /// no tours, a small repertoire.
+    pub const FREE: QuotaLimits = QuotaLimits {
+        songs: 60,
+        artists: 40,
+        setlists: 5,
+        gigs: 20,
+        tags: 10,
+        bands_owned: 1,
+        band_memberships: 2,
+        band_members: 5,
+        band_setlists: 5,
+        band_gigs: 20,
+        band_songs: 100,
+        setlist_items: 40,
+        tours: 0,
+        band_tours: 0,
+    };
 }
 
 impl QuotaLimits {

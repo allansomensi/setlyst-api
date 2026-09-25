@@ -1,6 +1,7 @@
 use crate::{
     errors::api_error::ApiError,
     models::{
+        billing::AccessTier,
         quota::{
             QuotaLimits, QuotaOverrides, QuotaReport, QuotaResource, QuotaUsageItem,
             UserQuotaSettings,
@@ -174,9 +175,9 @@ pub trait QuotaRepository: Send + Sync {
         actor_id: Uuid,
     ) -> Result<(), ApiError>;
     /// The limits that apply to `user_id`, or `None` when they are exempt
-    /// (admins, or the per-user `unlimited` flag): the plan's limits when
-    /// plans are enforced (platform defaults without a plan), the platform
-    /// defaults otherwise, then the per-user overrides.
+    /// (staff, or the per-user `unlimited` flag): by [`AccessTier`], the
+    /// plan's limits, `QuotaLimits::UNVERIFIED`, `QuotaLimits::FREE` or the
+    /// platform defaults (the beta), then the per-user overrides.
     async fn effective_limits(&self, user_id: Uuid) -> Result<Option<QuotaLimits>, ApiError>;
     /// Current usage for every per-user resource plus the effective
     /// per-band/per-setlist limits.
@@ -355,12 +356,18 @@ impl QuotaRepository for QuotaRepositoryImpl {
     }
 
     async fn effective_limits(&self, user_id: Uuid) -> Result<Option<QuotaLimits>, ApiError> {
-        let role: Option<Role> = sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
-            .bind(user_id)
-            .fetch_optional(&self.db)
-            .await?;
+        let row: Option<(Role, bool)> = sqlx::query_as(
+            "SELECT role, (email_verified_at IS NOT NULL AND email IS NOT NULL) FROM users WHERE id = $1",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.db)
+        .await?;
+        let (is_staff, email_verified) = row
+            .map(|(role, verified)| (role.is_staff(), verified))
+            .unwrap_or((false, true));
 
-        if role == Some(Role::Admin) {
+        // Staff already have access to everything.
+        if is_staff {
             return Ok(None);
         }
 
@@ -369,17 +376,22 @@ impl QuotaRepository for QuotaRepositoryImpl {
             return Ok(None);
         }
 
-        // With plans enforced, the plan's limits replace the platform
-        // defaults (accounts without a plan keep the defaults); per-user
+        // See `AccessTier`: the plan's limits while plans are enforced,
+        // the platform defaults in the beta, and the small built-in tiers
+        // for unverified accounts and accounts without a plan. Per-user
         // overrides apply on top either way.
         let billing = super::billing_repository::load_settings(&self.db).await?;
-        let base = if billing.enforced {
-            match super::billing_repository::load_effective_plan(&self.db, user_id).await? {
-                Some(plan) => plan.limits,
-                None => self.get_defaults().await?,
-            }
+        let plan = if billing.enforced {
+            super::billing_repository::load_effective_plan(&self.db, user_id).await?
         } else {
-            self.get_defaults().await?
+            None
+        };
+        let tier = AccessTier::resolve(false, billing.enforced, plan.is_some(), email_verified);
+        let base = match (tier, plan) {
+            (AccessTier::Plan, Some(plan)) => plan.limits,
+            (AccessTier::Unverified, _) => QuotaLimits::UNVERIFIED,
+            (AccessTier::Free, _) => QuotaLimits::FREE,
+            _ => self.get_defaults().await?,
         };
         Ok(Some(base.with_overrides(&settings.overrides)))
     }

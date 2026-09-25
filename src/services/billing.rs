@@ -13,7 +13,7 @@ use crate::{
     errors::api_error::{ApiError, codes},
     models::{
         billing::{
-            BillingInterval, BillingMe, BillingSettings, CreditsSummary, PromoKind,
+            AccessTier, BillingInterval, BillingMe, BillingSettings, CreditsSummary, PromoKind,
             RedemptionSummary, ReferralSummary, Subscription, SubscriptionSource,
             SubscriptionStatus, WITHDRAWAL_DAYS, subscription_in_effect,
         },
@@ -82,6 +82,31 @@ impl LockedSubscription {
     /// A paid subscription the payment provider is still charging for.
     fn is_paid_and_effective(&self, at: NaiveDateTime) -> bool {
         self.source == SubscriptionSource::Payment && self.is_effective(at)
+    }
+}
+
+/// Refused for staff accounts: they already have everything.
+pub fn staff_cannot_subscribe() -> ApiError {
+    ApiError::rule(
+        StatusCode::FORBIDDEN,
+        codes::STAFF_CANNOT_SUBSCRIBE,
+        "Admins and moderators already have every feature and can't subscribe to plans.",
+    )
+}
+
+/// Fails with `STAFF_CANNOT_SUBSCRIBE` when `user_id` is an admin or a
+/// moderator.
+pub async fn ensure_not_staff(conn: &mut PgConnection, user_id: Uuid) -> Result<(), ApiError> {
+    let is_staff: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM users WHERE id = $1 AND role IN ('admin', 'moderator'))",
+    )
+    .bind(user_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    if is_staff {
+        Err(staff_cannot_subscribe())
+    } else {
+        Ok(())
     }
 }
 
@@ -204,6 +229,7 @@ pub async fn grant_plan_time(
     note: Option<&str>,
     reference: Value,
 ) -> Result<GrantOutcome, ApiError> {
+    ensure_not_staff(conn, user_id).await?;
     ensure_plan_exists(conn, plan_code).await?;
     let current = lock_subscription(conn, user_id).await?;
     let timestamp = now();
@@ -295,7 +321,7 @@ pub async fn grant_plan_time(
 
 /// Starts a trial of `plan_code` for `days`, replacing an expired or
 /// canceled subscription. Returns `None` when the account already has a
-/// subscription in effect.
+/// subscription in effect, or is staff (who have everything already).
 pub async fn start_trial(
     conn: &mut PgConnection,
     user_id: Uuid,
@@ -303,6 +329,9 @@ pub async fn start_trial(
     days: i64,
     actor_id: Option<Uuid>,
 ) -> Result<Option<GrantOutcome>, ApiError> {
+    if ensure_not_staff(conn, user_id).await.is_err() {
+        return Ok(None);
+    }
     ensure_plan_exists(conn, plan_code).await?;
     let current = lock_subscription(conn, user_id).await?;
     let timestamp = now();
@@ -1477,6 +1506,10 @@ pub async fn grant_trials(state: &AppState, days: i64, actor_id: Uuid) -> Result
          SELECT u.id, $1, 'trialing', 'trial', $2, $3, $3, FALSE, $2, $2, $4
          FROM users u
          WHERE NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.user_id = u.id)
+           -- Staff have everything already; unverified accounts get their
+           -- trial once they verify their e-mail.
+           AND u.role = 'user'
+           AND u.email IS NOT NULL AND u.email_verified_at IS NOT NULL
          RETURNING user_id",
     )
     .bind(&settings.trial_plan)
@@ -1897,8 +1930,12 @@ pub async fn billing_me(state: &AppState, user_id: Uuid) -> Result<BillingMe, Ap
     let withdrawal_eligible_until = withdrawal_eligible_until(state, user_id)
         .await?
         .map(|t| t.and_utc());
+    let access = entitlements.tier();
     Ok(BillingMe {
         enforced: settings.enforced,
+        access,
+        email_verified: entitlements.email_verified,
+        can_subscribe: access != AccessTier::Staff,
         payments_enabled: state.payments.is_some(),
         plan,
         subscription,

@@ -23,6 +23,7 @@ pub fn create_routes(state: AppState) -> Router {
 
     Router::new()
         .route("/public/legal/version", get(public::legal_version))
+        .route("/public/billing", get(public::billing_mode))
         .route("/public/plans", get(public::list_plans))
         .route("/public/release-notes", get(public::list_release_notes))
         .merge(unsubscribe_routes)

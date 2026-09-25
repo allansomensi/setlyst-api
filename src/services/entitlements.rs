@@ -1,15 +1,21 @@
 //! Plan entitlements: which features an account may use.
 //!
-//! While subscriptions are not enforced (the platform setting
-//! `billing.enforced`), every account is entitled to everything. Once they
-//! are, a feature is available when the account's effective plan (a live
-//! subscription whose period hasn't ended) includes it. Admins always have
-//! every feature.
+//! See [`AccessTier`]: staff (admins and moderators) always have every
+//! feature. While subscriptions are not enforced (the platform setting
+//! `billing.enforced`, the beta), every verified account has everything.
+//! Once they are, a feature is available when the account's effective plan
+//! (a live subscription whose period hasn't ended) includes it, and
+//! accounts without a plan get the free tier ([`FREE_FEATURES`]). Accounts
+//! that haven't verified their e-mail address (and have no plan) only get
+//! [`UNVERIFIED_FEATURES`], in the beta too.
 
 use crate::{
     database::{AppState, repositories::billing_repository::load_effective_plan},
     errors::api_error::{ApiError, codes},
-    models::{billing::Plan, user::Role},
+    models::{
+        billing::{AccessTier, Plan},
+        user::Role,
+    },
 };
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -25,6 +31,7 @@ pub enum Feature {
     CreateBands,
     Tours,
     AnalyticsExport,
+    PdfExport,
     AdvancedPdf,
     ChordproImport,
     SongSuggestions,
@@ -34,10 +41,11 @@ pub enum Feature {
 }
 
 impl Feature {
-    pub const ALL: [Feature; 9] = [
+    pub const ALL: [Feature; 10] = [
         Feature::CreateBands,
         Feature::Tours,
         Feature::AnalyticsExport,
+        Feature::PdfExport,
         Feature::AdvancedPdf,
         Feature::ChordproImport,
         Feature::SongSuggestions,
@@ -51,6 +59,7 @@ impl Feature {
             Feature::CreateBands => "create_bands",
             Feature::Tours => "tours",
             Feature::AnalyticsExport => "analytics_export",
+            Feature::PdfExport => "pdf_export",
             Feature::AdvancedPdf => "advanced_pdf",
             Feature::ChordproImport => "chordpro_import",
             Feature::SongSuggestions => "song_suggestions",
@@ -61,17 +70,44 @@ impl Feature {
     }
 }
 
+/// Features of verified accounts without a plan once plans are enforced:
+/// one band (see `QuotaLimits::FREE`) and collaborating in bands; no
+/// tours, public links, PDF or report exports.
+pub const FREE_FEATURES: &[Feature] = &[
+    Feature::CreateBands,
+    Feature::SongSuggestions,
+    Feature::OfflineMode,
+];
+
+/// Features of accounts that haven't verified their e-mail address.
+pub const UNVERIFIED_FEATURES: &[Feature] = &[Feature::OfflineMode];
+
 /// What an account is entitled to right now.
 #[derive(Debug, Clone)]
 pub struct Entitlements {
     pub enforced: bool,
-    pub is_admin: bool,
+    pub is_staff: bool,
+    pub email_verified: bool,
     pub plan: Option<Plan>,
 }
 
 impl Entitlements {
+    pub fn tier(&self) -> AccessTier {
+        AccessTier::resolve(
+            self.is_staff,
+            self.enforced,
+            self.plan.is_some(),
+            self.email_verified,
+        )
+    }
+
     pub fn has(&self, feature: Feature) -> bool {
-        !self.enforced || self.is_admin || self.plan.as_ref().is_some_and(|p| p.has(feature))
+        match self.tier() {
+            AccessTier::Staff | AccessTier::Beta => true,
+            AccessTier::Plan => self.plan.as_ref().is_some_and(|p| p.has(feature)),
+            AccessTier::Unverified => UNVERIFIED_FEATURES.contains(&feature),
+            AccessTier::Free => FREE_FEATURES.contains(&feature),
+        }
     }
 
     /// Every known feature with its availability.
@@ -86,14 +122,17 @@ impl Entitlements {
 /// Loads the entitlements of `user_id`.
 pub async fn entitlements(state: &AppState, user_id: Uuid) -> Result<Entitlements, ApiError> {
     let settings = state.billing_repo.get_settings().await?;
-    let role: Option<Role> = sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(&state.db)
-        .await?;
+    let row: Option<(Role, bool)> = sqlx::query_as(
+        "SELECT role, (email_verified_at IS NOT NULL AND email IS NOT NULL) FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await?;
     let plan = load_effective_plan(&state.db, user_id).await?;
     Ok(Entitlements {
         enforced: settings.enforced,
-        is_admin: role == Some(Role::Admin),
+        is_staff: row.as_ref().is_some_and(|(role, _)| role.is_staff()),
+        email_verified: row.is_some_and(|(_, verified)| verified),
         plan,
     })
 }
@@ -168,8 +207,17 @@ pub async fn ensure_feature(
     user_id: Uuid,
     feature: Feature,
 ) -> Result<(), ApiError> {
-    if has_feature(state, user_id, feature).await? {
+    let entitlements = entitlements(state, user_id).await?;
+    if entitlements.has(feature) {
         return Ok(());
+    }
+    if entitlements.tier() == AccessTier::Unverified {
+        return Err(ApiError::rule_with_meta(
+            StatusCode::FORBIDDEN,
+            codes::EMAIL_NOT_VERIFIED,
+            "Verify your e-mail address to use this feature.",
+            json!({ "feature": feature.key() }),
+        ));
     }
     let plan = cheapest_plan_with(state, feature).await?;
     Err(ApiError::rule_with_meta(
@@ -185,25 +233,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn entitlements_follow_enforcement_role_and_plan() {
-        let open = Entitlements {
+    fn entitlements_follow_tier() {
+        let base = Entitlements {
             enforced: false,
-            is_admin: false,
+            is_staff: false,
+            email_verified: true,
             plan: None,
         };
-        assert!(open.has(Feature::Tours));
-        let enforced = Entitlements {
+        // The beta: everything.
+        assert_eq!(base.tier(), AccessTier::Beta);
+        assert!(base.has(Feature::Tours));
+
+        // Unverified, beta or not: almost nothing.
+        let unverified = Entitlements {
+            email_verified: false,
+            ..base.clone()
+        };
+        assert_eq!(unverified.tier(), AccessTier::Unverified);
+        assert!(!unverified.has(Feature::CreateBands));
+        assert!(unverified.has(Feature::OfflineMode));
+
+        // Enforced without a plan: the free tier.
+        let free = Entitlements {
             enforced: true,
-            is_admin: false,
-            plan: None,
+            ..base.clone()
         };
-        assert!(!enforced.has(Feature::Tours));
-        assert!(enforced.features().values().all(|v| !v));
-        let admin = Entitlements {
+        assert_eq!(free.tier(), AccessTier::Free);
+        assert!(free.has(Feature::CreateBands));
+        assert!(!free.has(Feature::Tours));
+        assert!(!free.has(Feature::PdfExport));
+        assert!(!free.has(Feature::AnalyticsExport));
+
+        // Staff: everything, whatever else holds.
+        let staff = Entitlements {
             enforced: true,
-            is_admin: true,
+            is_staff: true,
+            email_verified: false,
             plan: None,
         };
-        assert!(admin.has(Feature::PrioritySupport));
+        assert_eq!(staff.tier(), AccessTier::Staff);
+        assert!(staff.features().values().all(|v| *v));
     }
 }

@@ -346,6 +346,27 @@ async fn suggestions_need_the_plan_feature() {
     let app = app!();
     let (_owner, member, band, song, _) = setup_suggestions(&app).await;
     app.enforce_billing().await;
+    // A plan without suggestions.
+    sqlx::query(
+        "UPDATE plans SET features = features || '{\"song_suggestions\": false}' WHERE code = 'basic'",
+    )
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    let (_, admin) = app.user("sugadmin", Role::Admin).await;
+    let member_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM users WHERE username = 'sugmember'")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    let granted = app
+        .put(
+            &format!("/admin/users/{member_id}/subscription"),
+            &admin,
+            json!({ "plan_code": "basic", "days": 30 }),
+        )
+        .await;
+    assert_eq!(granted.status, StatusCode::OK, "{}", granted.body);
     let gated = app
         .post(
             &format!("/bands/{band}/suggestions"),

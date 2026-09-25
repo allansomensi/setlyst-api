@@ -484,7 +484,7 @@ pub async fn export_song_chordpro(
     path = "/api/v1/songs/{id}/export/pdf",
     tags = ["Songs"],
     summary = "Export one song as a PDF sheet.",
-    description = "Title, artist, a metadata line (key, capo, BPM, time signature, tuning, each toggleable), optional performance notes and the lyrics with chords (`chord_mode` hide|inline|above).\n\n**Advanced options** (plan feature `advanced_pdf`, `FEATURE_NOT_IN_PLAN` otherwise): `columns=2`, `watermark=false`, `margins` other than `normal`. Everything else is available to every plan.\n\nBand songs require the band's `export_pdf` permission. At most 3 PDFs render at once; when busy for 10 s the answer is `SERVICE_BUSY` (503, `meta.retry_after_seconds`).",
+    description = "Title, artist, a metadata line (key, capo, BPM, time signature, tuning, each toggleable), optional performance notes and the lyrics with chords (`chord_mode` hide|inline|above). Needs the plan feature `pdf_export` (`FEATURE_NOT_IN_PLAN`; `EMAIL_NOT_VERIFIED` before the e-mail is verified).\n\n**Advanced options** (plan feature `advanced_pdf`, `FEATURE_NOT_IN_PLAN` otherwise): `columns=2`, `watermark=false`, `margins` other than `normal`. Everything else is available to every plan.\n\nBand songs require the band's `export_pdf` permission. At most 3 PDFs render at once; when busy for 10 s the answer is `SERVICE_BUSY` (503, `meta.retry_after_seconds`).",
     params(("id" = Uuid, Path, description = "The song ID"), SongExportQuery),
     security(("jwt_token" = [])),
     responses(
@@ -502,6 +502,7 @@ pub async fn export_song_pdf(
 ) -> Result<axum::response::Response, ApiError> {
     let user_id = access.user_id();
     presets::limit(&presets::PDF_EXPORT, user_id)?;
+    ensure_feature(&state, user_id, Feature::PdfExport).await?;
     let song = exportable_song(&state, user_id, id).await?;
     let options = SongPdfOptions::from(query);
     if options.is_advanced() {

@@ -381,19 +381,55 @@ async fn content_listings_clamp_huge_pages() {
 async fn plans_gate_bands_sharing_and_advanced_pdfs() {
     let app = app!();
     let (_, admin) = app.user("planadmin", Role::Admin).await;
-    let (_, user) = app.user("freeuser", Role::User).await;
+    let (user_id, user) = app.user("freeuser", Role::User).await;
     let setlist = app.setlist(&user, "Livre", None).await;
     app.enforce_billing().await;
 
+    // The free tier: one band, no public links, no tours, watermarked
+    // setlist PDFs only.
     let band = app
-        .post("/bands", &user, json!({ "name": "No Plan" }))
+        .post("/bands", &user, json!({ "name": "Free Band" }))
         .await;
-    assert_eq!(band.code(), "FEATURE_NOT_IN_PLAN");
-    assert_eq!(band.body["meta"]["feature"], "create_bands");
+    assert_eq!(band.status, StatusCode::CREATED, "{}", band.body);
+    let second = app
+        .post("/bands", &user, json!({ "name": "Second Band" }))
+        .await;
+    assert_eq!(second.code(), "QUOTA_EXCEEDED");
     let share = app
         .post(&format!("/setlists/{setlist}/share"), &user, json!({}))
         .await;
     assert_eq!(share.code(), "FEATURE_NOT_IN_PLAN");
+    let tour = app
+        .post(
+            "/tours",
+            &user,
+            json!({ "name": "Free Tour", "start_date": "2030-01-01", "end_date": "2030-01-10" }),
+        )
+        .await;
+    assert_eq!(tour.code(), "FEATURE_NOT_IN_PLAN");
+    // Setlist PDFs still export, always with the watermark.
+    let pdf = app
+        .get(
+            &format!("/setlists/{setlist}/export/pdf?compact=true&watermark=false"),
+            &user,
+        )
+        .await;
+    assert_eq!(pdf.status, StatusCode::OK, "{}", pdf.body);
+    let free_advanced = app
+        .get(&format!("/setlists/{setlist}/export/pdf?columns=2"), &user)
+        .await;
+    assert_eq!(free_advanced.code(), "FEATURE_NOT_IN_PLAN");
+    assert_eq!(free_advanced.body["meta"]["feature"], "advanced_pdf");
+
+    // A paid plan: basic PDFs, advanced ones need a bigger plan.
+    let granted = app
+        .put(
+            &format!("/admin/users/{user_id}/subscription"),
+            &admin,
+            json!({ "plan_code": "basic", "days": 30 }),
+        )
+        .await;
+    assert_eq!(granted.status, StatusCode::OK, "{}", granted.body);
     let advanced = app
         .get(
             &format!("/setlists/{setlist}/export/pdf?include_lyrics=true"),
@@ -401,6 +437,7 @@ async fn plans_gate_bands_sharing_and_advanced_pdfs() {
         )
         .await;
     assert_eq!(advanced.code(), "FEATURE_NOT_IN_PLAN");
+    assert_eq!(advanced.body["meta"]["feature"], "advanced_pdf");
     let basic = app
         .get(
             &format!("/setlists/{setlist}/export/pdf?compact=true"),
@@ -408,11 +445,22 @@ async fn plans_gate_bands_sharing_and_advanced_pdfs() {
         )
         .await;
     assert_eq!(basic.status, StatusCode::OK);
-    // Admins always have every feature.
+    // Staff always have every feature.
     assert_eq!(
         app.post("/bands", &admin, json!({ "name": "Admin Band" }))
             .await
             .status,
+        StatusCode::CREATED
+    );
+    let (_, moderator) = app.user("planmod", Role::Moderator).await;
+    assert_eq!(
+        app.post(
+            "/tours",
+            &moderator,
+            json!({ "name": "Mod Tour", "start_date": "2030-01-01", "end_date": "2030-01-10" })
+        )
+        .await
+        .status,
         StatusCode::CREATED
     );
 }

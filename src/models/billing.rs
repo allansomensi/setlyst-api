@@ -166,6 +166,58 @@ impl Default for BillingSettings {
     }
 }
 
+/// Which rules an account falls under right now, in order of precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessTier {
+    /// Admins and moderators: every feature, no quotas, no plans to buy.
+    Staff,
+    /// A plan in effect while plans are enforced: its features and limits.
+    Plan,
+    /// E-mail address not verified yet (and no plan): very small limits
+    /// and no paid features, in the beta too.
+    Unverified,
+    /// Plans not enforced (the beta): every feature, the platform defaults.
+    Beta,
+    /// Plans enforced and no plan in effect: the free tier.
+    Free,
+}
+
+impl AccessTier {
+    pub fn resolve(is_staff: bool, enforced: bool, has_plan: bool, email_verified: bool) -> Self {
+        if is_staff {
+            AccessTier::Staff
+        } else if enforced && has_plan {
+            AccessTier::Plan
+        } else if !email_verified {
+            AccessTier::Unverified
+        } else if !enforced {
+            AccessTier::Beta
+        } else {
+            AccessTier::Free
+        }
+    }
+}
+
+/// Answer of `GET /public/billing`: whether the platform is in its beta
+/// (plans not enforced, everything free) and the sign-up trial.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PublicBillingMode {
+    /// `true` while plans aren't enforced: every feature is free.
+    pub beta: bool,
+    /// Days of the sign-up trial (starts once the e-mail is verified; only
+    /// once plans are enforced).
+    pub trial_days: i64,
+    pub trial_plan: String,
+    /// Limits of every verified account during the beta.
+    pub beta_limits: QuotaLimits,
+    /// The free tier (no plan, once plans are enforced).
+    pub free_limits: QuotaLimits,
+    pub free_features: BTreeMap<String, bool>,
+    /// Limits until the e-mail address is verified.
+    pub unverified_limits: QuotaLimits,
+}
+
 // ---------------------------------------------------------------------
 // Plans
 // ---------------------------------------------------------------------
@@ -573,6 +625,13 @@ pub struct ReferralSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BillingMe {
     pub enforced: bool,
+    /// Which rules apply to the caller (`staff`, `plan`, `unverified`,
+    /// `beta`, `free`).
+    pub access: AccessTier,
+    pub email_verified: bool,
+    /// Whether the caller may buy or be granted a plan (staff can't: they
+    /// already have everything).
+    pub can_subscribe: bool,
     /// Card payments are configured (checkout and the billing portal work).
     pub payments_enabled: bool,
     /// The plan in effect, if any.
