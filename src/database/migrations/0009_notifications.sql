@@ -13,7 +13,18 @@ CREATE TYPE notification_type AS ENUM (
     'band_member_removed',
     -- The recipient's site-wide role changed (e.g. promoted to admin or
     -- moderator, or demoted back to a regular user).
-    'platform_role_changed'
+    'platform_role_changed',
+    'band_member_added',
+    'share_link_revoked',
+    'announcement',
+    'release_published',
+    'band_suggestion_created',
+    'band_suggestion_resolved',
+    'moderation_action',
+    'subscription_changed',
+    'trial_ending',
+    'credits_granted',
+    'security_alert'
 );
 
 CREATE TABLE notifications (
@@ -29,3 +40,5 @@ CREATE TABLE notifications (
 -- Powers both "list mine, newest first" and the unread-count lookup.
 CREATE INDEX idx_notifications_user_created ON notifications(user_id, created_at DESC);
 CREATE INDEX idx_notifications_user_unread ON notifications(user_id) WHERE read_at IS NULL;
+-- Retention job.
+CREATE INDEX idx_notifications_created ON notifications (created_at);

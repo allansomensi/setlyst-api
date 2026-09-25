@@ -117,9 +117,9 @@ impl MetricsRepository for MetricsRepositoryImpl {
 
     async fn get_admin_metrics(&self) -> Result<AdminMetrics, ApiError> {
         // Forked band copies (songs.forked_from / artists.forked_from set)
-        // are independent DB rows by design — see migrations 0011 and
-        // 0018 — but they represent the same creative content as the row
-        // they were forked from, not new content. Excluding them from the
+        // are independent DB rows by design — see 0004_catalog.sql — but
+        // they represent the same creative content as the row they were
+        // forked from, not new content. Excluding them from the
         // platform-wide totals avoids the count doubling every time a
         // member forks their existing songs into a band.
         let counts_fut = sqlx::query_as::<_, AdminCountsRow>(

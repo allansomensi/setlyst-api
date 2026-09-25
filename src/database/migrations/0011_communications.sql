@@ -1,14 +1,6 @@
--- Communications: per-user communication preferences, a transactional
--- e-mail outbox, platform announcements and editable release notes.
-
--- ---------------------------------------------------------------------
--- Communication preferences (which categories reach the user by e-mail
--- and in the app). Shape validated by the API; missing keys fall back to
--- the defaults defined in `models::communication`.
--- ---------------------------------------------------------------------
-
-ALTER TABLE user_preferences
-    ADD COLUMN communication JSONB NOT NULL DEFAULT '{}';
+-- Communications: a transactional e-mail outbox, platform announcements
+-- and editable release notes. Per-user communication preferences live in
+-- `user_preferences.communication`.
 
 -- ---------------------------------------------------------------------
 -- E-mail outbox. Every e-mail is written here first (in the same
@@ -23,6 +15,10 @@ CREATE TABLE email_outbox (
     id UUID PRIMARY KEY,
     user_id UUID REFERENCES users(id) ON DELETE CASCADE,
     to_email VARCHAR(254) NOT NULL,
+    -- The mailbox the address really delivers to (lower case, no `+tag`,
+    -- Gmail dots folded), so the per-recipient caps can't be multiplied
+    -- with variants of one address.
+    to_canonical VARCHAR(254) NOT NULL,
     -- Template identifier (see `email::templates`).
     template VARCHAR(64) NOT NULL,
     locale VARCHAR(10) NOT NULL DEFAULT 'en',
@@ -30,6 +26,12 @@ CREATE TABLE email_outbox (
     -- up on) so one-time codes don't linger in the database.
     payload JSONB NOT NULL DEFAULT '{}',
     status email_status NOT NULL DEFAULT 'pending',
+    -- Lower is sent first: 0 = one-time codes and security notices, 3 =
+    -- account and billing messages, 5 = everything else (in-app
+    -- notification copies), 9 = bulk (announcements, release notes). A
+    -- bulk send of thousands of messages must never delay a password-reset
+    -- code.
+    priority SMALLINT NOT NULL DEFAULT 5,
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error VARCHAR(1000),
     scheduled_at TIMESTAMP NOT NULL,
@@ -38,7 +40,21 @@ CREATE TABLE email_outbox (
     created_at TIMESTAMP NOT NULL
 );
 
-CREATE INDEX idx_email_outbox_pending ON email_outbox (scheduled_at) WHERE status = 'pending';
+-- The worker claims due messages by priority, then age.
+CREATE INDEX idx_email_outbox_pending_priority
+    ON email_outbox (priority, scheduled_at) WHERE status = 'pending';
+-- Stale `sending` locks are recovered on every worker run.
+CREATE INDEX idx_email_outbox_sending
+    ON email_outbox (locked_at) WHERE status = 'sending';
+-- Global hourly cap on non-security mail (the worker counts what it sent
+-- in the last hour).
+CREATE INDEX idx_email_outbox_sent_bulk
+    ON email_outbox (sent_at) WHERE status = 'sent' AND priority > 0;
+-- Per-recipient caps (`outbox::enqueue`).
+CREATE INDEX idx_email_outbox_recipient
+    ON email_outbox (LOWER(to_email), template, created_at);
+CREATE INDEX idx_email_outbox_canonical
+    ON email_outbox (to_canonical, template, created_at);
 CREATE INDEX idx_email_outbox_user ON email_outbox (user_id, created_at DESC);
 CREATE INDEX idx_email_outbox_created ON email_outbox (created_at);
 
@@ -83,6 +99,8 @@ CREATE TABLE announcements (
 );
 
 CREATE INDEX idx_announcements_published ON announcements (published_at DESC) WHERE published_at IS NOT NULL;
+CREATE INDEX idx_announcements_created_by ON announcements (created_by) WHERE created_by IS NOT NULL;
+CREATE INDEX idx_announcements_updated_by ON announcements (updated_by) WHERE updated_by IS NOT NULL;
 
 CREATE TABLE announcement_receipts (
     announcement_id UUID NOT NULL REFERENCES announcements(id) ON DELETE CASCADE,
@@ -117,7 +135,11 @@ CREATE TABLE release_notes (
 );
 
 CREATE INDEX idx_release_notes_released ON release_notes (released_on DESC);
+CREATE INDEX idx_release_notes_created_by ON release_notes (created_by) WHERE created_by IS NOT NULL;
+CREATE INDEX idx_release_notes_updated_by ON release_notes (updated_by) WHERE updated_by IS NOT NULL;
 
+-- Releases so far. v0.12 is published on the date the migration runs (the
+-- deploy date); staff can adjust the text and the date in the console.
 INSERT INTO release_notes (id, version, title, items, released_on, published_at, created_at, updated_at)
 VALUES
 (
@@ -154,16 +176,75 @@ VALUES
     TIMESTAMP '2026-09-22 12:00:00'
 );
 
--- ---------------------------------------------------------------------
--- New notification kinds.
--- ---------------------------------------------------------------------
-
-ALTER TYPE notification_type ADD VALUE IF NOT EXISTS 'announcement';
-ALTER TYPE notification_type ADD VALUE IF NOT EXISTS 'release_published';
-ALTER TYPE notification_type ADD VALUE IF NOT EXISTS 'band_suggestion_created';
-ALTER TYPE notification_type ADD VALUE IF NOT EXISTS 'band_suggestion_resolved';
-ALTER TYPE notification_type ADD VALUE IF NOT EXISTS 'moderation_action';
-ALTER TYPE notification_type ADD VALUE IF NOT EXISTS 'subscription_changed';
-ALTER TYPE notification_type ADD VALUE IF NOT EXISTS 'trial_ending';
-ALTER TYPE notification_type ADD VALUE IF NOT EXISTS 'credits_granted';
-ALTER TYPE notification_type ADD VALUE IF NOT EXISTS 'security_alert';
+INSERT INTO release_notes (id, version, title, items, released_on, published_at, created_at, updated_at)
+VALUES (
+    gen_random_uuid(),
+    '0.12.0',
+    '{"en": "Plans, tours, band repertoire and a more secure account", "pt-BR": "Planos, turnês, repertório da banda e uma conta mais segura", "es": "Planes, giras, repertorio de la banda y una cuenta más segura"}',
+    '[
+      {"kind": "new", "text": {
+        "pt-BR": "Planos Básico, Intermediário e Pro, com 30 dias de teste, códigos promocionais e um programa de indicação que gera créditos. Durante o pré-lançamento, todos os recursos continuam liberados sem custo.",
+        "en": "Basic, Intermediate and Pro plans, with a 30-day trial, promo codes and a referral programme that earns credits. During the pre-release period every feature remains free.",
+        "es": "Planes Básico, Intermedio y Pro, con 30 días de prueba, códigos promocionales y un programa de referidos que genera créditos. Durante el prelanzamiento, todas las funciones siguen siendo gratuitas."}},
+      {"kind": "new", "text": {
+        "pt-BR": "Turnês: agrupe shows com datas de início e fim e acompanhe cada show com a sua setlist.",
+        "en": "Tours: group gigs under a start and end date and follow each gig with its setlist.",
+        "es": "Giras: agrupa conciertos con fecha de inicio y fin y sigue cada concierto con su setlist."}},
+      {"kind": "new", "text": {
+        "pt-BR": "Cada banda agora tem um Repertório, preenchido automaticamente com as músicas das suas setlists. Ao montar uma setlist da banda, escolha direto do repertório.",
+        "en": "Every band now has a Repertoire, filled automatically with the songs of its setlists. When building a band setlist, pick songs straight from it.",
+        "es": "Cada banda tiene ahora un Repertorio, que se completa automáticamente con las canciones de sus setlists. Al armar una setlist de la banda, elige directamente del repertorio."}},
+      {"kind": "new", "text": {
+        "pt-BR": "Sugestões com votação: os integrantes sugerem músicas para as setlists da banda e votam antes de a música entrar.",
+        "en": "Suggestions with voting: members suggest songs for the band''s setlists and vote before a song is added.",
+        "es": "Sugerencias con votación: los integrantes sugieren canciones para las setlists de la banda y votan antes de que se agreguen."}},
+      {"kind": "new", "text": {
+        "pt-BR": "Lembretes na página da banda, com cores, data e destaque no topo.",
+        "en": "Reminders on the band page, with colours, a date and pinning.",
+        "es": "Recordatorios en la página de la banda, con colores, fecha y opción de fijar."}},
+      {"kind": "new", "text": {
+        "pt-BR": "Lixeira: músicas, artistas, setlists, shows e turnês excluídos podem ser restaurados por 30 dias.",
+        "en": "Trash: deleted songs, artists, setlists, gigs and tours can be restored for 30 days.",
+        "es": "Papelera: las canciones, artistas, setlists, conciertos y giras eliminados se pueden restaurar durante 30 días."}},
+      {"kind": "new", "text": {
+        "pt-BR": "Novos campos nas músicas: energia, compasso, capotraste, afinação e observações de execução. Músicas e setlists aceitam links do YouTube, Spotify, Google Drive e outros serviços.",
+        "en": "New song fields: energy, time signature, capo, tuning and performance notes. Songs and setlists accept links to YouTube, Spotify, Google Drive and other services.",
+        "es": "Nuevos campos en las canciones: energía, compás, cejilla, afinación y notas de interpretación. Canciones y setlists aceptan enlaces de YouTube, Spotify, Google Drive y otros servicios."}},
+      {"kind": "new", "text": {
+        "pt-BR": "A análise da setlist mostra a curva de energia ao lado do BPM e aponta pontos fortes e pontos a melhorar na sequência do show.",
+        "en": "Setlist analysis shows the energy curve next to BPM and points out strengths and what to improve in the running order.",
+        "es": "El análisis de la setlist muestra la curva de energía junto al BPM y señala fortalezas y puntos a mejorar en el orden del show."}},
+      {"kind": "new", "text": {
+        "pt-BR": "Exporte cada música em PDF ou ChordPro e importe músicas em ChordPro com pré-visualização.",
+        "en": "Export any song to PDF or ChordPro, and import ChordPro songs with a preview.",
+        "es": "Exporta cualquier canción en PDF o ChordPro e importa canciones ChordPro con vista previa."}},
+      {"kind": "new", "text": {
+        "pt-BR": "Fixe setlists, bandas, músicas, shows e turnês na tela inicial para acessá-los mais rápido.",
+        "en": "Pin setlists, bands, songs, gigs and tours to the home screen for quicker access.",
+        "es": "Fija setlists, bandas, canciones, conciertos y giras en la pantalla de inicio para acceder más rápido."}},
+      {"kind": "new", "text": {
+        "pt-BR": "Perfil com foto, apresentação, cidade e instrumentos, além de avisos da plataforma e preferências de comunicação por e-mail.",
+        "en": "Profiles with a photo, bio, city and instruments, plus platform announcements and e-mail communication preferences.",
+        "es": "Perfil con foto, presentación, ciudad e instrumentos, además de avisos de la plataforma y preferencias de comunicación por correo."}},
+      {"kind": "security", "text": {
+        "pt-BR": "Autenticação em dois fatores opcional, recuperação de senha por código enviado ao e-mail, entrada com Google e proteção adicional contra tentativas de acesso indevido.",
+        "en": "Optional two-factor authentication, password recovery with a code sent by e-mail, Google sign-in and extra protection against unauthorized sign-in attempts.",
+        "es": "Autenticación en dos pasos opcional, recuperación de contraseña con un código enviado por correo, acceso con Google y protección adicional contra intentos de acceso indebido."}},
+      {"kind": "improved", "text": {
+        "pt-BR": "Estatísticas reorganizadas, com exportação em CSV, PDF e imagem.",
+        "en": "Statistics reorganized, with CSV, PDF and image export.",
+        "es": "Estadísticas reorganizadas, con exportación en CSV, PDF e imagen."}},
+      {"kind": "improved", "text": {
+        "pt-BR": "Tema claro redesenhado, com mais contraste entre fundo, cartões e bordas.",
+        "en": "Redesigned light theme, with clearer contrast between background, cards and borders.",
+        "es": "Tema claro rediseñado, con más contraste entre fondo, tarjetas y bordes."}},
+      {"kind": "fixed", "text": {
+        "pt-BR": "Correções na importação de backup, na edição de shows, na cópia de links e na navegação do editor de letras.",
+        "en": "Fixes to backup import, gig editing, link copying and navigation in the lyrics editor.",
+        "es": "Correcciones en la importación de copias de seguridad, la edición de conciertos, la copia de enlaces y la navegación del editor de letras."}}
+    ]',
+    (NOW() AT TIME ZONE 'utc')::date,
+    NOW() AT TIME ZONE 'utc',
+    NOW() AT TIME ZONE 'utc',
+    NOW() AT TIME ZONE 'utc'
+);

@@ -1,3 +1,5 @@
+-- Bands: members and their roles, invites and per-role permissions.
+
 -- Declared low-to-high on purpose: Postgres sorts enum values by their
 -- declaration order, and the member listing relies on `ORDER BY role DESC`
 -- to show the band's owner first.
@@ -10,10 +12,20 @@ CREATE TABLE bands (
     description TEXT,
     logo_url VARCHAR(500),
     members_can_manage_setlists BOOLEAN NOT NULL DEFAULT TRUE,
-    created_by UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    -- Song suggestions reaching this many votes are accepted
+    -- automatically. NULL = never accepted automatically.
+    suggestion_auto_accept_votes INTEGER
+        CHECK (suggestion_auto_accept_votes IS NULL OR suggestion_auto_accept_votes BETWEEN 1 AND 100),
+    -- A band must survive its creator's account being deleted (ownership
+    -- is tracked by `band_members.role = 'owner'`, not by this column).
+    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    updated_by UUID REFERENCES users(id) ON DELETE SET NULL,
     created_at TIMESTAMP NOT NULL,
     updated_at TIMESTAMP NOT NULL
 );
+
+CREATE INDEX idx_bands_created_by ON bands (created_by) WHERE created_by IS NOT NULL;
+CREATE INDEX idx_bands_updated_by ON bands (updated_by) WHERE updated_by IS NOT NULL;
 
 CREATE TABLE band_members (
     id UUID PRIMARY KEY,
@@ -24,13 +36,25 @@ CREATE TABLE band_members (
     -- purely cosmetic, unrelated to `role` and never affects permissions.
     title VARCHAR(50),
     joined_at TIMESTAMP NOT NULL,
-    UNIQUE (band_id, user_id)
+    UNIQUE (band_id, user_id),
+    -- One owner per band. A unique partial index, as an exclusion
+    -- constraint so it can be checked at commit (DEFERRABLE INITIALLY
+    -- DEFERRED): handing a band over inside a transaction (account
+    -- deletion promotes the successor first and removes the old owner's
+    -- membership afterwards) briefly has two owners. Its backing index is
+    -- named after the constraint.
+    CONSTRAINT idx_band_members_single_owner
+        EXCLUDE USING btree (band_id WITH =) WHERE (role = 'owner')
+        DEFERRABLE INITIALLY DEFERRED
 );
+
+CREATE INDEX idx_band_members_band_id ON band_members(band_id);
+CREATE INDEX idx_band_members_user_id ON band_members(user_id);
 
 CREATE TABLE band_invites (
     id UUID PRIMARY KEY,
     band_id UUID NOT NULL REFERENCES bands(id) ON DELETE CASCADE,
-    code VARCHAR(12) UNIQUE NOT NULL,
+    code VARCHAR(32) UNIQUE NOT NULL,
     role band_role NOT NULL DEFAULT 'member',
     created_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     max_uses INTEGER,
@@ -40,10 +64,12 @@ CREATE TABLE band_invites (
     created_at TIMESTAMP NOT NULL
 );
 
-CREATE INDEX idx_band_members_band_id ON band_members(band_id);
-CREATE INDEX idx_band_members_user_id ON band_members(user_id);
 CREATE INDEX idx_band_invites_band_id ON band_invites(band_id);
 CREATE INDEX idx_band_invites_code ON band_invites(code);
+CREATE INDEX idx_band_invites_created_by ON band_invites (created_by);
+-- Retention job.
+CREATE INDEX idx_band_invites_inactive ON band_invites (COALESCE(revoked_at, expires_at))
+    WHERE revoked_at IS NOT NULL OR expires_at IS NOT NULL;
 
 -- Granular per-role permissions. `admin` and `owner` always have every
 -- permission and are intentionally absent from this table — only

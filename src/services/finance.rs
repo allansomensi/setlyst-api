@@ -1,6 +1,6 @@
 //! The staff finance report and the payment ledger behind it.
 //!
-//! Every payment received is copied into `payments` (see migration 0020):
+//! Every payment received is copied into `payments` (see migration 0013_finance):
 //! by the Stripe webhook as it happens (`invoice.paid`, `charge.refunded`,
 //! `refund.*`, `charge.dispute.*`) and by [`sync_from_provider`], which
 //! staff can run to fill in anything the webhook missed (or payments made

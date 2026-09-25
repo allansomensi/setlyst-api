@@ -252,10 +252,8 @@ impl BandRepository for BandRepositoryImpl {
         .await?;
 
         // Seed the default permission matrix for the two configurable
-        // roles, mirroring the same defaults the 0014 migration backfilled
-        // for existing bands: moderators can manage setlists/songs,
-        // members can't (until the admin opts them in), and everyone can
-        // export PDFs.
+        // roles: moderators can manage setlists/songs, members can't
+        // (until the admin opts them in), and everyone can export PDFs.
         // Every band has a repertoire from the start.
         sqlx::query(
             "INSERT INTO setlists (id, title, description, user_id, band_id, is_repertoire, created_at, updated_at)
