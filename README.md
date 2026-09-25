@@ -132,7 +132,7 @@ Swagger UI: `http://127.0.0.1:8000/swagger-ui`
 | `PORT` | Port to listen on (all interfaces). Hosting platforms such as Render set it | `8000` |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated allowed origins | `http://localhost:3000` |
 | `RUST_LOG_CONSOLE` | Console log filter (the access log — method, route, status, latency — is at `info`) | `info,sqlx=warn,tower_governor=warn` |
-| `RUST_LOG_FILE` | File log level | `trace` |
+| `RUST_LOG_FILE` | File log filter (keep it at `info`: `trace`/`debug` also log the HTTP, SQL and SMTP libraries' protocol dialogue) | `info,sqlx=warn,tower_governor=warn` |
 | `LOG_TO_FILE` | Enable rolling file logs | `false` |
 | `LOG_FORMAT` | Console log format: `pretty` (multi-line, coloured) or `compact` (one plain line per event) | `pretty` in debug builds, `compact` in release builds |
 | `APP_BASE_URL` | Public web origin used in e-mail links and Stripe redirects. A release build logs an error at startup while it points to localhost; with a live Stripe key it must be `https` | `http://localhost:3000` |
@@ -266,7 +266,7 @@ Stripe is the source of truth: every webhook event is only a hint, and the subsc
 
 - **One subscription per account.** Checkout is refused while Stripe has a live subscription for the customer. A new checkout expires the pages of earlier ones. A second subscription that gets through anyway is canceled, its first charge is refunded, and an error is logged.
 - **Checkout.** Cards only. The buyer must accept the Subscription Terms (the Terms of Service URL is set in the Dashboard). The accepted version is stored on the subscription.
-- **Withdrawal (CDC art. 49).** `POST /billing/withdraw` refunds in full and cancels immediately. It works within 7 days of the first paid invoice, or of a yearly renewal charge. `GET /billing/me` exposes `withdrawal_eligible_until`. A full refund made in the Dashboard also cancels the subscription. A card dispute cancels it and is subtracted from revenue.
+- **Withdrawal (CDC art. 49).** `POST /billing/withdraw` refunds in full and cancels immediately. It works within 7 days of the first paid invoice, or of a yearly renewal charge, at most twice per account in any 12 months (past that it answers `WITHDRAWAL_NOT_ELIGIBLE` with `meta.reason = "limit"` and the request goes through support: subscribe, use, withdraw in full and subscribe again must not go on forever). `GET /billing/me` exposes `withdrawal_eligible_until`. A full refund made in the Dashboard also cancels the subscription. A card dispute cancels it and is subtracted from revenue.
 - **Failed renewals.** A `past_due` subscription keeps its plan for 14 days (`past_due_since`). After that the account has no plan and the subscription is canceled at Stripe.
 - **Reconciliation.** A subscription whose period ended is checked with Stripe before it expires. It is only expired when Stripe no longer has it. When Stripe can't be reached, the check is retried hourly. Once a day, every Stripe subscription is compared with its local copy.
 - **Billing e-mails** can't be switched off:

@@ -722,11 +722,16 @@ impl TestApp {
 
     /// Makes `user_id` owner of an already verified e-mail address.
     pub async fn set_verified_email(&self, user_id: Uuid, email: &str) {
-        sqlx::query("UPDATE users SET email = $2, email_verified_at = NOW() WHERE id = $1")
-            .bind(user_id)
-            .bind(email)
-            .execute(&self.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE users
+             SET email = $2, email_verified_at = NOW(),
+                 email_first_verified_at = COALESCE(email_first_verified_at, NOW())
+             WHERE id = $1",
+        )
+        .bind(user_id)
+        .bind(email)
+        .execute(&self.pool)
+        .await
+        .unwrap();
     }
 }

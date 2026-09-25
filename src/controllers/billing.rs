@@ -13,9 +13,9 @@ use crate::{
             AdjustCreditsPayload, AdminSubscriptionView, BillingMe, BillingOverview,
             BillingPageQuery, BillingSettings, CheckoutPayload, CreatePromoCodePayload,
             CreatePromotionPayload, CreditEntry, GrantSubscriptionPayload, GrantTrialsPayload,
-            GrantTrialsResponse, Plan, PromoCode, PromoListQuery, PromoRedemption, Promotion,
-            RedeemCodePayload, RedeemResponse, RedeemRewardPayload, RedirectResponse,
-            ReferralEntry, SubscriptionEvent, SubscriptionSource, UpdatePromoCodePayload,
+            GrantTrialsResponse, OwnSubscriptionEvent, Plan, PromoCode, PromoListQuery,
+            PromoRedemption, Promotion, RedeemCodePayload, RedeemResponse, RedeemRewardPayload,
+            RedirectResponse, ReferralEntry, SubscriptionSource, UpdatePromoCodePayload,
             UpdatePromotionPayload, UpsertPlanPayload, WithdrawResponse, check_plan_code,
         },
         finance::{FinanceOverview, FinanceSyncPayload, FinanceSyncResult},
@@ -186,19 +186,22 @@ pub async fn list_referrals(
     path = "/api/v1/billing/history",
     tags = ["Billing"],
     summary = "Changes to the caller's subscription, newest first (last 100).",
+    description = "Without who made each change or the staff-only details (grant notes, refund reasons, provider ids): those are for the staff console (`GET /admin/users/{id}/subscription`).",
     security(("jwt_token" = [])),
-    responses((status = 200, description = "Events.", body = [SubscriptionEvent]))
+    responses((status = 200, description = "Events.", body = [OwnSubscriptionEvent]))
 )]
 pub async fn history(
     State(state): State<AppState>,
     access: AccessControl,
 ) -> Result<impl IntoResponse, ApiError> {
-    Ok(Json(
-        state
-            .billing_repo
-            .subscription_events(access.user_id(), 100)
-            .await?,
-    ))
+    let events: Vec<OwnSubscriptionEvent> = state
+        .billing_repo
+        .subscription_events(access.user_id(), 100)
+        .await?
+        .into_iter()
+        .map(OwnSubscriptionEvent::from)
+        .collect();
+    Ok(Json(events))
 }
 
 // ---------------------------------------------------------------------

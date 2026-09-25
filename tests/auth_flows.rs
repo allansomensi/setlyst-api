@@ -1401,7 +1401,7 @@ async fn concurrent_wrong_codes_never_exceed_the_attempt_limits() {
 async fn second_factor_checks_outside_sign_in_are_limited() {
     let app = app!();
     let (user_id, token) = app.registered_user("guarded", "guarded@example.com").await;
-    let (_, recovery) = enable_two_factor(&app, &token).await;
+    let (secret, recovery) = enable_two_factor(&app, &token).await;
 
     for left in (0..5).rev() {
         let wrong = app
@@ -1471,11 +1471,41 @@ async fn second_factor_checks_outside_sign_in_are_limited() {
         .iter()
         .filter(|r| r.code() == "INVALID_TWO_FACTOR_CODE")
         .count();
-    let throttled = responses
+    // The other fifteen are refused: throttled by the window, or, for a
+    // request that reached the authentication check after the tenth
+    // failure below revoked the session, `SESSION_REVOKED`. Which of the
+    // two depends on timing; that none of them was checked as a guess
+    // does not.
+    let refused = responses
         .iter()
-        .filter(|r| r.code() == "TOO_MANY_ATTEMPTS")
+        .filter(|r| matches!(r.code(), "TOO_MANY_ATTEMPTS" | "SESSION_REVOKED"))
         .count();
-    assert_eq!((wrong, throttled), (5, 15));
+    assert_eq!(
+        (wrong, refused),
+        (5, 15),
+        "{:?}",
+        responses.iter().map(|r| r.code()).collect::<Vec<_>>()
+    );
+
+    // Ten wrong second factors in a day, like ten wrong passwords: the
+    // session is in the wrong hands, so every session is signed out and
+    // the owner is told. The short window alone would allow 480 guesses
+    // a day, forever.
+    assert_eq!(app.get("/users/me", &token).await.code(), "SESSION_REVOKED");
+    let (_, notice, _) = app
+        .last_email("security_notice", Some("guarded@example.com"))
+        .await
+        .expect("sign-out notice");
+    assert_eq!(notice["kind"], "reauth_sessions_revoked");
+    let challenge = challenge_for(&app, "guarded").await;
+    let signed_in = app
+        .post_public(
+            "/auth/login/2fa",
+            json!({ "challenge_token": challenge, "code": totp::code_at(&secret, now_unix() + 30) }),
+        )
+        .await;
+    assert_eq!(signed_in.status, StatusCode::OK, "{}", signed_in.body);
+    let token = signed_in.body["token"].as_str().unwrap().to_string();
 
     // After the window, a correct code works and doesn't count.
     sqlx::query(
@@ -2033,6 +2063,26 @@ async fn unverified_squatters_lose_the_address_and_whatever_they_set_up() {
         .await,
         1
     );
+
+    // An address Google is not authoritative for (it only checked the
+    // mailbox once, when the Google account was made) proves nothing:
+    // the unverified account keeps it, and the Google sign-in gets the
+    // same answer as for a verified account (sign in with the password,
+    // or recover it through the mailbox, and link).
+    let (keeper, _) = app.registered_user("keeper", "keeper@corp.example").await;
+    let refused = app
+        .post_public(
+            "/auth/oauth/google",
+            json!({ "id_token": "fake:g-keeper:keeper@corp.example", "accept_terms": true, "age_confirmed": true }),
+        )
+        .await;
+    assert_eq!(refused.code(), "ACCOUNT_LINK_REQUIRED", "{}", refused.body);
+    let kept: Option<String> = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+        .bind(keeper)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(kept.as_deref(), Some("keeper@corp.example"));
 }
 
 #[tokio::test]

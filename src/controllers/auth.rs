@@ -890,7 +890,16 @@ pub async fn google_sign_in(
         // The address was claimed without ever being proven. Google just
         // proved who owns it: it is taken away from the unverified account
         // (which keeps everything else and can add another address), and
-        // the sign-up below proceeds.
+        // the sign-up below proceeds. Only when Google is authoritative
+        // for the address (Gmail, or a Workspace domain it manages): for
+        // any other address Google only checked the mailbox once, when the
+        // Google account was created, so its word is not proof of current
+        // ownership and must not cost another account its address. Such a
+        // sign-in gets the same answer as for a verified account: sign in
+        // with the password (or recover it through the mailbox) and link.
+        if !identity.is_authoritative_for_email() {
+            return Err(ApiError::account_link_required());
+        }
         if !payload.accept_terms || !payload.age_confirmed {
             return Err(signup_consent_error(&payload, &identity));
         }

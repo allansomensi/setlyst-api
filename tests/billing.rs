@@ -165,6 +165,16 @@ async fn enforcement_applies_plans_trials_and_limits() {
     assert_eq!(granted.status, StatusCode::OK, "{}", granted.body);
     assert_eq!(granted.body["subscription"]["plan_code"], "basic");
     assert_eq!(granted.body["subscription"]["source"], "admin");
+    // Staff see who did it and the note; the account sees neither.
+    assert_eq!(granted.body["events"][0]["data"]["note"], "Support");
+    assert!(granted.body["events"][0]["actor_username"].is_string());
+    let history = app.get("/billing/history", &bare_token).await;
+    assert_eq!(history.status, StatusCode::OK, "{}", history.body);
+    let latest = &history.body[0];
+    assert_eq!(latest["to_plan"], "basic", "{latest}");
+    assert_eq!(latest["data"]["days"], 30, "{latest}");
+    assert!(latest.get("actor_username").is_none(), "{latest}");
+    assert!(latest["data"].get("note").is_none(), "{latest}");
     let quotas = app.get("/users/me/quotas", &bare_token).await;
     assert_eq!(limit(&quotas.body, "songs"), 250);
     assert_eq!(limit(&quotas.body, "tours"), 0);
@@ -349,16 +359,19 @@ async fn promo_codes_of_every_kind_and_their_errors() {
     )
     .await;
     assert_eq!(plan.status, StatusCode::CREATED, "{}", plan.body);
-    create(json!({ "code": "trial7", "kind": "trial_extension", "duration_days": 7 })).await;
+    create(json!({ "code": "TRIAL7DAYS", "kind": "trial_extension", "duration_days": 7 })).await;
     create(json!({ "code": "CREDITS50", "kind": "credits", "credits": 50 })).await;
     create(json!({ "code": "HALFPRICE", "kind": "discount", "discount_percent": 50 })).await;
-    create(json!({ "code": "OLDCODE", "kind": "credits", "credits": 5,
-                   "expires_at": "2020-01-01T00:00:00" }))
+    create(
+        json!({ "code": "OLDCODE2020", "kind": "credits", "credits": 5,
+                   "expires_at": "2020-01-01T00:00:00" }),
+    )
     .await;
-    let exhausted =
-        create(json!({ "code": "ONCE", "kind": "credits", "credits": 5, "max_redemptions": 1 }))
-            .await;
-    create(json!({ "code": "NEWBIES", "kind": "credits", "credits": 5, "new_users_only": true }))
+    let exhausted = create(
+        json!({ "code": "ONCEONLY", "kind": "credits", "credits": 5, "max_redemptions": 1 }),
+    )
+    .await;
+    create(json!({ "code": "NEWBIES25", "kind": "credits", "credits": 5, "new_users_only": true }))
         .await;
     let duplicate = create(json!({ "code": "proplan30", "kind": "credits", "credits": 1 })).await;
     assert_eq!(duplicate.code(), "ALREADY_EXISTS");
@@ -378,7 +391,7 @@ async fn promo_codes_of_every_kind_and_their_errors() {
     );
 
     // A trial extension doesn't apply to an account on a plan.
-    assert_eq!(redeem("TRIAL7").await.code(), "PROMO_CODE_NOT_ELIGIBLE");
+    assert_eq!(redeem("TRIAL7DAYS").await.code(), "PROMO_CODE_NOT_ELIGIBLE");
 
     let credits = redeem("credits50").await;
     assert_eq!(credits.body["credits"]["balance"], 50);
@@ -386,16 +399,16 @@ async fn promo_codes_of_every_kind_and_their_errors() {
     assert_eq!(discount.body["redemption"]["discount_percent"], 50);
 
     assert_eq!(redeem("NOPE").await.code(), "PROMO_CODE_INVALID");
-    assert_eq!(redeem("OLDCODE").await.code(), "PROMO_CODE_EXPIRED");
+    assert_eq!(redeem("OLDCODE2020").await.code(), "PROMO_CODE_EXPIRED");
     // The account existed before the code was created.
-    assert_eq!(redeem("NEWBIES").await.code(), "PROMO_CODE_NOT_ELIGIBLE");
+    assert_eq!(redeem("NEWBIES25").await.code(), "PROMO_CODE_NOT_ELIGIBLE");
 
     let (_, other) = app.registered_user("first.come", "first@example.com").await;
     let won = app
-        .post("/billing/redeem", &other, json!({ "code": "ONCE" }))
+        .post("/billing/redeem", &other, json!({ "code": "ONCEONLY" }))
         .await;
     assert_eq!(won.status, StatusCode::OK);
-    assert_eq!(redeem("ONCE").await.code(), "PROMO_CODE_EXHAUSTED");
+    assert_eq!(redeem("ONCEONLY").await.code(), "PROMO_CODE_EXHAUSTED");
 
     // Disabled codes stop working.
     let (_, fresh) = app.registered_user("late.comer", "late@example.com").await;
@@ -414,13 +427,13 @@ async fn promo_codes_of_every_kind_and_their_errors() {
     );
     // New users may use NEWBIES; trial extension starts a trial.
     assert_eq!(
-        app.post("/billing/redeem", &fresh, json!({ "code": "NEWBIES" }))
+        app.post("/billing/redeem", &fresh, json!({ "code": "NEWBIES25" }))
             .await
             .status,
         StatusCode::OK
     );
     let trial = app
-        .post("/billing/redeem", &fresh, json!({ "code": "TRIAL7" }))
+        .post("/billing/redeem", &fresh, json!({ "code": "TRIAL7DAYS" }))
         .await;
     assert_eq!(
         trial.body["subscription"]["status"], "trialing",
@@ -450,15 +463,15 @@ async fn the_last_slot_of_a_promo_code_goes_to_exactly_one_account() {
     app.post(
         "/admin/promo-codes",
         &admin,
-        json!({ "code": "LASTONE", "kind": "credits", "credits": 10, "max_redemptions": 1 }),
+        json!({ "code": "LASTONE01", "kind": "credits", "credits": 10, "max_redemptions": 1 }),
     )
     .await;
     let (_, a) = app.registered_user("racer.a", "a@example.com").await;
     let (_, b) = app.registered_user("racer.b", "b@example.com").await;
 
     let (ra, rb) = tokio::join!(
-        app.post("/billing/redeem", &a, json!({ "code": "LASTONE" })),
-        app.post("/billing/redeem", &b, json!({ "code": "LASTONE" })),
+        app.post("/billing/redeem", &a, json!({ "code": "LASTONE01" })),
+        app.post("/billing/redeem", &b, json!({ "code": "LASTONE01" })),
     );
     let mut statuses = [ra.status, rb.status];
     statuses.sort();

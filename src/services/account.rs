@@ -584,6 +584,13 @@ pub async fn require_second_factor(
         .meta(json!({ "context": context, "failures": failures }))
         .ip(ip)
         .spawn(state.audit_repo.clone());
+    // The short window alone never escalates: 5 guesses every 15 minutes
+    // is 480 a day against a 6-digit code, forever. Wrong second factors
+    // count towards the same daily total as wrong passwords and re-auth
+    // codes, which signs the account out everywhere when reached (the
+    // session is evidently in the wrong hands).
+    let day_failures = state.security_repo.record_reauth_failure(user.id).await?;
+    sign_out_after_too_many_failures(state, user, day_failures, ip).await?;
     Err(invalid_two_factor_code(Some(
         SECOND_FACTOR_MAX_FAILURES - failures,
     )))
@@ -854,6 +861,20 @@ async fn record_reauth_failure(
         .meta(json!({ "context": context, "failures_24h": day_failures }))
         .ip(ip)
         .spawn(state.audit_repo.clone());
+    sign_out_after_too_many_failures(state, user, day_failures, ip).await
+}
+
+/// Every wrong confirmation of a sensitive action (a password, a re-auth
+/// code or a second factor) counts towards one 24-hour total; at
+/// [`REAUTH_DAILY_FAILURES_BEFORE_SIGN_OUT`] every session is signed out
+/// and the owner is told. `day_failures` is that total after the failure
+/// just recorded.
+async fn sign_out_after_too_many_failures(
+    state: &AppState,
+    user: &User,
+    day_failures: i32,
+    ip: &Option<String>,
+) -> Result<(), ApiError> {
     if day_failures == REAUTH_DAILY_FAILURES_BEFORE_SIGN_OUT {
         warn!(user_id = %user.id, "Too many wrong confirmations; signing the account out everywhere");
         state.user_repo.revoke_sessions(user.id).await?;

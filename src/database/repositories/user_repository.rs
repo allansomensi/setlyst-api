@@ -375,8 +375,8 @@ async fn insert_with_referral_code(
             r#"INSERT INTO users (id, username, email, password_hash, first_name, last_name, role, status,
                                   must_change_password, password_changed_at, created_by, created_at, updated_at,
                                   referral_code, password_set, email_verified_at, terms_accepted_at,
-                                  terms_version, referred_by)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+                                  terms_version, referred_by, email_first_verified_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $16)
             ON CONFLICT (referral_code) DO NOTHING"#,
         )
         .bind(user.id)
@@ -1220,12 +1220,18 @@ impl UserRepository for UserRepositoryImpl {
         let hash = hash_password(new_password).await?;
         let timestamp = now();
         let mut tx = self.db.begin().await?;
-        let verified_before: Option<Option<NaiveDateTime>> =
-            sqlx::query_scalar("SELECT email_verified_at FROM users WHERE id = $1 FOR UPDATE")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some(verified_before) = verified_before else {
+        // Whether the account *ever* proved an address, not whether it is
+        // verified right now: staff setting a new address clears
+        // `email_verified_at` (it must be verified again), and that must
+        // not turn the next recovery into a "first proof" that wipes the
+        // owner's second factor (see migration 0015).
+        let ever_verified: Option<Option<NaiveDateTime>> = sqlx::query_scalar(
+            "SELECT email_first_verified_at FROM users WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(ever_verified) = ever_verified else {
             return Err(ApiError::NotFound);
         };
         sqlx::query(
@@ -1234,6 +1240,8 @@ impl UserRepository for UserRepositoryImpl {
                  password_changed_at = $2, token_version = token_version + 1,
                  failed_login_count = 0, locked_until = NULL,
                  email_verified_at = CASE WHEN $3 THEN COALESCE(email_verified_at, $2) ELSE email_verified_at END,
+                 email_first_verified_at = CASE WHEN $3 THEN COALESCE(email_first_verified_at, $2)
+                                                ELSE email_first_verified_at END,
                  updated_at = $2
              WHERE id = $4",
         )
@@ -1253,8 +1261,11 @@ impl UserRepository for UserRepositoryImpl {
         // was set up before it, possibly by someone who registered the
         // address without owning it, is removed (a squatter's 2FA would
         // otherwise lock the real owner out, and their linked Google
-        // account would keep a way in).
-        let first_proof = verify_email && verified_before.is_none();
+        // account would keep a way in). Only for accounts that never
+        // proved any address: one whose address staff replaced keeps its
+        // second factor, so nobody can get past it by changing the
+        // address and recovering the password.
+        let first_proof = verify_email && ever_verified.is_none();
         if first_proof {
             sqlx::query(
                 "UPDATE users
@@ -1280,7 +1291,9 @@ impl UserRepository for UserRepositoryImpl {
 
     async fn mark_email_verified(&self, id: Uuid, email: &str) -> Result<bool, ApiError> {
         let result = sqlx::query(
-            "UPDATE users SET email_verified_at = $3
+            "UPDATE users
+             SET email_verified_at = $3,
+                 email_first_verified_at = COALESCE(email_first_verified_at, $3)
              WHERE id = $1 AND LOWER(email) = LOWER($2) AND email_verified_at IS NULL",
         )
         .bind(id)
@@ -1295,7 +1308,10 @@ impl UserRepository for UserRepositoryImpl {
         let timestamp = now();
         let mut tx = self.db.begin().await?;
         sqlx::query(
-            "UPDATE users SET email = $2, email_verified_at = $3, updated_at = $3, updated_by = $1
+            "UPDATE users
+             SET email = $2, email_verified_at = $3,
+                 email_first_verified_at = COALESCE(email_first_verified_at, $3),
+                 updated_at = $3, updated_by = $1
              WHERE id = $1",
         )
         .bind(id)

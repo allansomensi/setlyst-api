@@ -94,6 +94,13 @@ pub mod presets {
     /// them is a notification (and e-mail) bombing tool.
     pub static BAND_MEMBER_CHANGES: LazyLock<SlidingWindowLimiter<Uuid>> =
         LazyLock::new(|| SlidingWindowLimiter::new(60, HOUR));
+    /// `GET /setlists/{id}/items`, a setlist's whole running order with
+    /// every song's lyrics: 300 per 5 minutes per account. The offline
+    /// sync reads it once per setlist; nothing legitimate reads it in a
+    /// loop, and a filled-up repertoire makes it the heaviest answer the
+    /// API produces.
+    pub static SETLIST_ITEMS: LazyLock<SlidingWindowLimiter<Uuid>> =
+        LazyLock::new(|| SlidingWindowLimiter::new(300, Duration::from_secs(5 * 60)));
 
     /// Records a hit of `user_id` on `limiter`; `TOO_MANY_ATTEMPTS` (429,
     /// `meta.retry_after_seconds`) when the window is full.

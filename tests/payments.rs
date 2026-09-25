@@ -390,7 +390,7 @@ async fn deliver(app: &TestApp, body: &Value, signature: Option<String>) -> (Sta
 /// Delivers a correctly signed event about `subscription_id`.
 async fn event(app: &TestApp, id: &str, kind: &str, subscription_id: &str) -> StatusCode {
     let body = json!({
-        "id": id, "object": "event", "type": kind,
+        "id": id, "object": "event", "type": kind, "livemode": false,
         "data": {"object": {"object": "subscription", "id": subscription_id}}
     });
     let signature = sign(
@@ -600,7 +600,7 @@ async fn checkout_charges_database_prices_and_carries_trials_and_discounts() {
     // Completing that checkout spends the code.
     fake.put(subscription("sub_anna", user_id, "pro", 30));
     let body = json!({
-        "id": "evt_checkout", "object": "event", "type": "checkout.session.completed",
+        "id": "evt_checkout", "object": "event", "livemode": false, "type": "checkout.session.completed",
         "data": {"object": {
             "object": "checkout.session", "mode": "subscription", "subscription": "sub_anna",
             "client_reference_id": user_id.to_string(),
@@ -635,7 +635,7 @@ async fn the_webhook_verifies_signatures_and_mirrors_subscriptions_once() {
 
     // Forged or unsigned deliveries change nothing.
     let body = json!({
-        "id": "evt_forged", "object": "event", "type": "customer.subscription.created",
+        "id": "evt_forged", "object": "event", "livemode": false, "type": "customer.subscription.created",
         "data": {"object": {"object": "subscription", "id": "sub_1"}}
     });
     let (unsigned, _) = deliver(&app, &body, None).await;
@@ -1072,7 +1072,7 @@ async fn paid_invoices_and_refunds_feed_the_finance_report() {
 
     // invoice.paid records the payment once, however often it arrives.
     let paid = json!({
-        "id": "evt_paid", "object": "event", "type": "invoice.paid",
+        "id": "evt_paid", "object": "event", "livemode": false, "type": "invoice.paid",
         "data": {"object": {"object": "invoice", "id": "in_1",
                  "parent": {"subscription_details": {"subscription": "sub_fin"}}}}
     });
@@ -1102,7 +1102,7 @@ async fn paid_invoices_and_refunds_feed_the_finance_report() {
     // nothing.
     let refund = |amount: i64, id: &str| {
         json!({
-            "id": id, "object": "event", "type": "charge.refunded",
+            "id": id, "object": "event", "livemode": false, "type": "charge.refunded",
             "data": {"object": {"object": "charge", "id": "ch_1",
                      "payment_intent": "pi_in_1", "amount_refunded": amount}}
         })
@@ -1156,7 +1156,7 @@ async fn paid_invoices_and_refunds_feed_the_finance_report() {
         .unwrap()
         .insert(0, invoice("in_5", user_id, 2990, 0));
     let early_refund = json!({
-        "id": "evt_r5", "object": "event", "type": "charge.refunded",
+        "id": "evt_r5", "object": "event", "livemode": false, "type": "charge.refunded",
         "data": {"object": {"object": "charge", "id": "ch_5",
                  "payment_intent": "pi_in_5", "amount_refunded": 500}}
     });
@@ -1214,7 +1214,7 @@ fn invoice_of(
 /// Delivers a signed `invoice.paid` for `invoice_id`.
 async fn invoice_paid(app: &TestApp, event_id: &str, invoice_id: &str, subscription_id: &str) {
     let body = json!({
-        "id": event_id, "object": "event", "type": "invoice.paid",
+        "id": event_id, "object": "event", "livemode": false, "type": "invoice.paid",
         "data": {"object": {"object": "invoice", "id": invoice_id,
                  "parent": {"subscription_details": {"subscription": subscription_id}}}}
     });
@@ -1397,6 +1397,62 @@ async fn withdrawal_within_7_days_refunds_and_cancels() {
 }
 
 #[tokio::test]
+async fn self_service_withdrawals_are_capped_per_year() {
+    let mut app = app!();
+    let fake = with_payments(&mut app);
+    app.enforce_billing().await;
+    let (user_id, token) = verified_user(&app, "serial.withdrawer").await;
+    fake.put(subscription("sub_cap", user_id, "pro", 30));
+    event(&app, "evt_cap", "customer.subscription.created", "sub_cap").await;
+    fake.invoices
+        .lock()
+        .unwrap()
+        .push(invoice_of("in_cap1", "sub_cap", user_id, 3990, 2));
+    invoice_paid(&app, "evt_cap1", "in_cap1", "sub_cap").await;
+
+    // Two withdrawals in the last twelve months already: subscribe, use,
+    // withdraw in full and subscribe again must not go on forever (the
+    // provider keeps the card fees of every refund). The third goes
+    // through support.
+    for months_ago in [2, 8] {
+        sqlx::query(
+            "INSERT INTO subscription_events (id, user_id, kind, created_at)
+             VALUES (gen_random_uuid(), $1, 'withdrawn',
+                     NOW() AT TIME ZONE 'utc' - make_interval(months => $2))",
+        )
+        .bind(user_id)
+        .bind(months_ago)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    }
+    let refused = app.post("/billing/withdraw", &token, json!({})).await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.body);
+    assert_eq!(refused.code(), "WITHDRAWAL_NOT_ELIGIBLE");
+    assert_eq!(refused.body["meta"]["reason"], "limit");
+    assert_eq!(refused.body["meta"]["contact_support"], true);
+    assert_eq!(
+        fake.calls_to("refund:pi_in_cap1:setlyst-withdraw-in_cap1"),
+        0
+    );
+    assert_eq!(fake.calls_to("cancel:sub_cap"), 0);
+
+    // Withdrawals older than a year no longer count.
+    sqlx::query(
+        "UPDATE subscription_events SET created_at = created_at - INTERVAL '1 year'
+         WHERE user_id = $1 AND kind = 'withdrawn'",
+    )
+    .bind(user_id)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    let withdrawn = app.post("/billing/withdraw", &token, json!({})).await;
+    assert_eq!(withdrawn.status, StatusCode::OK, "{}", withdrawn.body);
+    assert_eq!(withdrawn.body["refunded_cents"], 3990);
+    assert_eq!(fake.calls_to("cancel:sub_cap"), 1);
+}
+
+#[tokio::test]
 async fn withdrawal_after_7_days_is_refused() {
     let mut app = app!();
     let fake = with_payments(&mut app);
@@ -1438,7 +1494,7 @@ async fn a_dispute_cancels_the_subscription_and_counts_against_revenue() {
 
     let dispute = |id: &str, kind: &str, status: &str| {
         json!({
-            "id": id, "object": "event", "type": kind,
+            "id": id, "object": "event", "livemode": false, "type": kind,
             "data": {"object": {"object": "dispute", "id": "dp_1", "charge": "ch_d",
                      "payment_intent": "pi_in_d", "amount": 3990, "status": status}}
         })
@@ -1535,7 +1591,7 @@ async fn yearly_renewals_are_reminded_once_per_period() {
 
     let upcoming = |id: &str, subscription: &str| {
         json!({
-            "id": id, "object": "event", "type": "invoice.upcoming",
+            "id": id, "object": "event", "livemode": false, "type": "invoice.upcoming",
             "data": {"object": {"object": "invoice", "amount_due": 39900, "currency": "brl",
                      "parent": {"subscription_details": {"subscription": subscription}}}}
         })
@@ -1573,7 +1629,7 @@ async fn accepted_terms_are_stored_from_the_completed_checkout() {
     assert_eq!(started.status, StatusCode::OK, "{}", started.body);
     fake.put(subscription("sub_c", user_id, "pro", 30));
     let body = json!({
-        "id": "evt_cs", "object": "event", "type": "checkout.session.completed",
+        "id": "evt_cs", "object": "event", "livemode": false, "type": "checkout.session.completed",
         "data": {"object": {
             "object": "checkout.session", "id": "cs_1", "mode": "subscription",
             "subscription": "sub_c", "client_reference_id": user_id.to_string(),
@@ -1637,7 +1693,7 @@ async fn customers_deleted_at_stripe_are_forgotten_and_emails_synced() {
     );
 
     let body = json!({
-        "id": "evt_del", "object": "event", "type": "customer.deleted",
+        "id": "evt_del", "object": "event", "livemode": false, "type": "customer.deleted",
         "data": {"object": {"object": "customer", "id": "cus_zap"}}
     });
     assert_eq!(signed(&app, body).await, StatusCode::OK);
@@ -1656,7 +1712,7 @@ async fn customers_deleted_at_stripe_are_forgotten_and_emails_synced() {
 async fn webhook_bodies_are_capped() {
     let mut app = app!();
     with_payments(&mut app);
-    let body = json!({ "id": "evt_big", "object": "event", "padding": "x".repeat(300 * 1024) });
+    let body = json!({ "id": "evt_big", "object": "event", "livemode": false, "padding": "x".repeat(300 * 1024) });
     let signature = sign(
         body.to_string().as_bytes(),
         WEBHOOK_SECRET,

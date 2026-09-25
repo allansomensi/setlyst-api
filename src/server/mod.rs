@@ -1,5 +1,5 @@
 use crate::{
-    config::Config,
+    config::{Config, SmtpTls, database_tls_problem},
     database::{
         AppState,
         connection::{create_pool, run_migrations},
@@ -36,6 +36,13 @@ fn check_production_config(config: &Config) {
         error!("❌ {problem}");
         std::process::exit(1);
     }
+    if let Some(problem) = insecure_smtp_problem(config) {
+        error!("❌ {problem}");
+        std::process::exit(1);
+    }
+    if let Some(problem) = database_tls_problem(&config.database_url) {
+        error!("❌ {problem}");
+    }
     if let Some(stripe) = &config.stripe
         && stripe.is_test_mode()
         && !config.allow_test_payments
@@ -68,6 +75,29 @@ pub fn direct_clients_problem(config: &Config) -> Option<&'static str> {
         .then_some(
             "Neither TRUSTED_PROXIES nor INTERNAL_API_SECRET is set: behind a proxy every client would share one rate-limit bucket. Set TRUSTED_PROXIES (e.g. 10.0.0.0/8 on Render) and/or INTERNAL_API_SECRET, or ALLOW_DIRECT_CLIENTS=true if clients really connect directly.",
         )
+}
+
+/// Why a release build must not start with this SMTP setup, if it
+/// mustn't: `SMTP_TLS=none` sends every one-time code, password reset and
+/// sign-in notice in plain text across the network. Only a relay on this
+/// very machine may be spoken to unencrypted.
+pub fn insecure_smtp_problem(config: &Config) -> Option<&'static str> {
+    let smtp = config.smtp.as_ref()?;
+    if smtp.tls != SmtpTls::None {
+        return None;
+    }
+    let host = smtp
+        .host
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
+    let loopback = host == "localhost"
+        || host.ends_with(".localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    (!loopback).then_some(
+        "SMTP_TLS=none with a remote SMTP_HOST: one-time codes and password resets would travel unencrypted. Use SMTP_TLS=starttls or tls (none is only for a relay on this machine).",
+    )
 }
 
 /// How long the startup check of the Stripe key's scopes may take.
@@ -224,6 +254,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SmtpConfig;
 
     #[test]
     fn a_proxied_setup_must_say_how_to_find_the_client() {
@@ -247,6 +278,33 @@ mod tests {
             ..Config::default()
         };
         assert!(direct_clients_problem(&direct).is_none());
+    }
+
+    #[test]
+    fn unencrypted_smtp_is_only_allowed_to_a_local_relay() {
+        let smtp = |host: &str, tls: SmtpTls| SmtpConfig {
+            host: host.to_string(),
+            port: 25,
+            username: None,
+            password: None,
+            tls,
+            from: "Setlyst <no-reply@setlyst.test>".to_string(),
+            reply_to: None,
+        };
+        let with = |smtp: SmtpConfig| Config {
+            smtp: Some(smtp),
+            ..Config::default()
+        };
+        assert!(insecure_smtp_problem(&Config::default()).is_none());
+        assert!(insecure_smtp_problem(&with(smtp("localhost", SmtpTls::None))).is_none());
+        assert!(insecure_smtp_problem(&with(smtp("127.0.0.1", SmtpTls::None))).is_none());
+        assert!(insecure_smtp_problem(&with(smtp("::1", SmtpTls::None))).is_none());
+        assert!(
+            insecure_smtp_problem(&with(smtp("smtp.example.com", SmtpTls::StartTls))).is_none()
+        );
+        assert!(insecure_smtp_problem(&with(smtp("smtp.example.com", SmtpTls::Tls))).is_none());
+        assert!(insecure_smtp_problem(&with(smtp("smtp.example.com", SmtpTls::None))).is_some());
+        assert!(insecure_smtp_problem(&with(smtp("10.0.0.5", SmtpTls::None))).is_some());
     }
 
     #[test]

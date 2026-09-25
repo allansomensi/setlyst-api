@@ -39,6 +39,34 @@ use tracing::{debug, error, info};
 use uuid::Uuid;
 use validator::Validate;
 
+/// Most items `GET /setlists/{id}/items` returns. Every plan's setlist
+/// and band repertoire limit is far below it, so no real setlist is cut;
+/// it only bounds how much lyrics text one answer can carry (each song
+/// may hold 50 000 characters), on top of the per-account rate limit.
+pub const MAX_LISTED_ITEMS: usize = 2_000;
+
+/// The public link of a band setlist is only shown to members who may
+/// manage it (its personal owner always may): anyone else could hand it
+/// out, and keep using it after leaving the band. Staff viewing as a
+/// member never see it either (redacted by the middleware).
+async fn withhold_share_token_from_non_managers(
+    state: &AppState,
+    user_id: Uuid,
+    setlist: &mut Setlist,
+) -> Result<(), ApiError> {
+    if setlist.share_token.is_none() || setlist.band_id.is_none() {
+        return Ok(());
+    }
+    match state.setlist_repo.can_manage(setlist.id, user_id).await {
+        Ok(()) => Ok(()),
+        Err(ApiError::DatabaseError(e)) => Err(ApiError::DatabaseError(e)),
+        Err(_) => {
+            setlist.share_token = None;
+            Ok(())
+        }
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/setlists",
@@ -133,6 +161,7 @@ pub async fn find_setlist_by_id(
     match state.setlist_repo.find_by_id(id, access.user_id()).await {
         Ok(Some(mut setlist)) => {
             mark_one(&state, user_id, &mut setlist).await?;
+            withhold_share_token_from_non_managers(&state, user_id, &mut setlist).await?;
             info!(
                 %user_id,
                 setlist_id = %id,
@@ -763,12 +792,13 @@ pub async fn reorder_setlist_songs(
     path = "/api/v1/setlists/{id}/items",
     tags = ["Setlists"],
     summary = "Get the full running order of a setlist.",
-    description = "Retrieves songs, block headers and breaks merged into a single list ordered by position — the shape the setlist builder UI renders directly.",
+    description = "Retrieves songs, block headers and breaks merged into a single list ordered by position — the shape the setlist builder UI renders directly. At most 2 000 items (well above every plan's limits). Each song carries its full lyrics, so the endpoint is rate limited per account: 300 calls per 5 minutes (`TOO_MANY_ATTEMPTS`, 429, `meta.retry_after_seconds`).",
     params(("id" = Uuid, Path, description = "The ID of the setlist")),
     security((), ("jwt_token" = [])),
     responses(
         (status = 200, description = "Items retrieved successfully.", body = Vec<SetlistItem>),
-        (status = 404, description = "Setlist not found.")
+        (status = 404, description = "Setlist not found."),
+        (status = 429, description = "Too many running orders read in a short time.")
     )
 )]
 pub async fn get_setlist_items(
@@ -781,8 +811,20 @@ pub async fn get_setlist_items(
     debug!(%user_id, setlist_id = %id, "Processing request to retrieve setlist items");
 
     state.setlist_repo.exists(id, user_id).await?;
+    // The largest ordinary answer of the API (a repertoire's every song
+    // with its lyrics): bounded in size and in how often one account can
+    // ask for it, so a filled-up band can't be turned into a way to keep
+    // the server busy serialising and compressing tens of megabytes.
+    crate::utils::rate_limit::presets::limit(
+        &crate::utils::rate_limit::presets::SETLIST_ITEMS,
+        user_id,
+    )?;
 
-    let items = state.setlist_repo.get_items(id).await?;
+    let mut items = state
+        .setlist_repo
+        .get_items_capped(id, MAX_LISTED_ITEMS)
+        .await?;
+    items.truncate(MAX_LISTED_ITEMS);
 
     Ok(Json(items))
 }

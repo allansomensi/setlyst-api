@@ -12,7 +12,9 @@ pub enum ConfigError {
     #[error("Failed to parse integer: {0}")]
     ParseInt(#[from] std::num::ParseIntError),
 
-    #[error("JWT_SECRET must be at least 32 characters long for security reasons")]
+    #[error(
+        "JWT_SECRET must be a generated secret of at least 32 characters (e.g. `openssl rand -base64 48`): placeholders and repetitive strings are refused"
+    )]
     InsecureJwtSecret,
 
     #[error(

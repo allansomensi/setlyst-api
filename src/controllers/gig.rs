@@ -152,6 +152,16 @@ pub async fn find_gig_by_id(
     match state.gig_repo.find_by_id(id, user_id).await {
         Ok(Some(mut gig)) => {
             mark_one(&state, user_id, &mut gig).await?;
+            // The public link of a band gig is only shown to members who
+            // may manage it: anyone else could hand it out, and keep using
+            // it after leaving the band.
+            if gig.share_token.is_some() && gig.band_id.is_some() {
+                match state.gig_repo.can_manage(id, user_id).await {
+                    Ok(()) => {}
+                    Err(ApiError::DatabaseError(e)) => return Err(ApiError::DatabaseError(e)),
+                    Err(_) => gig.share_token = None,
+                }
+            }
             info!(%user_id, gig_id = %id, "Gig retrieved successfully");
             Ok(Json(gig))
         }

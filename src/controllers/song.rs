@@ -577,6 +577,11 @@ pub async fn export_song_chordpro(
     access: AccessControl,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // Like every other export: staff viewing the platform as someone
+    // must not walk away with their content, one song at a time either.
+    if access.impersonator().is_some() {
+        return Err(ApiError::impersonation_read_only());
+    }
     let song = exportable_song(&state, access.user_id(), id).await?;
     let export = SongExport {
         title: song.title.clone(),
@@ -620,6 +625,9 @@ pub async fn export_song_pdf(
     Path(id): Path<Uuid>,
     Query(query): Query<SongExportQuery>,
 ) -> Result<axum::response::Response, ApiError> {
+    if access.impersonator().is_some() {
+        return Err(ApiError::impersonation_read_only());
+    }
     let user_id = access.user_id();
     presets::limit(&presets::PDF_EXPORT, user_id)?;
     ensure_feature(&state, user_id, Feature::PdfExport).await?;

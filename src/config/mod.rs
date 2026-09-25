@@ -209,6 +209,85 @@ impl Default for Config {
     }
 }
 
+/// Fragments of the placeholders `.env.example` and setup guides use for
+/// secrets: a value carrying one was never replaced.
+const PLACEHOLDER_SECRET_FRAGMENTS: &[&str] = &[
+    "replace_this",
+    "replace-this",
+    "replace_me",
+    "replace-me",
+    "your_secret",
+    "your-secret",
+    "your_jwt",
+    "changeme",
+    "change_me",
+    "change-me",
+    "placeholder",
+    "example",
+    "secret_key_here",
+];
+
+/// A `JWT_SECRET` long enough for the length check but not a secret: a
+/// placeholder left in place, or a string with so few distinct characters
+/// that it was typed rather than generated (`aaaa…`, `12341234…`). Every
+/// derived key (code HMACs, unsubscribe links, the fallback data key)
+/// hangs off it.
+pub fn jwt_secret_is_weak(secret: &str) -> bool {
+    let lower = secret.to_ascii_lowercase();
+    if PLACEHOLDER_SECRET_FRAGMENTS
+        .iter()
+        .any(|fragment| lower.contains(fragment))
+    {
+        return true;
+    }
+    let distinct: std::collections::HashSet<char> = secret.chars().collect();
+    distinct.len() < 8
+}
+
+/// Whether `DATABASE_URL` reaches a remote server without asking for a
+/// verified TLS connection: sqlx's default (`sslmode=prefer`) encrypts
+/// when the server offers it but never checks the certificate, and
+/// silently falls back to plain text. `None` when all is well (a local
+/// server, or an explicit `sslmode`).
+pub fn database_tls_problem(database_url: &str) -> Option<&'static str> {
+    let rest = database_url.split_once("://").map(|(_, r)| r)?;
+    let (authority, query) = match rest.split_once('?') {
+        Some((a, q)) => (a, Some(q)),
+        None => (rest, None),
+    };
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host_port = host_port.split('/').next().unwrap_or(host_port);
+    let host = host_port
+        .strip_prefix('[')
+        .and_then(|h| h.split(']').next())
+        .unwrap_or_else(|| host_port.split(':').next().unwrap_or(host_port))
+        .to_ascii_lowercase();
+    let local = host.is_empty()
+        || host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host.ends_with(".localhost");
+    if local {
+        return None;
+    }
+    let mode = query.and_then(|q| {
+        q.split('&').find_map(|pair| {
+            pair.strip_prefix("sslmode=")
+                .or_else(|| pair.strip_prefix("ssl-mode="))
+        })
+    });
+    match mode.map(str::to_ascii_lowercase).as_deref() {
+        Some("require") | Some("verify-ca") | Some("verify_ca") | Some("verify-full")
+        | Some("verify_full") | Some("verifyca") | Some("verifyfull") => None,
+        Some(_) => Some(
+            "DATABASE_URL asks for an unencrypted or unverified connection (sslmode); use sslmode=verify-full for a remote server",
+        ),
+        None => Some(
+            "DATABASE_URL has no sslmode: the connection to the remote database is only encrypted if the server happens to offer it, and its certificate is never checked. Add ?sslmode=verify-full (or at least require)",
+        ),
+    }
+}
+
 /// Reads an optional, non-blank variable.
 fn env_opt(key: &str) -> Option<String> {
     std::env::var(key)
@@ -390,7 +469,7 @@ impl Config {
     /// everything that would otherwise fail later at runtime.
     pub fn from_env() -> Result<Self, ConfigError> {
         let jwt_secret = std::env::var("JWT_SECRET")?;
-        if jwt_secret.len() < 32 {
+        if jwt_secret.len() < 32 || jwt_secret_is_weak(&jwt_secret) {
             return Err(ConfigError::InsecureJwtSecret);
         }
 
@@ -480,6 +559,40 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placeholder_and_low_entropy_jwt_secrets_are_refused() {
+        assert!(jwt_secret_is_weak(
+            "replace_this_value_with_a_secure_32_char_secret"
+        ));
+        assert!(jwt_secret_is_weak("your_secret_your_secret_your_secret_1"));
+        assert!(jwt_secret_is_weak(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        assert!(jwt_secret_is_weak("12341234123412341234123412341234"));
+        assert!(!jwt_secret_is_weak(
+            "kJ8v2Qm9xLp4Zr7Tn3Wb6Yc1Hf5Gd0Se8Ua2Vi4Xo"
+        ));
+        assert!(!jwt_secret_is_weak(
+            "integration-tests-secret-that-is-long-enough"
+        ));
+    }
+
+    #[test]
+    fn remote_databases_must_ask_for_verified_tls() {
+        assert!(database_tls_problem("postgres://postgres:postgres@localhost:5432/db").is_none());
+        assert!(database_tls_problem("postgres://u:p@127.0.0.1/db").is_none());
+        assert!(database_tls_problem("postgres://u:p@[::1]:5432/db").is_none());
+        assert!(
+            database_tls_problem("postgres://u:p@db.example.com:5432/db?sslmode=verify-full")
+                .is_none()
+        );
+        assert!(database_tls_problem("postgres://u:p@db.example.com/db?sslmode=require").is_none());
+        assert!(database_tls_problem("postgres://u:p@db.example.com:5432/db").is_some());
+        assert!(database_tls_problem("postgres://u:p@db.example.com/db?sslmode=prefer").is_some());
+        assert!(database_tls_problem("postgres://u:p@db.example.com/db?sslmode=disable").is_some());
+        assert!(database_tls_problem("postgres://u:p@[2001:db8::7]/db").is_some());
+    }
 
     #[test]
     fn trusted_proxies_accept_cidrs_and_bare_addresses() {

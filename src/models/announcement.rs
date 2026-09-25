@@ -318,6 +318,7 @@ pub fn is_valid_cta_url_for(url: &str, allowed_hosts: &[String]) -> bool {
             parsed.scheme() == "https"
                 && parsed.username().is_empty()
                 && parsed.password().is_none()
+                && parsed.port().is_none()
                 && parsed.domain().is_some_and(|domain| {
                     let domain = domain.trim_end_matches('.').to_ascii_lowercase();
                     allowed_hosts.contains(&domain)
@@ -456,6 +457,10 @@ mod tests {
         ));
         assert!(!is_valid_cta_url_for("http://setlyst.app/pricing", &hosts));
         assert!(!is_valid_cta_url_for("https://user@setlyst.app/", &hosts));
+        assert!(!is_valid_cta_url_for(
+            "https://setlyst.app:8443/pricing",
+            &hosts
+        ));
         let mut d = draft();
         d.audience_roles = Some(vec!["root".into()]);
         assert!(d.check().is_err());

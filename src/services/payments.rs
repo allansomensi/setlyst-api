@@ -1202,10 +1202,10 @@ pub async fn handle_webhook(
 
     // A test-mode event on the live endpoint (or the reverse) must never
     // touch real subscriptions.
-    if let Some(livemode) = event.livemode
-        && livemode != payments.livemode
-    {
-        warn!(event = %event.id, kind = %event.kind, livemode, "Webhook event from the other Stripe mode; ignored");
+    // Stripe always says which mode an event belongs to; one that
+    // doesn't is not Stripe's and is ignored like a mismatch.
+    if event.livemode != Some(payments.livemode) {
+        warn!(event = %event.id, kind = %event.kind, livemode = ?event.livemode, "Webhook event from the other Stripe mode (or without one); ignored");
         return Ok(());
     }
     let object = value.pointer("/data/object").unwrap_or(&Value::Null);
@@ -1444,6 +1444,35 @@ fn withdrawal_not_eligible(eligible_until: Option<NaiveDateTime>) -> ApiError {
     )
 }
 
+/// Self-service withdrawals an account may make in any 12 months. The
+/// right to withdraw is per purchase, but nothing stops a subscription
+/// from being taken, used for six days, withdrawn in full and taken
+/// again, indefinitely: each round costs the card fees the provider
+/// keeps on a refund and gives the paid features away. Past this count
+/// the request goes through support instead.
+pub const SELF_SERVICE_WITHDRAWALS_PER_YEAR: i64 = 2;
+
+fn withdrawal_limit_reached() -> ApiError {
+    ApiError::rule_with_meta(
+        StatusCode::CONFLICT,
+        codes::WITHDRAWAL_NOT_ELIGIBLE,
+        "This account has already withdrawn from a subscription twice in the last 12 months. Contact support to withdraw from this one.",
+        json!({ "eligible_until": Value::Null, "reason": "limit", "contact_support": true }),
+    )
+}
+
+/// Self-service withdrawals recorded for `user_id` in the last year.
+async fn withdrawals_in_last_year(state: &AppState, user_id: Uuid) -> Result<i64, ApiError> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM subscription_events
+         WHERE user_id = $1 AND kind = 'withdrawn' AND created_at >= $2",
+    )
+    .bind(user_id)
+    .bind(now() - Duration::days(365))
+    .fetch_one(&state.db)
+    .await?)
+}
+
 /// `POST /billing/withdraw`: the buyer's right to withdraw (CDC art. 49,
 /// Decreto 7.962 art. 5). Within 7 days of the subscription's first paid
 /// invoice (or of a yearly renewal charge), cancels it now and refunds
@@ -1523,6 +1552,12 @@ async fn refund_and_end(
     let Some((subscription_id, interval)) = row else {
         return Err(no_paid_subscription());
     };
+    if !staff
+        && withdrawals_in_last_year(state, user_id).await? >= SELF_SERVICE_WITHDRAWALS_PER_YEAR
+    {
+        warn!(%user_id, "Self-service withdrawal refused: yearly limit reached");
+        return Err(withdrawal_limit_reached());
+    }
 
     let mut tx = state.db.begin().await?;
     lock_provider_subscription(&mut tx, &subscription_id).await?;

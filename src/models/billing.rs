@@ -604,6 +604,61 @@ pub struct SubscriptionEvent {
     pub created_at: NaiveDateTime,
 }
 
+/// The keys of [`SubscriptionEvent::data`] an account may see about its
+/// own history. Everything else stays with staff: the note an admin
+/// wrote when granting a plan, the reason of a staff refund, provider
+/// object ids and the like.
+const OWNER_VISIBLE_EVENT_DATA: &[&str] = &[
+    "days",
+    "source",
+    "plan_code",
+    "interval",
+    "effective_at",
+    "current_period_end",
+    "currency",
+    "refunded_cents",
+    "old_amount_cents",
+    "new_amount_cents",
+];
+
+/// One change in the caller's own subscription history
+/// (`GET /billing/history`): a [`SubscriptionEvent`] without who did it
+/// and without the staff-only details in `data`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OwnSubscriptionEvent {
+    pub id: Uuid,
+    pub kind: String,
+    pub from_plan: Option<String>,
+    pub to_plan: Option<String>,
+    pub from_status: Option<SubscriptionStatus>,
+    pub to_status: Option<SubscriptionStatus>,
+    pub data: Value,
+    pub created_at: NaiveDateTime,
+}
+
+impl From<SubscriptionEvent> for OwnSubscriptionEvent {
+    fn from(event: SubscriptionEvent) -> Self {
+        let data = match event.data {
+            Value::Object(map) => Value::Object(
+                map.into_iter()
+                    .filter(|(key, _)| OWNER_VISIBLE_EVENT_DATA.contains(&key.as_str()))
+                    .collect(),
+            ),
+            _ => Value::Object(Default::default()),
+        };
+        Self {
+            id: event.id,
+            kind: event.kind,
+            from_plan: event.from_plan,
+            to_plan: event.to_plan,
+            from_status: event.from_status,
+            to_status: event.to_status,
+            data,
+            created_at: event.created_at,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // The caller's billing (`GET /billing/me`)
 // ---------------------------------------------------------------------
@@ -815,7 +870,7 @@ pub struct PromoCode {
 
 fn validate_promo_code(code: &str) -> Result<(), ValidationError> {
     let code = code.trim();
-    if (4..=32).contains(&code.len())
+    if (MIN_PROMO_CODE_CHARS..=32).contains(&code.len())
         && code
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -824,13 +879,15 @@ fn validate_promo_code(code: &str) -> Result<(), ValidationError> {
     } else {
         Err(error(
             "invalid_promo_code",
-            "Codes have 4 to 32 letters, digits, '-' or '_'.",
+            "Codes have 8 to 32 letters, digits, '-' or '_'.",
         ))
     }
 }
 
-/// Shortest custom code accepted for `discount` and `plan_grant` codes.
-pub const MIN_VALUABLE_CODE_CHARS: usize = 8;
+/// Shortest custom code accepted, whatever it grants: credits and trial
+/// time are worth money too, and redemption attempts are throttled, not
+/// impossible (generated codes have 10 characters).
+pub const MIN_PROMO_CODE_CHARS: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Validate)]
 pub struct CreatePromoCodePayload {
@@ -891,18 +948,6 @@ impl CreatePromoCodePayload {
             && end <= start
         {
             return Err("'expires_at' must be after 'starts_at'.".into());
-        }
-        // Codes worth money must not be guessable (generated codes have 10
-        // characters).
-        if matches!(self.kind, PromoKind::Discount | PromoKind::PlanGrant)
-            && self
-                .code
-                .as_deref()
-                .is_some_and(|c| c.trim().chars().count() < MIN_VALUABLE_CODE_CHARS)
-        {
-            return Err(format!(
-                "Discount and plan codes need at least {MIN_VALUABLE_CODE_CHARS} characters."
-            ));
         }
         Ok(())
     }

@@ -24,6 +24,20 @@ use reqwest::Url;
 
 pub const MAX_IMAGE_URL_LENGTH: usize = 500;
 
+/// Public wildcard-DNS services that turn any name into the IP address
+/// embedded in it.
+const WILDCARD_DNS_SUFFIXES: &[&str] = &[
+    ".nip.io",
+    ".sslip.io",
+    ".xip.io",
+    ".localtest.me",
+    ".traefik.me",
+    ".lvh.me",
+    ".vcap.me",
+    ".lacolhost.com",
+    ".127-0-0-1.org",
+];
+
 fn invalid(message: &str) -> ApiError {
     ApiError::rule(
         StatusCode::BAD_REQUEST,
@@ -65,6 +79,20 @@ pub fn validate_image_url(raw: &str) -> Result<String, ApiError> {
     {
         return Err(invalid("the host is not public."));
     }
+    // Wildcard DNS services resolve any name to the address written in
+    // it (`10-0-0-5.sslip.io`, `127.0.0.1.nip.io`): an IP literal in
+    // disguise, kept out for the same reason literals are.
+    if WILDCARD_DNS_SUFFIXES
+        .iter()
+        .any(|suffix| host == suffix[1..] || host.ends_with(suffix))
+    {
+        return Err(invalid("the host is not public."));
+    }
+    // Only the default https port: the image proxy fetches nothing else,
+    // and a port is how a link would probe a service rather than a CDN.
+    if url.port().is_some() {
+        return Err(invalid("links with a port are not accepted."));
+    }
     if url.path().to_ascii_lowercase().ends_with(".svg") {
         return Err(invalid("SVG images are not accepted."));
     }
@@ -84,6 +112,8 @@ mod tests {
             "https://i.imgur.com/abc123.png",
             "https://example.com/photos/me.jpg?size=200",
             " https://cdn.example.org/a.webp ",
+            // The default port is dropped by the parser, not a port.
+            "https://example.com:443/a.png",
         ] {
             assert!(validate_image_url(url).is_ok(), "{url}");
         }
@@ -106,6 +136,10 @@ mod tests {
             "https://intranet/a.png",
             "https://example.com/logo.SVG",
             "https://www.pornhub.com/a.jpg",
+            "https://example.com:8443/a.png",
+            "https://127.0.0.1.nip.io/a.png",
+            "https://10-0-0-5.sslip.io/a.png",
+            "https://nip.io/a.png",
             "javascript:alert(1)",
             "data:image/png;base64,AAAA",
             "https://example.com/a b.png",

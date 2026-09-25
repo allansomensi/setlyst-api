@@ -979,19 +979,12 @@ pub async fn update_user_quotas(
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateUserQuotaPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    access.require_admin()?;
+    require_admin_for(&access, "change another account's limits")?;
     payload.validate()?;
-    if id == access.user_id() {
-        return Err(ApiError::cannot_target_self(
-            "You can't change your own quotas.",
-        ));
-    }
-
-    let target = state
-        .user_repo
-        .find_by_id(id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
+    // Same hierarchy as every other account operation: never one's own
+    // account, never a peer (an admin's limits are not another admin's
+    // to change).
+    let target = load_managed_target(&state, &access, id).await?;
 
     state
         .quota_repo
