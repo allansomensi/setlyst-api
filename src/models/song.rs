@@ -456,6 +456,14 @@ pub struct Song {
     /// for a personal song (or a fork whose source was later deleted — the
     /// link is cleared, not the copy).
     pub forked_from: Option<Uuid>,
+    /// What sets this version apart ("Simplified", "Acoustic"), or `None`
+    /// for an original.
+    #[sqlx(default)]
+    pub version_label: Option<String>,
+    /// The original song this one is a version of (always the root of the
+    /// family), or `None` for an original. See `GET /songs/{id}/versions`.
+    #[sqlx(default)]
+    pub version_of: Option<Uuid>,
     pub tempo: Option<i32>,
     pub lyrics: Option<String>,
     pub tonality: Option<Tonality>,
@@ -512,6 +520,20 @@ pub struct SongSetlistRef {
     pub band_name: Option<String>,
     /// The song's position in that setlist.
     pub position: i32,
+}
+
+/// `GET /songs/{id}/versions`: one song of a version family.
+#[derive(ToSchema, Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct SongVersion {
+    pub id: Uuid,
+    pub title: String,
+    /// `None` for the original.
+    pub version_label: Option<String>,
+    /// `true` for the family's original (the song the others are versions of).
+    pub is_original: bool,
+    pub tonality: Option<Tonality>,
+    pub tempo: Option<i32>,
+    pub updated_at: NaiveDateTime,
 }
 
 /// A band's copy of one of the caller's personal songs, and whether the two
@@ -581,6 +603,24 @@ pub fn validate_performance_notes(value: &str) -> Result<(), validator::Validati
     Ok(())
 }
 
+/// Longest version label, in characters.
+pub const MAX_VERSION_LABEL_LENGTH: usize = 60;
+
+pub fn validate_version_label(value: &str) -> Result<(), validator::ValidationError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().count() > MAX_VERSION_LABEL_LENGTH
+        || value.chars().any(|c| c.is_control())
+    {
+        let mut error = validator::ValidationError::new("invalid_version_label");
+        error.message = Some(std::borrow::Cow::from(format!(
+            "The version name must be 1 to {MAX_VERSION_LABEL_LENGTH} characters, on one line."
+        )));
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Trims an optional free-text value; blank becomes `None`.
 pub fn clean_text(value: Option<&str>) -> Option<String> {
     value
@@ -625,6 +665,13 @@ pub struct CreateSongPayload {
     /// At most 5 links to supported providers (see `LinkInput`).
     #[validate(length(max = 5, message = "At most 5 links are allowed."))]
     pub links: Option<Vec<LinkInput>>,
+    /// Creates the song as a version of another of the caller's personal
+    /// songs (its family's original is recorded, whichever member of the
+    /// family is given).
+    pub version_of: Option<Uuid>,
+    /// What sets this version apart ("Simplified", "Acoustic").
+    #[validate(custom(function = "validate_version_label"))]
+    pub version_label: Option<String>,
 }
 
 /// Every nullable field uses `Option<Option<T>>`: absent leaves it
@@ -672,6 +719,9 @@ pub struct UpdateSongPayload {
     /// Absent = unchanged, `[]` = remove every link.
     #[validate(length(max = 5, message = "At most 5 links are allowed."))]
     pub links: Option<Vec<LinkInput>>,
+    #[serde(default, deserialize_with = "crate::models::patch::double_option")]
+    #[validate(custom(function = "validate_version_label"))]
+    pub version_label: Option<Option<String>>,
 }
 
 impl Song {
@@ -685,6 +735,8 @@ impl Song {
             user_id,
             band_id: None,
             forked_from: None,
+            version_label: clean_text(payload.version_label.as_deref()),
+            version_of: None,
             tempo: payload.tempo,
             lyrics: payload.lyrics.clone(),
             tonality: payload.tonality,
@@ -724,6 +776,10 @@ impl Song {
             user_id: creator_id,
             band_id: Some(band_id),
             forked_from: Some(source.id),
+            // The band's copy of the family's original, if it has one, is
+            // resolved when the copy is stored.
+            version_label: source.version_label.clone(),
+            version_of: None,
             tempo: source.tempo,
             lyrics: source.lyrics.clone(),
             tonality: source.tonality,
@@ -787,6 +843,10 @@ pub struct SongWithArtist {
     pub user_id: Uuid,
     pub band_id: Option<Uuid>,
     pub forked_from: Option<Uuid>,
+    #[sqlx(default)]
+    pub version_label: Option<String>,
+    #[sqlx(default)]
+    pub version_of: Option<Uuid>,
     pub tempo: Option<i32>,
     pub lyrics: Option<String>,
     pub tonality: Option<Tonality>,
@@ -812,6 +872,12 @@ pub struct SongWithArtist {
     pub updated_by_username: Option<String>,
     #[sqlx(default)]
     pub source_synced_at: Option<NaiveDateTime>,
+    /// Songs read as part of a setlist: the key it is played in there, in
+    /// semitones from the written `tonality` (0 = as written). Absent
+    /// everywhere else.
+    #[sqlx(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transpose: Option<i16>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }

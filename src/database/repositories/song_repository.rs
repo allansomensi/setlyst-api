@@ -5,8 +5,8 @@ use crate::{
         band::BandRole,
         link::Links,
         song::{
-            BandCopyStatus, CreateSongPayload, Song, SongExport, SongSetlistRef, SongWithArtist,
-            TagCount, UpdateSongPayload, clean_text,
+            BandCopyStatus, CreateSongPayload, Song, SongExport, SongSetlistRef, SongVersion,
+            SongWithArtist, TagCount, UpdateSongPayload, clean_text,
         },
     },
     validations::link::normalize_links,
@@ -20,7 +20,8 @@ use uuid::Uuid;
 /// `concat!` (sqlx only accepts literal query strings).
 macro_rules! song_columns {
     () => {
-        "s.id, s.title, s.artist_id, s.user_id, s.band_id, s.forked_from, s.tempo, s.lyrics,
+        "s.id, s.title, s.artist_id, s.user_id, s.band_id, s.forked_from, s.version_label,
+         s.version_of, s.tempo, s.lyrics,
          s.tonality, s.genre, s.duration, s.energy, s.time_signature, s.capo, s.tuning,
          s.performance_notes, s.links,
          COALESCE((SELECT array_agg(st.tag ORDER BY st.tag) FROM song_tags st WHERE st.song_id = s.id), '{}') AS tags,
@@ -88,14 +89,21 @@ pub trait SongRepository: Send + Sync {
     async fn delete(&self, id: Uuid) -> Result<(), ApiError>;
     /// Moves a live song to the trash.
     async fn trash(&self, id: Uuid, actor_id: Uuid) -> Result<(), ApiError>;
-    /// Checks title uniqueness among the caller's *personal* songs for that artist.
+    /// Checks title uniqueness among the caller's *personal* songs for that
+    /// artist: one song per title and version label (`None` = an original).
     async fn is_unique(
         &self,
         title: &str,
         artist_id: Uuid,
+        version_label: Option<&str>,
         user_id: Uuid,
         exclude_id: Option<Uuid>,
     ) -> Result<(), ApiError>;
+    /// Every live song of `id`'s version family (the original and its
+    /// versions) in the same scope as `id` — the same owner's personal
+    /// songs, or the same band's. The original first, then by label.
+    /// The caller must already have authorized access to `id`.
+    async fn versions_of(&self, id: Uuid) -> Result<Vec<SongVersion>, ApiError>;
     /// The song exists and is one of `user_id`'s *personal* songs.
     async fn exists(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
     /// Checks the caller may edit/delete this song: its personal owner, or
@@ -339,6 +347,19 @@ impl SongRepository for SongRepositoryImpl {
     ) -> Result<Song, ApiError> {
         let links = normalize_links(payload.links.as_deref().unwrap_or_default())?;
         let mut new_song = Song::new(payload, user_id);
+        // Always the family's original, whichever member was named (the
+        // controller checked it is one of the caller's personal songs).
+        if let Some(of) = payload.version_of {
+            new_song.version_of = sqlx::query_scalar(
+                "SELECT COALESCE(version_of, id) FROM songs WHERE id = $1 AND deleted_at IS NULL",
+            )
+            .bind(of)
+            .fetch_optional(&self.db)
+            .await?;
+            if new_song.version_of.is_none() {
+                return Err(ApiError::NotFound);
+            }
+        }
         new_song.title = new_song.title.trim().to_string();
         new_song.lyrics = new_song.lyrics.filter(|l| !l.trim().is_empty());
         new_song.tags = tags.to_vec();
@@ -349,8 +370,9 @@ impl SongRepository for SongRepositoryImpl {
 
         sqlx::query(
             "INSERT INTO songs (id, title, artist_id, user_id, band_id, forked_from, tempo, lyrics, tonality, genre, duration,
-                                energy, time_signature, capo, tuning, performance_notes, links, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
+                                energy, time_signature, capo, tuning, performance_notes, links, created_at, updated_at,
+                                version_label, version_of)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
         )
         .bind(new_song.id)
         .bind(&new_song.title)
@@ -371,6 +393,8 @@ impl SongRepository for SongRepositoryImpl {
         .bind(sqlx::types::Json(&links))
         .bind(new_song.created_at)
         .bind(new_song.updated_at)
+        .bind(&new_song.version_label)
+        .bind(new_song.version_of)
         .execute(&mut *tx)
         .await?;
 
@@ -504,6 +528,15 @@ impl SongRepository for SongRepositoryImpl {
             updated = true;
         }
 
+        if let Some(label) = &payload.version_label {
+            sqlx::query("UPDATE songs SET version_label = $1 WHERE id = $2")
+                .bind(clean_text(label.as_deref()))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            updated = true;
+        }
+
         if let Some(links) = &payload.links {
             let links = normalize_links(links)?;
             sqlx::query("UPDATE songs SET links = $1 WHERE id = $2")
@@ -565,20 +598,24 @@ impl SongRepository for SongRepositoryImpl {
         &self,
         title: &str,
         artist_id: Uuid,
+        version_label: Option<&str>,
         user_id: Uuid,
         exclude_id: Option<Uuid>,
     ) -> Result<(), ApiError> {
         // Case- and whitespace-insensitive: "Wonderwall" and "wonderwall "
-        // by the same artist are the same song.
+        // by the same artist are the same song (and so are two versions
+        // both called "Acoustic").
         let exists = sqlx::query(
             "SELECT id FROM songs
              WHERE LOWER(TRIM(title)) = LOWER(TRIM($1)) AND artist_id = $2 AND user_id = $3
+               AND LOWER(TRIM(COALESCE(version_label, ''))) = LOWER(TRIM(COALESCE($5, '')))
                AND band_id IS NULL AND deleted_at IS NULL AND ($4::uuid IS NULL OR id != $4)",
         )
         .bind(title)
         .bind(artist_id)
         .bind(user_id)
         .bind(exclude_id)
+        .bind(version_label)
         .fetch_optional(&self.db)
         .await?
         .is_some();
@@ -588,6 +625,27 @@ impl SongRepository for SongRepositoryImpl {
         } else {
             Ok(())
         }
+    }
+
+    async fn versions_of(&self, id: Uuid) -> Result<Vec<SongVersion>, ApiError> {
+        let versions = sqlx::query_as::<_, SongVersion>(
+            "WITH target AS (
+                SELECT COALESCE(version_of, id) AS root, user_id, band_id
+                FROM songs WHERE id = $1
+             )
+             SELECT s.id, s.title, s.version_label, s.version_of IS NULL AS is_original,
+                    s.tonality, s.tempo, s.updated_at
+             FROM songs s, target t
+             WHERE (s.id = t.root OR s.version_of = t.root)
+               AND s.deleted_at IS NULL
+               AND s.band_id IS NOT DISTINCT FROM t.band_id
+               AND (t.band_id IS NOT NULL OR s.user_id = t.user_id)
+             ORDER BY s.version_of IS NOT NULL, LOWER(COALESCE(s.version_label, '')), s.created_at",
+        )
+        .bind(id)
+        .fetch_all(&self.db)
+        .await?;
+        Ok(versions)
     }
 
     async fn exists(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
@@ -722,8 +780,11 @@ impl SongRepository for SongRepositoryImpl {
         let (song_id, inserted): (Uuid, bool) = sqlx::query_as(
             "INSERT INTO songs (id, title, artist_id, user_id, band_id, forked_from, tempo, lyrics, tonality, genre, duration,
                                 energy, time_signature, capo, tuning, performance_notes, links, created_at, updated_at,
-                                source_synced_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $19)
+                                source_synced_at, version_label, version_of)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $19, $20,
+                     -- A version's copy joins the band's copy of its original, when there is one.
+                     (SELECT o.id FROM songs o
+                      WHERE o.band_id = $5 AND o.forked_from = $21 AND o.deleted_at IS NULL LIMIT 1))
              ON CONFLICT (band_id, forked_from)
                 WHERE band_id IS NOT NULL AND forked_from IS NOT NULL AND deleted_at IS NULL
              DO UPDATE SET updated_at = songs.updated_at
@@ -748,12 +809,25 @@ impl SongRepository for SongRepositoryImpl {
         .bind(sqlx::types::Json(new_song.links.to_stored()))
         .bind(new_song.created_at)
         .bind(new_song.updated_at)
+        .bind(&new_song.version_label)
+        .bind(source.version_of)
         .fetch_one(&mut *tx)
         .await?;
 
         // A fresh copy carries the source's tags along.
         if inserted {
             replace_tags(&mut tx, song_id, &source.tags).await?;
+            // Copies of this song's versions made before it join it now.
+            sqlx::query(
+                "UPDATE songs SET version_of = $1
+                 WHERE band_id = $2 AND version_of IS NULL AND id <> $1
+                   AND forked_from IN (SELECT v.id FROM songs v WHERE v.version_of = $3)",
+            )
+            .bind(song_id)
+            .bind(band_id)
+            .bind(source.id)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
 
@@ -833,7 +907,7 @@ impl SongRepository for SongRepositoryImpl {
         let result = sqlx::query(
             "UPDATE songs SET title = $2, artist_id = $3, tempo = $4, lyrics = $5, tonality = $6,
                     genre = $7, duration = $8, energy = $9, time_signature = $10, capo = $11,
-                    tuning = $12, performance_notes = $13, links = $14,
+                    tuning = $12, performance_notes = $13, links = $14, version_label = $17,
                     updated_at = $15, updated_by = $16, source_synced_at = $15
              WHERE id = $1 AND band_id IS NOT NULL AND deleted_at IS NULL",
         )
@@ -853,6 +927,7 @@ impl SongRepository for SongRepositoryImpl {
         .bind(sqlx::types::Json(source.links.to_stored()))
         .bind(now)
         .bind(actor_id)
+        .bind(&source.version_label)
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {

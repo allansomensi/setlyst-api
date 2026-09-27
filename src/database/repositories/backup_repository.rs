@@ -42,6 +42,8 @@ struct SongRow {
     tuning: Option<String>,
     performance_notes: Option<String>,
     links: sqlx::types::Json<Vec<StoredLink>>,
+    version_label: Option<String>,
+    version_of: Option<Uuid>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -57,6 +59,7 @@ struct SetlistSongRow {
     setlist_id: Uuid,
     song_id: Uuid,
     position: i32,
+    transpose: i16,
 }
 
 #[derive(sqlx::FromRow)]
@@ -151,7 +154,9 @@ impl BackupRepository for BackupRepositoryImpl {
         let songs_fut = sqlx::query_as::<_, SongRow>(
             "SELECT s.id, s.title, s.artist_id, s.tempo, s.lyrics, s.tonality, s.genre, s.duration,
                     COALESCE((SELECT array_agg(st.tag ORDER BY st.tag) FROM song_tags st WHERE st.song_id = s.id), '{}') AS tags,
-                    s.energy, s.time_signature, s.capo, s.tuning, s.performance_notes, s.links
+                    s.energy, s.time_signature, s.capo, s.tuning, s.performance_notes, s.links,
+                    s.version_label,
+                    (SELECT o.id FROM songs o WHERE o.id = s.version_of AND o.deleted_at IS NULL) AS version_of
              FROM songs s
              WHERE s.user_id = $1 AND s.band_id IS NULL AND s.deleted_at IS NULL
              ORDER BY s.title ASC",
@@ -196,7 +201,7 @@ impl BackupRepository for BackupRepositoryImpl {
             Vec::new()
         } else {
             sqlx::query_as::<_, SetlistSongRow>(
-                "SELECT ss.setlist_id, ss.song_id, ss.position
+                "SELECT ss.setlist_id, ss.song_id, ss.position, ss.transpose
                  FROM setlist_songs ss
                  INNER JOIN songs s ON s.id = ss.song_id
                  WHERE ss.setlist_id = ANY($1) AND s.deleted_at IS NULL
@@ -217,6 +222,7 @@ impl BackupRepository for BackupRepositoryImpl {
                 .push(BackupSetlistSong {
                     song_id: row.song_id,
                     position: row.position,
+                    transpose: row.transpose,
                 });
         }
 
@@ -246,6 +252,8 @@ impl BackupRepository for BackupRepositoryImpl {
                 tuning: r.tuning,
                 performance_notes: r.performance_notes,
                 links: to_inputs(r.links.0),
+                version_label: r.version_label,
+                version_of: r.version_of,
             })
             .collect();
 
@@ -438,17 +446,21 @@ impl BackupRepository for BackupRepositoryImpl {
 
         // Songs: existing ones by (artist, title) in memory; new ones one
         // insert each (enum columns), tags in one statement at the end.
-        let existing_songs: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
-            "SELECT id, artist_id, LOWER(TRIM(title)) FROM songs
+        let existing_songs: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
+            "SELECT id, artist_id, LOWER(TRIM(title)), LOWER(TRIM(COALESCE(version_label, '')))
+             FROM songs
              WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL",
         )
         .bind(user_id)
         .fetch_all(&mut *tx)
         .await?;
-        let mut song_by_key: HashMap<(Uuid, String), Uuid> = existing_songs
+        let mut song_by_key: HashMap<(Uuid, String, String), Uuid> = existing_songs
             .into_iter()
-            .map(|(id, artist, title)| ((artist, title), id))
+            .map(|(id, artist, title, label)| ((artist, title, label), id))
             .collect();
+        // Songs created by this import that are versions of another: their
+        // original is linked once every song of the file has its new id.
+        let mut version_links: Vec<(Uuid, Uuid)> = Vec::new();
         let mut song_id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(backup.songs.len());
         let (mut tag_song_ids, mut tag_values) = (Vec::new(), Vec::new());
         for (song, links) in backup.songs.iter().zip(song_links) {
@@ -459,7 +471,12 @@ impl BackupRepository for BackupRepositoryImpl {
                 )));
             };
             let title = song.title.trim();
-            let key = (resolved_artist_id, title.to_lowercase());
+            let version_label = clean_text(song.version_label.as_deref());
+            let key = (
+                resolved_artist_id,
+                title.to_lowercase(),
+                version_label.as_deref().unwrap_or_default().to_lowercase(),
+            );
 
             let resolved_id = match song_by_key.get(&key) {
                 Some(&existing_id) => existing_id,
@@ -470,8 +487,8 @@ impl BackupRepository for BackupRepositoryImpl {
                         "INSERT INTO songs
                          (id, title, artist_id, user_id, tempo, lyrics, tonality, genre, duration,
                           energy, time_signature, capo, tuning, performance_notes, links,
-                          created_at, updated_at)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16)",
+                          created_at, updated_at, version_label)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16, $17)",
                     )
                     .bind(new_id)
                     .bind(title)
@@ -489,6 +506,7 @@ impl BackupRepository for BackupRepositoryImpl {
                     .bind(clean_text(song.performance_notes.as_deref()))
                     .bind(sqlx::types::Json(&links))
                     .bind(now)
+                    .bind(&version_label)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| {
@@ -496,6 +514,9 @@ impl BackupRepository for BackupRepositoryImpl {
                         ApiError::DatabaseError(e)
                     })?;
                     song_by_key.insert(key, new_id);
+                    if let Some(original) = song.version_of {
+                        version_links.push((new_id, original));
+                    }
                     new_id
                 }
             };
@@ -505,6 +526,29 @@ impl BackupRepository for BackupRepositoryImpl {
                 tag_values.push(tag);
             }
             song_id_map.insert(song.id, resolved_id);
+        }
+        let (version_ids, version_roots): (Vec<Uuid>, Vec<Uuid>) = version_links
+            .into_iter()
+            .filter_map(|(id, original)| {
+                song_id_map
+                    .get(&original)
+                    .filter(|&&root| root != id)
+                    .map(|&root| (id, root))
+            })
+            .unzip();
+        if !version_ids.is_empty() {
+            // Always the family's root, even if the file's original was
+            // merged into a song that is itself a version.
+            sqlx::query(
+                "UPDATE songs AS s SET version_of = COALESCE(o.version_of, o.id)
+                 FROM UNNEST($1::uuid[], $2::uuid[]) AS t(id, original)
+                 INNER JOIN songs o ON o.id = t.original
+                 WHERE s.id = t.id AND COALESCE(o.version_of, o.id) <> s.id",
+            )
+            .bind(&version_ids)
+            .bind(&version_roots)
+            .execute(&mut *tx)
+            .await?;
         }
         if !tag_song_ids.is_empty() {
             // A song merged into an existing one keeps the existing tags
@@ -533,7 +577,7 @@ impl BackupRepository for BackupRepositoryImpl {
         // Setlists and all their entries: two statements.
         let mut setlist_id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(backup.setlists.len());
         let mut setlist_rows = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        let mut entries = (Vec::new(), Vec::new(), Vec::new());
+        let mut entries = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for (setlist, links) in backup.setlists.iter().zip(setlist_links) {
             let new_setlist_id = Uuid::new_v4();
             setlist_id_map.insert(setlist.id, new_setlist_id);
@@ -555,6 +599,7 @@ impl BackupRepository for BackupRepositoryImpl {
             let mut position_of: HashMap<Uuid, usize> = HashMap::with_capacity(setlist.songs.len());
             let mut song_ids: Vec<Uuid> = Vec::with_capacity(setlist.songs.len());
             let mut positions: Vec<i32> = Vec::with_capacity(setlist.songs.len());
+            let mut transposes: Vec<i16> = Vec::with_capacity(setlist.songs.len());
             for entry in &setlist.songs {
                 let Some(&resolved_song_id) = song_id_map.get(&entry.song_id) else {
                     return Err(ApiError::BadRequest(format!(
@@ -563,18 +608,25 @@ impl BackupRepository for BackupRepositoryImpl {
                     )));
                 };
                 match position_of.get(&resolved_song_id) {
-                    Some(&index) => positions[index] = entry.position,
+                    Some(&index) => {
+                        positions[index] = entry.position;
+                        transposes[index] = entry.transpose;
+                    }
                     None => {
                         position_of.insert(resolved_song_id, song_ids.len());
                         song_ids.push(resolved_song_id);
                         positions.push(entry.position);
+                        transposes.push(entry.transpose);
                     }
                 }
             }
-            for (song_id, position) in song_ids.into_iter().zip(positions) {
+            for ((song_id, position), transpose) in
+                song_ids.into_iter().zip(positions).zip(transposes)
+            {
                 entries.0.push(new_setlist_id);
                 entries.1.push(song_id);
                 entries.2.push(position);
+                entries.3.push(transpose);
             }
         }
         if !setlist_rows.0.is_empty() {
@@ -599,13 +651,15 @@ impl BackupRepository for BackupRepositoryImpl {
         }
         if !entries.0.is_empty() {
             sqlx::query(
-                "INSERT INTO setlist_songs (setlist_id, song_id, position)
-                 SELECT t.setlist_id, t.song_id, t.position
-                 FROM UNNEST($1::uuid[], $2::uuid[], $3::int[]) AS t(setlist_id, song_id, position)",
+                "INSERT INTO setlist_songs (setlist_id, song_id, position, transpose)
+                 SELECT t.setlist_id, t.song_id, t.position, t.transpose
+                 FROM UNNEST($1::uuid[], $2::uuid[], $3::int[], $4::smallint[])
+                      AS t(setlist_id, song_id, position, transpose)",
             )
             .bind(&entries.0)
             .bind(&entries.1)
             .bind(&entries.2)
+            .bind(&entries.3)
             .execute(&mut *tx)
             .await?;
         }

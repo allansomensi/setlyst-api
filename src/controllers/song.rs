@@ -25,7 +25,7 @@ use crate::{
         resolve_page,
         song::{
             BandCopyStatus, CreateSongPayload, RenameTagPayload, Song, SongExport, SongListQuery,
-            SongSetlistRef, TagCount, Tonality, UpdateSongPayload,
+            SongSetlistRef, SongVersion, TagCount, Tonality, UpdateSongPayload,
         },
     },
     services::entitlements::{Feature, ensure_feature, has_feature},
@@ -142,6 +142,33 @@ pub async fn find_song_setlists(
         .await?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(state.song_repo.setlists_of(id, user_id).await?))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/songs/{id}/versions",
+    tags = ["Songs"],
+    summary = "Versions of a song.",
+    description = "Every live song of the song's version family — the original (`is_original`) and its versions (a simplified chart, an acoustic arrangement...), in the same library as the song: the caller's personal songs, or the band's. The original first, then by `version_label`. A song with no versions lists just itself.\n\nCreate a version with `POST /songs` and `version_of`.",
+    params(("id" = Uuid, Path, description = "The song ID")),
+    security(("jwt_token" = [])),
+    responses(
+        (status = 200, description = "The version family.", body = [SongVersion]),
+        (status = 404, description = "Song not found.")
+    )
+)]
+pub async fn find_song_versions(
+    Path(id): Path<Uuid>,
+    State(state): State<AppState>,
+    access: AccessControl,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+    state
+        .song_repo
+        .find_by_id(id, user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(state.song_repo.versions_of(id).await?))
 }
 
 #[utoipa::path(
@@ -265,7 +292,7 @@ pub async fn sync_band_song(
     path = "/api/v1/songs",
     tags = ["Songs"],
     summary = "Create a new song.",
-    description = "`links`: at most 5 `https` links to YouTube, Spotify, Google Drive, Apple Music, Deezer, SoundCloud, Dropbox or OneDrive (`INVALID_LINK` otherwise, `meta.url`).",
+    description = "`links`: at most 5 `https` links to YouTube, Spotify, Google Drive, Apple Music, Deezer, SoundCloud, Dropbox or OneDrive (`INVALID_LINK` otherwise, `meta.url`).\n\n`version_of` creates the song as a version of another of the caller's personal songs (a simplified chart, an acoustic arrangement...), named by `version_label`. A version usually shares its original's title and artist: songs are unique per title, artist *and* version label.",
     request_body = CreateSongPayload,
     security(("jwt_token" = [])),
     responses(
@@ -288,9 +315,20 @@ pub async fn create_song(
     crate::validations::link::normalize_links(payload.links.as_deref().unwrap_or_default())?;
 
     state.artist_repo.exists(payload.artist_id, user_id).await?;
+    if let Some(original) = payload.version_of {
+        // Versions live next to their original: one of the caller's own
+        // personal songs.
+        state.song_repo.exists(original, user_id).await?;
+    }
     state
         .song_repo
-        .is_unique(&payload.title, payload.artist_id, user_id, None)
+        .is_unique(
+            &payload.title,
+            payload.artist_id,
+            payload.version_label.as_deref().map(str::trim),
+            user_id,
+            None,
+        )
         .await?;
     let quota = state
         .quota_repo
@@ -365,13 +403,24 @@ pub async fn update_song(
             state.artist_repo.exists(artist_id, user_id).await?;
         }
 
-        if payload.title.is_some() || payload.artist_id.is_some() {
+        if payload.title.is_some() || payload.artist_id.is_some() || payload.version_label.is_some()
+        {
             let title_to_check = payload.title.as_deref().unwrap_or(&existing_song.title);
             let artist_to_check = payload.artist_id.unwrap_or(existing_song.artist_id);
+            let label_to_check = match &payload.version_label {
+                Some(label) => label.as_deref(),
+                None => existing_song.version_label.as_deref(),
+            };
 
             state
                 .song_repo
-                .is_unique(title_to_check, artist_to_check, user_id, Some(id))
+                .is_unique(
+                    title_to_check,
+                    artist_to_check,
+                    label_to_check.map(str::trim),
+                    user_id,
+                    Some(id),
+                )
                 .await?;
         }
 
@@ -822,11 +871,13 @@ pub async fn import_chordpro(
         tuning: None,
         performance_notes: None,
         links: None::<Vec<LinkInput>>,
+        version_of: None,
+        version_label: None,
     };
     create.validate()?;
     state
         .song_repo
-        .is_unique(&create.title, artist_id, user_id, None)
+        .is_unique(&create.title, artist_id, None, user_id, None)
         .await?;
     let quota = state
         .quota_repo

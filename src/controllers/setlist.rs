@@ -23,9 +23,11 @@ use crate::{
             DuplicateSetlistResponse, PublicMarker, PublicSetlist, ReorderSetlistItemsPayload,
             ReorderSetlistSongsPayload, Setlist, SetlistItem, SetlistMarker,
             UpdateSetlistBlockPayload, UpdateSetlistBreakPayload, UpdateSetlistPayload,
+            UpdateSetlistSongPayload,
         },
         song::{PublicSong, SongWithArtist},
     },
+    music::transpose::apply_setlist_key,
     services::entitlements::{Feature, ensure_feature, has_feature, shared_content_visible},
     utils::share_token::token_fingerprint,
 };
@@ -585,6 +587,45 @@ pub async fn add_song_to_setlist(
             band_copy,
         }),
     ))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/setlists/{id}/songs/{song_id}",
+    tags = ["Setlists"],
+    summary = "Set the key of a song in a setlist.",
+    description = "The key a song is played in *in this setlist*, as semitones from its written key (`transpose`, -11 to 11, 0 = as written) — for a singer who takes it lower, say. The song itself and its key in other setlists are untouched. Setlist songs carry it back as `transpose` (`GET /setlists/{id}/songs`, `/items`), and the setlist PDF prints the chords in that key.\n\nA song added to a band setlist starts in the key it has in the band's repertoire.",
+    params(
+        ("id" = Uuid, Path, description = "The ID of the setlist"),
+        ("song_id" = Uuid, Path, description = "The ID of the song")
+    ),
+    request_body = UpdateSetlistSongPayload,
+    security(("jwt_token" = [])),
+    responses(
+        (status = 204, description = "Key saved."),
+        (status = 400, description = "Invalid input."),
+        (status = 403, description = "Not allowed to manage this setlist."),
+        (status = 404, description = "Setlist or song not found.")
+    )
+)]
+pub async fn update_setlist_song(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path((setlist_id, song_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<UpdateSetlistSongPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+    payload.validate()?;
+
+    state.setlist_repo.can_manage(setlist_id, user_id).await?;
+    state
+        .setlist_repo
+        .set_song_transpose(setlist_id, song_id, payload.transpose)
+        .await?;
+    state.setlist_repo.touch(setlist_id, user_id).await?;
+
+    info!(%user_id, %setlist_id, %song_id, transpose = payload.transpose, "Setlist song key saved");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(
@@ -1315,9 +1356,15 @@ pub(crate) async fn sync_band_copy_from(
 async fn render_setlist_pdf(
     state: &AppState,
     setlist: &Setlist,
-    items: Vec<SetlistItem>,
+    mut items: Vec<SetlistItem>,
     options: PdfExportOptions,
 ) -> Result<axum::response::Response, ApiError> {
+    // Printed in the key each song is played in in this setlist.
+    for item in &mut items {
+        if let SetlistItem::Song { song, .. } = item {
+            apply_setlist_key(song);
+        }
+    }
     let band_name = match setlist.band_id {
         Some(band_id) => state.band_repo.find_any(band_id).await?.map(|b| b.name),
         None => None,
@@ -1621,7 +1668,11 @@ pub(crate) async fn public_setlist(
         links: setlist.links,
         songs: songs
             .into_iter()
-            .map(|(position, song)| PublicSong::from_song(position, song))
+            .map(|(position, mut song)| {
+                // The key shown is the one the setlist plays it in.
+                apply_setlist_key(&mut song);
+                PublicSong::from_song(position, song)
+            })
             .collect(),
         markers: markers.into_iter().map(PublicMarker::from).collect(),
     })

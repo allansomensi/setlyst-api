@@ -16,7 +16,9 @@ use uuid::Uuid;
 /// - 2: song energy, time signature, capo, tuning, performance notes and
 ///   links; setlist links; tours and each gig's tour and location. Every
 ///   new field is optional, so version 1 files still import.
-pub const BACKUP_FORMAT_VERSION: u32 = 2;
+/// - 3: song versions (`version_label`, `version_of`) and the key each
+///   setlist plays a song in (`transpose`). Optional as well.
+pub const BACKUP_FORMAT_VERSION: u32 = 3;
 
 /// A fully self-contained, portable snapshot of a user's data.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -77,6 +79,12 @@ pub struct BackupSong {
     pub performance_notes: Option<String>,
     #[serde(default)]
     pub links: Vec<LinkInput>,
+    /// Since version 3: what sets this version apart ("Simplified").
+    #[serde(default)]
+    pub version_label: Option<String>,
+    /// The `id` (in this file) of the original this song is a version of.
+    #[serde(default)]
+    pub version_of: Option<Uuid>,
 }
 
 /// Setlist entry inside a backup file.
@@ -96,6 +104,10 @@ pub struct BackupSetlist {
 pub struct BackupSetlistSong {
     pub song_id: Uuid,
     pub position: i32,
+    /// Since version 3: the key the setlist plays it in, in semitones from
+    /// the song's written key.
+    #[serde(default)]
+    pub transpose: i16,
 }
 
 /// Gig entry inside a backup file. Only personal (non-band) gigs are ever
@@ -202,6 +214,13 @@ impl BackupFile {
                 return Err(format!("\"{}\" has an invalid capo.", song.title));
             }
             if song
+                .version_label
+                .as_deref()
+                .is_some_and(|l| crate::models::song::validate_version_label(l).is_err())
+            {
+                return Err(format!("\"{}\" has an invalid version name.", song.title));
+            }
+            if song
                 .time_signature
                 .as_deref()
                 .is_some_and(|t| validate_time_signature(t).is_err())
@@ -254,13 +273,12 @@ impl BackupFile {
             }
             // Positions are appended to (`MAX(position) + 1`) later on; a
             // value near `i32::MAX` would make every later add overflow.
-            if setlist
-                .songs
-                .iter()
-                .any(|entry| !(0..=MAX_BACKUP_POSITION).contains(&entry.position))
-            {
+            if setlist.songs.iter().any(|entry| {
+                !(0..=MAX_BACKUP_POSITION).contains(&entry.position)
+                    || !(-11..=11).contains(&entry.transpose)
+            }) {
                 return Err(format!(
-                    "\"{}\" has a song position outside 0..={MAX_BACKUP_POSITION}.",
+                    "\"{}\" has a song position outside 0..={MAX_BACKUP_POSITION} or a key change outside -11..=11.",
                     setlist.title
                 ));
             }

@@ -548,7 +548,7 @@ fn is_chord_line_filler(token: &str) -> bool {
             .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
 }
 
-fn is_chord_only_line(line: &str) -> bool {
+pub(crate) fn is_chord_only_line(line: &str) -> bool {
     let mut has_chord = false;
     for token in line.split_whitespace() {
         let token = token.trim_matches(|c| c == '(' || c == ')');
@@ -1829,6 +1829,8 @@ mod tests {
             user_id: Uuid::new_v4(),
             band_id: None,
             forked_from: None,
+            version_label: None,
+            version_of: None,
             tempo: Some(120),
             lyrics: lyrics.map(str::to_string),
             tonality: Some(Tonality::FSharpM),
@@ -1844,6 +1846,7 @@ mod tests {
             updated_by: None,
             updated_by_username: None,
             source_synced_at: None,
+            transpose: None,
             created_at: now,
             updated_at: now,
         }

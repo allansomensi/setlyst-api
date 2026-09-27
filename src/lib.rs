@@ -9,6 +9,7 @@ pub mod jobs;
 pub mod middlewares;
 pub mod models;
 pub mod moderation;
+pub mod music;
 mod openapi;
 pub mod payments;
 pub mod routes;

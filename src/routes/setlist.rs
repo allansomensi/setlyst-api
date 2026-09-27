@@ -36,7 +36,7 @@ pub fn create_routes(state: AppState) -> Router {
         .route("/{id}/songs/reorder", patch(setlist::reorder_setlist_songs))
         .route(
             "/{id}/songs/{song_id}",
-            delete(setlist::remove_song_from_setlist),
+            delete(setlist::remove_song_from_setlist).patch(setlist::update_setlist_song),
         )
         .route(
             "/{id}/duplicate",

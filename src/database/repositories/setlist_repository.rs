@@ -167,6 +167,14 @@ pub trait SetlistRepository: Send + Sync {
     /// adding the same song twice rather than silently repositioning it.
     async fn has_song(&self, setlist_id: Uuid, song_id: Uuid) -> Result<bool, ApiError>;
     async fn remove_song(&self, setlist_id: Uuid, song_id: Uuid) -> Result<(), ApiError>;
+    /// Sets the key a song is played in in this setlist, as semitones from
+    /// its written key (`NotFound` if the song isn't in the setlist).
+    async fn set_song_transpose(
+        &self,
+        setlist_id: Uuid,
+        song_id: Uuid,
+        transpose: i16,
+    ) -> Result<(), ApiError>;
     async fn get_songs(
         &self,
         setlist_id: Uuid,
@@ -816,6 +824,20 @@ impl SetlistRepository for SetlistRepositoryImpl {
             .fetch_optional(&mut *tx)
             .await?;
             if let Some(repertoire) = repertoire {
+                // The band already plays this song in some key: a new
+                // setlist starts with it (the repertoire is where a band
+                // keeps "our" key for each song).
+                sqlx::query(
+                    "UPDATE setlist_songs AS ss SET transpose = r.transpose
+                     FROM setlist_songs r
+                     WHERE ss.setlist_id = $1 AND ss.song_id = $3
+                       AND r.setlist_id = $2 AND r.song_id = $3",
+                )
+                .bind(setlist_id)
+                .bind(repertoire)
+                .bind(song_id)
+                .execute(&mut *tx)
+                .await?;
                 append_song(&mut tx, repertoire, song_id).await?;
             }
         }
@@ -851,6 +873,27 @@ impl SetlistRepository for SetlistRepositoryImpl {
         Ok(())
     }
 
+    async fn set_song_transpose(
+        &self,
+        setlist_id: Uuid,
+        song_id: Uuid,
+        transpose: i16,
+    ) -> Result<(), ApiError> {
+        let result = sqlx::query(
+            "UPDATE setlist_songs SET transpose = $3 WHERE setlist_id = $1 AND song_id = $2",
+        )
+        .bind(setlist_id)
+        .bind(song_id)
+        .bind(transpose)
+        .execute(&self.db)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(ApiError::NotFound);
+        }
+        Ok(())
+    }
+
     async fn get_songs(
         &self,
         setlist_id: Uuid,
@@ -872,7 +915,7 @@ impl SetlistRepository for SetlistRepositoryImpl {
         let songs = sqlx::query_as::<_, SongWithArtist>(concat!(
             "SELECT ",
             song_columns!(),
-            ", a.name AS artist_name
+            ", a.name AS artist_name, ss.transpose
              FROM songs s
              INNER JOIN setlist_songs ss ON s.id = ss.song_id
              INNER JOIN setlists st ON st.id = ss.setlist_id
@@ -1038,6 +1081,7 @@ impl SetlistRepository for SetlistRepositoryImpl {
         let mut forker = PersonalForker::new(&mut tx, user_id, limits).await?;
         let mut song_ids: Vec<Uuid> = Vec::with_capacity(source_songs.len());
         let mut positions: Vec<i32> = Vec::with_capacity(source_songs.len());
+        let mut transposes: Vec<i16> = Vec::with_capacity(source_songs.len());
         let mut skipped = 0i64;
         for row in &source_songs {
             let resolved = if row.song.band_id.is_none() {
@@ -1049,6 +1093,8 @@ impl SetlistRepository for SetlistRepositoryImpl {
                 Some(song_id) if !song_ids.contains(&song_id) => {
                     song_ids.push(song_id);
                     positions.push(row.position);
+                    // The copy plays every song in the same key.
+                    transposes.push(row.song.transpose.unwrap_or(0));
                 }
                 Some(_) => {}
                 None => skipped += 1,
@@ -1057,13 +1103,15 @@ impl SetlistRepository for SetlistRepositoryImpl {
 
         if !song_ids.is_empty() {
             sqlx::query(
-                "INSERT INTO setlist_songs (setlist_id, song_id, position)
-                 SELECT $1, t.song_id, t.position FROM UNNEST($2::uuid[], $3::int[]) AS t(song_id, position)
+                "INSERT INTO setlist_songs (setlist_id, song_id, position, transpose)
+                 SELECT $1, t.song_id, t.position, t.transpose
+                 FROM UNNEST($2::uuid[], $3::int[], $4::smallint[]) AS t(song_id, position, transpose)
                  ON CONFLICT (setlist_id, song_id) DO NOTHING",
             )
             .bind(new_setlist.id)
             .bind(&song_ids)
             .bind(&positions)
+            .bind(&transposes)
             .execute(&mut *tx)
             .await?;
         }
@@ -1398,7 +1446,7 @@ impl SetlistRepositoryImpl {
         let rows = sqlx::query_as::<_, SongItemRow>(concat!(
             "SELECT ss.position, ",
             song_columns!(),
-            ", a.name AS artist_name
+            ", a.name AS artist_name, ss.transpose
              FROM songs s
              INNER JOIN setlist_songs ss ON s.id = ss.song_id
              INNER JOIN setlists st ON st.id = ss.setlist_id
@@ -1619,8 +1667,8 @@ impl PersonalForker {
         })
     }
 
-    /// The caller's personal song matching `source` (same title and
-    /// artist name), created when missing. `None` when creating it would
+    /// The caller's personal song matching `source` (same title, artist
+    /// name and version label), created when missing. `None` when creating it would
     /// exceed a quota.
     async fn personal_copy(
         &mut self,
@@ -1642,11 +1690,13 @@ impl PersonalForker {
                 "SELECT id FROM songs
                  WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL AND artist_id = $2
                    AND LOWER(TRIM(title)) = LOWER(TRIM($3))
+                   AND LOWER(TRIM(COALESCE(version_label, ''))) = LOWER(TRIM(COALESCE($4, '')))
                  LIMIT 1",
             )
             .bind(self.user_id)
             .bind(artist_id)
             .bind(&source.title)
+            .bind(&source.version_label)
             .fetch_optional(&mut **tx)
             .await?;
             if existing.is_some() {
@@ -1687,8 +1737,17 @@ impl PersonalForker {
         let song = Song::fork_for_user(source, artist_id, self.user_id);
         sqlx::query(
             "INSERT INTO songs (id, title, artist_id, user_id, band_id, forked_from, tempo, lyrics, tonality, genre, duration,
-                                energy, time_signature, capo, tuning, performance_notes, links, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, NULL, NULL, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16)",
+                                energy, time_signature, capo, tuning, performance_notes, links, created_at, updated_at,
+                                version_label, version_of)
+             VALUES ($1, $2, $3, $4, NULL, NULL, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16, $17,
+                     -- A version joins the caller's own original of the song, if they have one.
+                     CASE WHEN $17::text IS NULL THEN NULL ELSE
+                         (SELECT o.id FROM songs o
+                          WHERE o.user_id = $4 AND o.band_id IS NULL AND o.deleted_at IS NULL
+                            AND o.artist_id = $3 AND o.version_label IS NULL
+                            AND LOWER(TRIM(o.title)) = LOWER(TRIM($2))
+                          LIMIT 1)
+                     END)",
         )
         .bind(song.id)
         .bind(&song.title)
@@ -1706,6 +1765,7 @@ impl PersonalForker {
         .bind(&song.performance_notes)
         .bind(sqlx::types::Json(song.links.to_stored()))
         .bind(song.created_at)
+        .bind(&song.version_label)
         .execute(&mut **tx)
         .await?;
         self.songs_used += 1;

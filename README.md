@@ -26,7 +26,9 @@ Built with Rust for reliability and performance, using Axum, SQLx, and PostgreSQ
 
 - **User management** — Registration, authentication (JWT), role-based access control (`user`, `moderator`, `admin`), and per-user preferences (theme, language, live mode font size)
 - **Artists & Songs** — Full CRUD with pagination, user-scoped data isolation, uniqueness enforcement, and metadata fields (tonality, BPM, genre, duration, lyrics)
+- **Song versions** — Keep several charts of one song (a simplified one, an acoustic arrangement) as versions of it (`version_of`, `version_label`, `GET /songs/{id}/versions`)
 - **Setlists** — Create and manage ordered song lists, reorder tracks, and compute total duration automatically
+- **Per-setlist keys** — Each setlist remembers the key it plays every song in (`PATCH /setlists/{id}/songs/{song_id}`, `transpose` in semitones); band setlists start from the repertoire's key, and the setlist PDF and public share print the chords in that key
 - **PDF Export** — Generate printable setlist PDFs with optional title, duration, key, and BPM display; supports `en`, `pt-BR`, and `es` locales
 - **ChordPro Export** — Export all songs as a single `.cho` file compatible with ChordPro readers
 - **Backup & Restore** — Export/import a full portable JSON snapshot of all user data; atomic import with smart merge rules

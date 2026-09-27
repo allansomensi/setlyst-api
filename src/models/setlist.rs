@@ -99,6 +99,16 @@ pub struct AddSongToSetlistPayload {
     pub song_id: Uuid,
 }
 
+/// `PATCH /setlists/{id}/songs/{song_id}`: how the song is played in this
+/// setlist.
+#[derive(Debug, Deserialize, Serialize, ToSchema, Validate)]
+pub struct UpdateSetlistSongPayload {
+    /// The key it is played in, as semitones from the song's written key
+    /// (0 = as written), -11 to 11.
+    #[validate(range(min = -11, max = 11, message = "Transpose must be between -11 and 11."))]
+    pub transpose: i16,
+}
+
 /// What became of the band's copy when one of the caller's personal songs
 /// was added to a band setlist.
 #[derive(ToSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
