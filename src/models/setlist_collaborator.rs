@@ -125,6 +125,44 @@ pub struct UpdateCollaboratorPayload {
     pub role: CollaboratorRole,
 }
 
+/// Where the account found by `GET /setlists/{id}/collaborators/lookup`
+/// stands in the setlist.
+#[derive(ToSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateStatus {
+    /// Can be invited.
+    Available,
+    /// Already invited, waiting for an answer.
+    Invited,
+    /// Already an accepted collaborator.
+    Collaborator,
+    /// The setlist's owner.
+    Owner,
+    /// The caller themselves.
+    #[serde(rename = "self")]
+    Myself,
+}
+
+/// An account looked up by username before inviting it
+/// (`GET /setlists/{id}/collaborators/lookup`): only what any signed-in
+/// user sees of another profile (username and avatar).
+#[derive(ToSchema, Debug, Clone, Serialize, Deserialize)]
+pub struct CollaboratorCandidate {
+    pub user_id: Uuid,
+    pub username: String,
+    pub avatar_url: Option<String>,
+    pub status: CandidateStatus,
+}
+
+/// Query of `GET /setlists/{id}/collaborators/lookup`.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct CollaboratorLookupQuery {
+    /// The username to look up (case-insensitive; a leading `@` is
+    /// ignored).
+    pub username: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

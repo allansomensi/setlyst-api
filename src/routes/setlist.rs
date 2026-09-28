@@ -50,6 +50,10 @@ pub fn create_routes(state: AppState) -> Router {
                 .post(setlist_collaborator::invite_setlist_collaborator),
         )
         .route(
+            "/{id}/collaborators/lookup",
+            get(setlist_collaborator::lookup_setlist_collaborator),
+        )
+        .route(
             "/{id}/collaborators/{user_id}",
             patch(setlist_collaborator::update_setlist_collaborator)
                 .delete(setlist_collaborator::remove_setlist_collaborator),

@@ -85,8 +85,9 @@ use crate::{
             SetlistMarker,
         },
         setlist_collaborator::{
-            CollaboratorRole, InviteCollaboratorPayload, SetlistCollaborator, SetlistCollaborators,
-            SetlistInvitation, SetlistOwner, UpdateCollaboratorPayload,
+            CandidateStatus, CollaboratorCandidate, CollaboratorRole, InviteCollaboratorPayload,
+            SetlistCollaborator, SetlistCollaborators, SetlistInvitation, SetlistOwner,
+            UpdateCollaboratorPayload,
         },
         song::{
             Genre, PublicSong, RenameTagPayload, Song, SongSetlistRef, SongVersion, SongWithArtist,
@@ -266,6 +267,7 @@ use utoipa::{
         setlist_collaborator::accept_setlist_invitation,
         setlist_collaborator::decline_setlist_invitation,
         setlist_collaborator::list_setlist_collaborators,
+        setlist_collaborator::lookup_setlist_collaborator,
         setlist_collaborator::invite_setlist_collaborator,
         setlist_collaborator::update_setlist_collaborator,
         setlist_collaborator::remove_setlist_collaborator,
@@ -541,6 +543,8 @@ use utoipa::{
             SetlistOwner,
             InviteCollaboratorPayload,
             UpdateCollaboratorPayload,
+            CollaboratorCandidate,
+            CandidateStatus,
             Gig,
             GigStatus,
             PublicGig,

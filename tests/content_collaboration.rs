@@ -571,3 +571,68 @@ async fn declined_and_removed_invites_leave_no_access() {
     let setlist_row = app.get(&format!("/setlists/{setlist}"), &owner).await;
     assert_eq!(setlist_row.body["collaborator_count"], 0);
 }
+
+#[tokio::test]
+async fn a_username_is_looked_up_before_the_invite() {
+    let app = app!();
+    let (owner_id, owner) = app.user("guitarra", Role::User).await;
+    let (_, editor) = app.user("violino", Role::User).await;
+    let (_, manager) = app.user("regente", Role::User).await;
+    let (guest_id, stranger) = app.user("flauta", Role::User).await;
+    let setlist = app.setlist(&owner, "Recital", None).await;
+    let lookup =
+        |username: &str| format!("/setlists/{setlist}/collaborators/lookup?username={username}");
+
+    // Case-insensitive, `@` ignored: only the username and avatar.
+    let found = app.get(&lookup("%40FLAUTA"), &owner).await;
+    assert_eq!(found.status, StatusCode::OK, "{}", found.body);
+    assert_eq!(found.body["user_id"], guest_id.to_string());
+    assert_eq!(found.body["username"], "flauta");
+    assert_eq!(found.body["status"], "available");
+    assert!(found.body.get("email").is_none());
+
+    let missing = app.get(&lookup("ninguem"), &owner).await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    assert_eq!(missing.code(), "USER_NOT_FOUND");
+    assert_eq!(
+        app.get(&lookup("guitarra"), &owner).await.body["status"],
+        "self"
+    );
+
+    // Where the account already stands in the setlist.
+    collaborate(&app, &owner, &editor, "violino", &setlist, "editor").await;
+    collaborate(&app, &owner, &manager, "regente", &setlist, "manager").await;
+    let invited = app
+        .post(
+            &format!("/setlists/{setlist}/collaborators"),
+            &owner,
+            json!({ "username": "flauta" }),
+        )
+        .await;
+    assert_eq!(invited.status, StatusCode::NO_CONTENT, "{}", invited.body);
+    assert_eq!(
+        app.get(&lookup("flauta"), &owner).await.body["status"],
+        "invited"
+    );
+    assert_eq!(
+        app.get(&lookup("violino"), &owner).await.body["status"],
+        "collaborator"
+    );
+
+    // A manager may look people up too; the owner shows as such.
+    let as_manager = app.get(&lookup("guitarra"), &manager).await;
+    assert_eq!(as_manager.status, StatusCode::OK, "{}", as_manager.body);
+    assert_eq!(as_manager.body["status"], "owner");
+    assert_eq!(as_manager.body["user_id"], owner_id.to_string());
+
+    // An editor can't invite, so can't look up either; a stranger doesn't
+    // even see the setlist.
+    assert_eq!(
+        app.get(&lookup("flauta"), &editor).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.get(&lookup("guitarra"), &stranger).await.status,
+        StatusCode::NOT_FOUND
+    );
+}

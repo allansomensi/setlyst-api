@@ -11,7 +11,8 @@ use crate::{
         notification::Notification,
         setlist::Setlist,
         setlist_collaborator::{
-            CollaboratorRole, InviteCollaboratorPayload, SetlistCollaborators, SetlistInvitation,
+            CandidateStatus, CollaboratorCandidate, CollaboratorLookupQuery, CollaboratorRole,
+            InviteCollaboratorPayload, SetlistCollaborators, SetlistInvitation,
             UpdateCollaboratorPayload,
         },
         user::{Status, active_ban},
@@ -181,6 +182,93 @@ pub async fn list_setlist_collaborators(
     }
     let collaborators = state.setlist_collaborator_repo.list(setlist_id).await?;
     Ok(Json(collaborators))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/setlists/{id}/collaborators/lookup",
+    tags = ["Setlists"],
+    summary = "Look up an account before inviting it to a setlist.",
+    description = "Confirms that a username belongs to an account that can be invited, before sending the invite: its username and avatar, and where it already stands in the setlist (`status`: `available`, `invited`, `collaborator`, `owner` or `self`). Only for who may invite (the owner and managers; `403` otherwise). An unknown, inactive or banned account is `USER_NOT_FOUND`, as in the invite itself. At most 120 lookups per 10 minutes (`TOO_MANY_ATTEMPTS`).",
+    params(
+        ("id" = Uuid, Path, description = "The ID of the setlist"),
+        CollaboratorLookupQuery
+    ),
+    security(("jwt_token" = [])),
+    responses(
+        (status = 200, description = "The account found.", body = CollaboratorCandidate),
+        (status = 403, description = "The caller can't invite people to this setlist."),
+        (status = 404, description = "Setlist or user not found."),
+        (status = 409, description = "A band setlist.")
+    )
+)]
+pub async fn lookup_setlist_collaborator(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(setlist_id): Path<Uuid>,
+    Query(query): Query<CollaboratorLookupQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
+    // The setlist first, as for the invite: a stranger must not learn
+    // which usernames exist through this endpoint.
+    let setlist = state
+        .setlist_repo
+        .find_by_id(setlist_id, user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if setlist.band_id.is_some() {
+        return Err(ApiError::rule(
+            StatusCode::CONFLICT,
+            codes::COLLABORATION_UNAVAILABLE,
+            "Only personal setlists can have collaborators.",
+        ));
+    }
+    let standing = state
+        .setlist_collaborator_repo
+        .standing(setlist_id, user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if !standing.can_manage(CollaboratorRole::Viewer) {
+        return Err(ApiError::Forbidden);
+    }
+    presets::limit(&presets::SETLIST_COLLABORATOR_LOOKUPS, user_id)?;
+
+    let username = query.username.trim().trim_start_matches('@');
+    if username.is_empty() || username.chars().count() > 50 {
+        return Err(user_not_found());
+    }
+    let candidate = state
+        .user_repo
+        .find_by_username(username)
+        .await?
+        .ok_or_else(user_not_found)?;
+    if candidate.status != Status::Active
+        || active_ban(
+            candidate.banned_at,
+            candidate.banned_until,
+            chrono::Utc::now().naive_utc(),
+        )
+        .is_some()
+    {
+        return Err(user_not_found());
+    }
+
+    let status = if candidate.id == user_id {
+        CandidateStatus::Myself
+    } else {
+        state
+            .setlist_collaborator_repo
+            .candidate_status(setlist_id, candidate.id)
+            .await?
+    };
+
+    Ok(Json(CollaboratorCandidate {
+        user_id: candidate.id,
+        username: candidate.username,
+        avatar_url: candidate.avatar_url,
+        status,
+    }))
 }
 
 #[utoipa::path(

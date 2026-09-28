@@ -2,8 +2,8 @@ use crate::database::repositories::setlist_repository::detach_contributed_songs;
 use crate::{
     errors::api_error::{ApiError, codes},
     models::setlist_collaborator::{
-        CollaboratorRole, MAX_SETLIST_COLLABORATORS, SetlistCollaborator, SetlistCollaborators,
-        SetlistInvitation, SetlistOwner, SetlistStanding,
+        CandidateStatus, CollaboratorRole, MAX_SETLIST_COLLABORATORS, SetlistCollaborator,
+        SetlistCollaborators, SetlistInvitation, SetlistOwner, SetlistStanding,
     },
 };
 use axum::http::StatusCode;
@@ -69,6 +69,15 @@ pub trait SetlistCollaboratorRepository: Send + Sync {
 
     /// Invites waiting for the caller's answer, newest first.
     async fn invitations(&self, user_id: Uuid) -> Result<Vec<SetlistInvitation>, ApiError>;
+
+    /// Where `user_id` stands in the setlist, as seen before inviting them:
+    /// its owner, an accepted collaborator, a pending invite, or nothing
+    /// yet (`Available`). Never `Myself`: the caller decides that.
+    async fn candidate_status(
+        &self,
+        setlist_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<CandidateStatus, ApiError>;
 }
 
 pub struct SetlistCollaboratorRepositoryImpl {
@@ -413,5 +422,30 @@ impl SetlistCollaboratorRepository for SetlistCollaboratorRepositoryImpl {
         .bind(user_id)
         .fetch_all(&self.db)
         .await?)
+    }
+
+    async fn candidate_status(
+        &self,
+        setlist_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<CandidateStatus, ApiError> {
+        let row: Option<(bool, Option<bool>)> = sqlx::query_as(
+            "SELECT s.user_id = $2,
+                    CASE WHEN c.user_id IS NULL THEN NULL ELSE c.accepted_at IS NOT NULL END
+             FROM setlists s
+             LEFT JOIN setlist_collaborators c ON c.setlist_id = s.id AND c.user_id = $2
+             WHERE s.id = $1 AND s.deleted_at IS NULL",
+        )
+        .bind(setlist_id)
+        .bind(user_id)
+        .fetch_optional(&self.db)
+        .await?;
+
+        Ok(match row.ok_or(ApiError::NotFound)? {
+            (true, _) => CandidateStatus::Owner,
+            (false, Some(true)) => CandidateStatus::Collaborator,
+            (false, Some(false)) => CandidateStatus::Invited,
+            (false, None) => CandidateStatus::Available,
+        })
     }
 }

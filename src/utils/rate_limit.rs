@@ -99,6 +99,12 @@ pub mod presets {
     /// e-mails the invitee).
     pub static SETLIST_COLLABORATOR_CHANGES: LazyLock<SlidingWindowLimiter<Uuid>> =
         LazyLock::new(|| SlidingWindowLimiter::new(60, HOUR));
+    /// Username lookups before a setlist invite
+    /// (`GET /setlists/{id}/collaborators/lookup`): 120 per 10 minutes per
+    /// account. The form checks as the person types (debounced); a script
+    /// walking through usernames hits the wall quickly.
+    pub static SETLIST_COLLABORATOR_LOOKUPS: LazyLock<SlidingWindowLimiter<Uuid>> =
+        LazyLock::new(|| SlidingWindowLimiter::new(120, Duration::from_secs(10 * 60)));
     /// `GET /setlists/{id}/items`, a setlist's whole running order with
     /// every song's lyrics: 300 per 5 minutes per account. The offline
     /// sync reads it once per setlist; nothing legitimate reads it in a
