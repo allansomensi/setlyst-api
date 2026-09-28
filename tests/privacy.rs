@@ -198,6 +198,11 @@ async fn every_reference_to_an_account_is_exported_or_excluded_on_purpose() {
         // Invite codes are the band's credentials; the band's admins see
         // who created each one.
         "band_invites.created_by",
+        // Attribution inside shared setlists (who invited whom, who added
+        // each song): shown to the setlist's members, and part of the
+        // setlist's content rather than the account's.
+        "setlist_collaborators.invited_by",
+        "setlist_songs.added_by",
         // Covered through `referrals` (`referrals_made` / `referred`).
         "users.referred_by",
         // Second-factor material: secrets, never exported (the account's

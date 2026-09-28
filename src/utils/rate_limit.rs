@@ -94,6 +94,11 @@ pub mod presets {
     /// them is a notification (and e-mail) bombing tool.
     pub static BAND_MEMBER_CHANGES: LazyLock<SlidingWindowLimiter<Uuid>> =
         LazyLock::new(|| SlidingWindowLimiter::new(60, HOUR));
+    /// Setlist collaborator changes by one account (invites, role changes,
+    /// removals): 60 per hour, for the same reason (an invite notifies and
+    /// e-mails the invitee).
+    pub static SETLIST_COLLABORATOR_CHANGES: LazyLock<SlidingWindowLimiter<Uuid>> =
+        LazyLock::new(|| SlidingWindowLimiter::new(60, HOUR));
     /// `GET /setlists/{id}/items`, a setlist's whole running order with
     /// every song's lyrics: 300 per 5 minutes per account. The offline
     /// sync reads it once per setlist; nothing legitimate reads it in a

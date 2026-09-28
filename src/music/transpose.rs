@@ -363,6 +363,10 @@ mod tests {
             updated_by_username: None,
             source_synced_at: None,
             transpose: Some(-3),
+            added_by: None,
+            added_by_username: None,
+            added_by_avatar_url: None,
+            added_at: None,
             created_at: now,
             updated_at: now,
         };

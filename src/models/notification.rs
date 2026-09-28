@@ -1,4 +1,6 @@
-use crate::models::{band::BandRole, communication::Category, user::Role};
+use crate::models::{
+    band::BandRole, communication::Category, setlist_collaborator::CollaboratorRole, user::Role,
+};
 use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -45,6 +47,8 @@ pub enum NotificationType {
     CreditsGranted,
     /// A security-relevant change on the account (2FA, e-mail, password).
     SecurityAlert,
+    /// Someone invited the recipient to collaborate on their setlist.
+    SetlistInvitation,
 }
 
 impl NotificationType {
@@ -56,7 +60,8 @@ impl NotificationType {
             | NotificationType::BandMemberRemoved
             | NotificationType::BandMemberAdded
             | NotificationType::BandSuggestionCreated
-            | NotificationType::BandSuggestionResolved => Category::Bands,
+            | NotificationType::BandSuggestionResolved
+            | NotificationType::SetlistInvitation => Category::Bands,
             NotificationType::PlatformRoleChanged
             | NotificationType::ShareLinkRevoked
             | NotificationType::ModerationAction
@@ -85,6 +90,7 @@ impl NotificationType {
             NotificationType::TrialEnding => "trial_ending",
             NotificationType::CreditsGranted => "credits_granted",
             NotificationType::SecurityAlert => "security_alert",
+            NotificationType::SetlistInvitation => "setlist_invitation",
         }
     }
 }
@@ -174,6 +180,28 @@ impl Notification {
 }
 
 impl Notification {
+    /// `actor` invited the recipient to collaborate on a setlist as `role`.
+    pub fn setlist_invitation(
+        user_id: Uuid,
+        setlist_id: Uuid,
+        setlist_title: &str,
+        role: CollaboratorRole,
+        actor_id: Uuid,
+        actor_username: &str,
+    ) -> Self {
+        Self::new(
+            user_id,
+            NotificationType::SetlistInvitation,
+            json!({
+                "setlist_id": setlist_id,
+                "setlist_title": setlist_title,
+                "role": role,
+                "actor_id": actor_id,
+                "invited_by": actor_username,
+            }),
+        )
+    }
+
     pub fn band_member_added(
         user_id: Uuid,
         band_id: Uuid,

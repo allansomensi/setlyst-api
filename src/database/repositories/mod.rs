@@ -16,6 +16,7 @@ pub mod pin_repository;
 pub mod quota_repository;
 pub mod release_note_repository;
 pub mod security_repository;
+pub mod setlist_collaborator_repository;
 pub mod setlist_repository;
 pub mod song_repository;
 pub mod suggestion_repository;

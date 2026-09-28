@@ -23,6 +23,7 @@ pub mod quota;
 pub mod release_note;
 pub mod security;
 pub mod setlist;
+pub mod setlist_collaborator;
 pub mod song;
 pub mod status;
 pub mod suggestion;

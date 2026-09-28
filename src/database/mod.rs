@@ -26,6 +26,9 @@ use repositories::{
     quota_repository::{QuotaRepository, QuotaRepositoryImpl},
     release_note_repository::{ReleaseNoteRepository, ReleaseNoteRepositoryImpl},
     security_repository::{SecurityRepository, SecurityRepositoryImpl},
+    setlist_collaborator_repository::{
+        SetlistCollaboratorRepository, SetlistCollaboratorRepositoryImpl,
+    },
     setlist_repository::{SetlistRepository, SetlistRepositoryImpl},
     song_repository::{SongRepository, SongRepositoryImpl},
     suggestion_repository::{SuggestionRepository, SuggestionRepositoryImpl},
@@ -47,6 +50,7 @@ pub struct AppState {
     pub artist_repo: Arc<dyn ArtistRepository>,
     pub song_repo: Arc<dyn SongRepository>,
     pub setlist_repo: Arc<dyn SetlistRepository>,
+    pub setlist_collaborator_repo: Arc<dyn SetlistCollaboratorRepository>,
     pub gig_repo: Arc<dyn GigRepository>,
     pub metrics_repo: Arc<dyn MetricsRepository>,
     pub backup_repo: Arc<dyn BackupRepository>,
@@ -101,6 +105,9 @@ impl AppState {
             artist_repo: Arc::new(ArtistRepositoryImpl::new(pool.clone())),
             song_repo: Arc::new(SongRepositoryImpl::new(pool.clone())),
             setlist_repo: Arc::new(SetlistRepositoryImpl::new(pool.clone())),
+            setlist_collaborator_repo: Arc::new(SetlistCollaboratorRepositoryImpl::new(
+                pool.clone(),
+            )),
             gig_repo: Arc::new(GigRepositoryImpl::new(pool.clone())),
             metrics_repo: Arc::new(MetricsRepositoryImpl::new(pool.clone())),
             backup_repo: Arc::new(BackupRepositoryImpl::new(pool.clone())),

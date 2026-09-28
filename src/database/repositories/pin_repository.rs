@@ -8,7 +8,8 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 /// Resolves pins of `p` (`user_pins p`) to live items the pin's owner can
-/// still access: their personal content, or content of a band they are in.
+/// still access: their personal content, content of a band they are in, or
+/// setlists shared with them.
 macro_rules! resolved_pins {
     () => {
         "SELECT p.item_type, p.item_id, p.position, x.title, x.subtitle, x.band_id, x.is_repertoire
@@ -23,7 +24,11 @@ macro_rules! resolved_pins {
             SELECT st.title, (SELECT b.name FROM bands b WHERE b.id = st.band_id), st.band_id, st.is_repertoire FROM setlists st
             WHERE p.item_type = 'setlist' AND st.id = p.item_id AND st.deleted_at IS NULL
               AND ((st.band_id IS NULL AND st.user_id = p.user_id)
-                   OR EXISTS (SELECT 1 FROM band_members m WHERE m.band_id = st.band_id AND m.user_id = p.user_id))
+                   OR EXISTS (SELECT 1 FROM band_members m WHERE m.band_id = st.band_id AND m.user_id = p.user_id)
+                   OR (st.band_id IS NULL AND EXISTS (
+                         SELECT 1 FROM setlist_collaborators co
+                         WHERE co.setlist_id = st.id AND co.user_id = p.user_id
+                           AND co.accepted_at IS NOT NULL)))
             UNION ALL
             SELECT b.name, NULL, b.id, FALSE FROM bands b
             WHERE p.item_type = 'band' AND b.id = p.item_id
@@ -159,7 +164,11 @@ impl PinRepository for PinRepositoryImpl {
                     SELECT 1 FROM setlists st
                     WHERE p.item_type = 'setlist' AND st.id = p.item_id AND st.deleted_at IS NULL
                       AND ((st.band_id IS NULL AND st.user_id = p.user_id)
-                           OR EXISTS (SELECT 1 FROM band_members m WHERE m.band_id = st.band_id AND m.user_id = p.user_id))
+                           OR EXISTS (SELECT 1 FROM band_members m WHERE m.band_id = st.band_id AND m.user_id = p.user_id)
+                           OR (st.band_id IS NULL AND EXISTS (
+                                 SELECT 1 FROM setlist_collaborators co
+                                 WHERE co.setlist_id = st.id AND co.user_id = p.user_id
+                                   AND co.accepted_at IS NOT NULL)))
                     UNION ALL
                     SELECT 1 FROM bands b
                     WHERE p.item_type = 'band' AND b.id = p.item_id

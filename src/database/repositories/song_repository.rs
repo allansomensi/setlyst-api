@@ -301,8 +301,8 @@ impl SongRepository for SongRepositoryImpl {
 
     async fn setlists_of(&self, id: Uuid, user_id: Uuid) -> Result<Vec<SongSetlistRef>, ApiError> {
         // Same scope rule as a setlist's own song list: a personal setlist
-        // only counts its owner's personal songs, a band setlist only the
-        // band's songs.
+        // only counts the personal songs of its owner and collaborators, a
+        // band setlist only the band's songs.
         let setlists = sqlx::query_as::<_, SongSetlistRef>(
             "SELECT st.id, st.title, st.is_repertoire, st.band_id, b.name AS band_name, ss.position
              FROM setlist_songs ss
@@ -310,11 +310,19 @@ impl SongRepository for SongRepositoryImpl {
              INNER JOIN songs s ON s.id = ss.song_id
              LEFT JOIN bands b ON b.id = st.band_id
              WHERE ss.song_id = $1 AND st.deleted_at IS NULL AND s.deleted_at IS NULL
-               AND ((st.band_id IS NULL AND s.band_id IS NULL AND s.user_id = st.user_id)
+               AND ((st.band_id IS NULL AND s.band_id IS NULL
+                     AND (s.user_id = st.user_id
+                          OR EXISTS (SELECT 1 FROM setlist_collaborators co
+                                     WHERE co.setlist_id = st.id AND co.user_id = s.user_id
+                                       AND co.accepted_at IS NOT NULL)))
                     OR s.band_id = st.band_id)
                AND ((st.band_id IS NULL AND st.user_id = $2)
                     OR EXISTS (SELECT 1 FROM band_members bm
-                               WHERE bm.band_id = st.band_id AND bm.user_id = $2))
+                               WHERE bm.band_id = st.band_id AND bm.user_id = $2)
+                    OR (st.band_id IS NULL AND EXISTS (
+                          SELECT 1 FROM setlist_collaborators co
+                          WHERE co.setlist_id = st.id AND co.user_id = $2
+                            AND co.accepted_at IS NOT NULL)))
              ORDER BY st.band_id IS NOT NULL, LOWER(b.name), st.band_id,
                       st.is_repertoire DESC, LOWER(st.title), st.id",
         )

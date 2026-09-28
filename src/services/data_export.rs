@@ -84,6 +84,7 @@ pub const EXPORTED_USER_REFERENCES: &[&str] = &[
     "promo_redemptions.user_id",
     "referrals.referred_id",
     "referrals.referrer_id",
+    "setlist_collaborators.user_id",
     "subscription_events.user_id",
     "subscriptions.user_id",
     "user_pins.user_id",
@@ -152,6 +153,13 @@ pub async fn personal_data(state: &AppState, user_id: Uuid) -> Result<Value, Api
             "SELECT b.name AS band, m.role, m.title, m.joined_at FROM band_members m
              JOIN bands b ON b.id = m.band_id
              WHERE m.user_id = $1 ORDER BY m.joined_at",
+            user_id).await?,
+        // Other people's setlists shared with the account (its own are in
+        // the backup).
+        "setlist_collaborations": rows(state,
+            "SELECT s.title AS setlist, c.role, c.created_at AS invited_at, c.accepted_at
+             FROM setlist_collaborators c JOIN setlists s ON s.id = c.setlist_id
+             WHERE c.user_id = $1 ORDER BY c.created_at",
             user_id).await?,
         // What the account wrote inside bands (other members' content is
         // left out).

@@ -96,6 +96,10 @@ pub mod codes {
     pub const INVALID_LINK: &str = "INVALID_LINK";
     pub const REPERTOIRE_PROTECTED: &str = "REPERTOIRE_PROTECTED";
     pub const SONG_ALREADY_IN_SETLIST: &str = "SONG_ALREADY_IN_SETLIST";
+    /// Collaborators only exist on personal setlists (not band ones).
+    pub const COLLABORATION_UNAVAILABLE: &str = "COLLABORATION_UNAVAILABLE";
+    /// No (active) account with the given username.
+    pub const USER_NOT_FOUND: &str = "USER_NOT_FOUND";
     pub const SUGGESTION_CLOSED: &str = "SUGGESTION_CLOSED";
     pub const NOT_IN_TRASH: &str = "NOT_IN_TRASH";
     pub const RESTORE_CONFLICT: &str = "RESTORE_CONFLICT";

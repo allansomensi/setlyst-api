@@ -7,6 +7,7 @@ use validator::Validate;
 
 use super::{
     link::{LinkInput, Links},
+    setlist_collaborator::CollaboratorRole,
     song::PublicSong,
 };
 
@@ -53,6 +54,16 @@ pub struct Setlist {
     /// Whether the *caller* pinned this setlist to their home screen.
     #[sqlx(default)]
     pub is_pinned: bool,
+    /// Accepted collaborators (personal setlists only; see
+    /// `/setlists/{id}/collaborators`).
+    #[sqlx(default)]
+    pub collaborator_count: i64,
+    /// The caller's role when they collaborate on someone else's setlist;
+    /// absent for its owner, band members and everywhere the caller isn't
+    /// known.
+    #[sqlx(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaborator_role: Option<CollaboratorRole>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -293,6 +304,8 @@ impl Setlist {
             links: Links::default(),
             is_repertoire: false,
             is_pinned: false,
+            collaborator_count: 0,
+            collaborator_role: None,
             created_at: now,
             updated_at: now,
         }

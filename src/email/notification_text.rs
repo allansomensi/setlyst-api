@@ -41,6 +41,16 @@ fn platform_role(l: Locale, role: &str) -> String {
     .to_string()
 }
 
+fn collaborator_role(l: Locale, role: &str) -> String {
+    match role {
+        "viewer" => l.pick("viewer", "leitor", "lector"),
+        "editor" => l.pick("editor", "editor", "editor"),
+        "manager" => l.pick("manager", "gerente", "gestor"),
+        other => other,
+    }
+    .to_string()
+}
+
 fn band_path(data: &Value) -> Option<String> {
     data.get("band_id")
         .and_then(Value::as_str)
@@ -182,6 +192,26 @@ pub fn describe(kind: NotificationType, data: &Value, l: Locale) -> Notification
                 )
                 .into()],
             cta_path: Some("/dashboard/whats-new".into()),
+        },
+        NotificationType::SetlistInvitation => NotificationText {
+            title: l
+                .pick(
+                    "{u} invited you to the setlist \"{t}\"",
+                    "{u} convidou você para a setlist \"{t}\"",
+                    "{u} te invitó a la setlist \"{t}\"",
+                )
+                .replace("{u}", s(data, "invited_by"))
+                .replace("{t}", s(data, "setlist_title")),
+            lines: vec![l
+                .pick(
+                    "{u} wants to share the setlist \"{t}\" with you as {r}. Accept the invite to see it and play it in Live Mode.",
+                    "{u} quer compartilhar a setlist \"{t}\" com você como {r}. Aceite o convite para vê-la e tocá-la no Modo Ao Vivo.",
+                    "{u} quiere compartir la setlist \"{t}\" contigo como {r}. Acepta la invitación para verla y tocarla en el Modo en vivo.",
+                )
+                .replace("{u}", s(data, "invited_by"))
+                .replace("{t}", s(data, "setlist_title"))
+                .replace("{r}", &collaborator_role(l, s(data, "role")))],
+            cta_path: Some("/dashboard/setlists".into()),
         },
         NotificationType::BandSuggestionCreated => NotificationText {
             title: l
@@ -358,7 +388,8 @@ mod tests {
             "band_id": "b1", "band_name": "Os Tais", "old_role": "member", "new_role": "admin",
             "role": "member", "kind": "setlist", "title": "Sexta", "reason": "spam",
             "song_title": "Garota", "suggested_by": "ana", "status": "accepted",
-            "action": "avatar_removed", "note": "n", "amount": 50, "version": "0.12.0"
+            "action": "avatar_removed", "note": "n", "amount": 50, "version": "0.12.0",
+            "setlist_title": "Show do Beto", "invited_by": "beto"
         });
         for kind in [
             NotificationType::BandRoleChanged,
@@ -375,6 +406,7 @@ mod tests {
             NotificationType::TrialEnding,
             NotificationType::CreditsGranted,
             NotificationType::SecurityAlert,
+            NotificationType::SetlistInvitation,
         ] {
             for locale in Locale::ALL {
                 let text = describe(kind, &data, locale);

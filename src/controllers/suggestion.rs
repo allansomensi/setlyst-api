@@ -167,7 +167,13 @@ async fn add_suggested_song(
         };
         state
             .setlist_repo
-            .add_song(setlist.id, band_song, quota.as_slice())
+            // Credited to whoever suggested it.
+            .add_song(
+                setlist.id,
+                band_song,
+                row.suggested_by.unwrap_or(actor_id),
+                quota.as_slice(),
+            )
             .await?;
         state.setlist_repo.touch(setlist.id, actor_id).await?;
     }

@@ -1,5 +1,7 @@
 use crate::{
-    controllers::setlist, database::AppState, middlewares::client_ip::ClientIpKeyExtractor,
+    controllers::{setlist, setlist_collaborator},
+    database::AppState,
+    middlewares::client_ip::ClientIpKeyExtractor,
 };
 use axum::{
     Router,
@@ -28,6 +30,29 @@ pub fn create_routes(state: AppState) -> Router {
         .route(
             "/",
             get(setlist::find_all_setlists).post(setlist::create_setlist),
+        )
+        .route("/shared", get(setlist_collaborator::find_shared_setlists))
+        .route(
+            "/invitations",
+            get(setlist_collaborator::find_setlist_invitations),
+        )
+        .route(
+            "/{id}/invitation",
+            delete(setlist_collaborator::decline_setlist_invitation),
+        )
+        .route(
+            "/{id}/invitation/accept",
+            axum::routing::post(setlist_collaborator::accept_setlist_invitation),
+        )
+        .route(
+            "/{id}/collaborators",
+            get(setlist_collaborator::list_setlist_collaborators)
+                .post(setlist_collaborator::invite_setlist_collaborator),
+        )
+        .route(
+            "/{id}/collaborators/{user_id}",
+            patch(setlist_collaborator::update_setlist_collaborator)
+                .delete(setlist_collaborator::remove_setlist_collaborator),
         )
         .route(
             "/{id}/songs",

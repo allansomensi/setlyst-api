@@ -12,6 +12,7 @@ use crate::{
             CreateSetlistPayload, Setlist, SetlistItem, SetlistItemRef, SetlistItemType,
             SetlistMarker, SetlistMarkerType, UpdateSetlistPayload,
         },
+        setlist_collaborator::CollaboratorRole,
         song::{Song, SongWithArtist},
     },
     validations::link::normalize_links,
@@ -35,27 +36,70 @@ macro_rules! setlist_columns {
          (SELECT COUNT(*) FROM setlist_songs sc
             INNER JOIN songs so ON so.id = sc.song_id
             WHERE sc.setlist_id = s.id AND so.deleted_at IS NULL
-              AND ((s.band_id IS NULL AND so.band_id IS NULL AND so.user_id = s.user_id)
+              AND ((s.band_id IS NULL AND so.band_id IS NULL
+                    AND (so.user_id = s.user_id
+                         OR EXISTS (SELECT 1 FROM setlist_collaborators co
+                                    WHERE co.setlist_id = s.id AND co.user_id = so.user_id
+                                      AND co.accepted_at IS NOT NULL)))
                    OR so.band_id = s.band_id)) AS song_count,
+         (SELECT COUNT(*) FROM setlist_collaborators co
+            WHERE co.setlist_id = s.id AND co.accepted_at IS NOT NULL) AS collaborator_count,
          setlist_total_duration(s.id) AS total_duration"
     };
 }
 
 /// The condition keeping a setlist's songs to live songs of its own scope:
-/// a personal setlist only shows its owner's personal songs and a band
-/// setlist only that band's copies — even if a stale row points elsewhere
-/// (defense in depth: an old duplicate could hold band songs in a personal
-/// setlist). Expects `songs s` and `setlists st`.
+/// a personal setlist only shows the personal songs of its owner and of
+/// its (accepted) collaborators, and a band setlist only that band's
+/// copies — even if a stale row points elsewhere (defense in depth: an old
+/// duplicate could hold band songs in a personal setlist). Expects
+/// `songs s` and `setlists st`.
 macro_rules! scoped_songs {
     () => {
         "s.deleted_at IS NULL
-         AND ((st.band_id IS NULL AND s.band_id IS NULL AND s.user_id = st.user_id)
+         AND ((st.band_id IS NULL AND s.band_id IS NULL
+               AND (s.user_id = st.user_id
+                    OR EXISTS (SELECT 1 FROM setlist_collaborators co
+                               WHERE co.setlist_id = st.id AND co.user_id = s.user_id
+                                 AND co.accepted_at IS NOT NULL)))
               OR s.band_id = st.band_id)"
+    };
+}
+
+/// Who added each song, for the columns of a setlist song (expects
+/// `setlist_songs ss`).
+macro_rules! added_by_columns {
+    () => {
+        "ss.added_by, ss.added_at,
+         (SELECT u.username FROM users u WHERE u.id = ss.added_by) AS added_by_username,
+         (SELECT u.avatar_url FROM users u WHERE u.id = ss.added_by) AS added_by_avatar_url"
+    };
+}
+
+/// Whether `$2` may see setlist `s`: its personal owner, a member of its
+/// band, or an accepted collaborator.
+macro_rules! visible_to_caller {
+    () => {
+        "((s.band_id IS NULL AND s.user_id = $2)
+          OR EXISTS (SELECT 1 FROM band_members bm WHERE bm.band_id = s.band_id AND bm.user_id = $2)
+          OR (s.band_id IS NULL AND EXISTS (
+                SELECT 1 FROM setlist_collaborators co
+                WHERE co.setlist_id = s.id AND co.user_id = $2 AND co.accepted_at IS NOT NULL)))"
     };
 }
 
 #[async_trait::async_trait]
 pub trait SetlistRepository: Send + Sync {
+    /// Personal setlists of other accounts the caller collaborates on
+    /// (accepted invites), newest change first. Each carries the caller's
+    /// `collaborator_role`.
+    async fn find_shared(
+        &self,
+        user_id: Uuid,
+        page: i64,
+        size: i64,
+    ) -> Result<(Vec<Setlist>, i64), ApiError>;
+
     /// Lists the caller's personal setlists (i.e. `band_id IS NULL`).
     async fn find_all(
         &self,
@@ -136,6 +180,16 @@ pub trait SetlistRepository: Send + Sync {
     /// the band's setlist-management bar (`moderator`+, or `member` when the
     /// band allows it).
     async fn can_manage(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
+
+    /// Changing the running order (songs, blocks, breaks, keys): what
+    /// [`can_manage`](Self::can_manage) allows, and collaborators from
+    /// `editor` up.
+    async fn can_edit_items(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
+
+    /// Editing the title, description and links: what
+    /// [`can_manage`](Self::can_manage) allows, and `manager`
+    /// collaborators.
+    async fn can_edit_details(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
     /// Checks the caller may export this setlist to PDF: its personal
     /// owner, or a band member whose role satisfies the band's
     /// `export_pdf` permission (`admin`+ always can; `moderator`/`member`
@@ -161,6 +215,7 @@ pub trait SetlistRepository: Send + Sync {
         &self,
         setlist_id: Uuid,
         song_id: Uuid,
+        added_by: Uuid,
         quota: &[QuotaGuard],
     ) -> Result<(), ApiError>;
     /// Checks whether a song is already part of a setlist — used to reject
@@ -301,6 +356,42 @@ struct SetlistAccessRow {
     band_id: Option<Uuid>,
     band_role: Option<BandRole>,
     role_permission_allowed: Option<bool>,
+    collaborator_role: Option<CollaboratorRole>,
+}
+
+/// What a caller wants to do to a setlist, for [`SetlistRepositoryImpl::check_permission`].
+#[derive(Debug, Clone, Copy)]
+enum SetlistAction {
+    /// Delete it, share it publicly: its owner, or band members allowed
+    /// to manage setlists. Never collaborators.
+    Manage,
+    /// Change its running order: also collaborators from `editor` up.
+    EditItems,
+    /// Edit its title, description and links: also `manager`
+    /// collaborators.
+    EditDetails,
+    /// Export it as a PDF: the band's `export_pdf` permission, and any
+    /// collaborator (they already read every chart in it).
+    ExportPdf,
+}
+
+impl SetlistAction {
+    fn band_permission(self) -> &'static str {
+        match self {
+            SetlistAction::ExportPdf => "export_pdf",
+            _ => "manage_setlists",
+        }
+    }
+
+    /// The lowest collaborator role allowed, if any.
+    fn collaborator_minimum(self) -> Option<CollaboratorRole> {
+        match self {
+            SetlistAction::Manage => None,
+            SetlistAction::EditItems => Some(CollaboratorRole::Editor),
+            SetlistAction::EditDetails => Some(CollaboratorRole::Manager),
+            SetlistAction::ExportPdf => Some(CollaboratorRole::Viewer),
+        }
+    }
 }
 
 pub(crate) fn repertoire_protected() -> ApiError {
@@ -311,24 +402,28 @@ pub(crate) fn repertoire_protected() -> ApiError {
     )
 }
 
-/// Appends `song_id` at the end of `setlist_id` (no-op if already there).
+/// Appends `song_id` at the end of `setlist_id` (no-op if already there),
+/// recording `added_by` as who added it.
 async fn append_song(
     tx: &mut Transaction<'_, Postgres>,
     setlist_id: Uuid,
     song_id: Uuid,
+    added_by: Uuid,
 ) -> Result<(), ApiError> {
     sqlx::query(
         r#"
-        INSERT INTO setlist_songs (setlist_id, song_id, position)
+        INSERT INTO setlist_songs (setlist_id, song_id, position, added_by, added_at)
         SELECT $1, $2, COALESCE(GREATEST(
             (SELECT MAX(position) FROM setlist_songs WHERE setlist_id = $1),
             (SELECT MAX(position) FROM setlist_markers WHERE setlist_id = $1)
-        ), 0) + 1
+        ), 0) + 1, $3, $4
         ON CONFLICT (setlist_id, song_id) DO NOTHING
         "#,
     )
     .bind(setlist_id)
     .bind(song_id)
+    .bind(added_by)
+    .bind(chrono::Utc::now().naive_utc())
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -357,6 +452,44 @@ impl SetlistRepository for SetlistRepositoryImpl {
             FROM setlists s
             WHERE s.user_id = $1 AND s.band_id IS NULL AND s.deleted_at IS NULL
             ORDER BY is_favorite DESC, LOWER(s.title) ASC, s.id ASC
+            LIMIT $2 OFFSET $3"
+        ))
+        .bind(user_id)
+        .bind(size)
+        .bind(offset)
+        .fetch_all(&self.db);
+
+        let (count, setlists) = tokio::try_join!(count, setlists)?;
+        Ok((setlists, count))
+    }
+
+    async fn find_shared(
+        &self,
+        user_id: Uuid,
+        page: i64,
+        size: i64,
+    ) -> Result<(Vec<Setlist>, i64), ApiError> {
+        let offset = (page - 1) * size;
+
+        let count = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM setlist_collaborators c
+             INNER JOIN setlists s ON s.id = c.setlist_id
+             WHERE c.user_id = $1 AND c.accepted_at IS NOT NULL
+               AND s.deleted_at IS NULL AND s.band_id IS NULL",
+        )
+        .bind(user_id)
+        .fetch_one(&self.db);
+
+        let setlists = sqlx::query_as::<_, Setlist>(concat!(
+            "SELECT ",
+            setlist_columns!(),
+            ", EXISTS(SELECT 1 FROM favorite_setlists f WHERE f.setlist_id = s.id AND f.user_id = $1) AS is_favorite,
+            c.role AS collaborator_role
+            FROM setlist_collaborators c
+            INNER JOIN setlists s ON s.id = c.setlist_id
+            WHERE c.user_id = $1 AND c.accepted_at IS NOT NULL
+              AND s.deleted_at IS NULL AND s.band_id IS NULL
+            ORDER BY is_favorite DESC, s.updated_at DESC, s.id ASC
             LIMIT $2 OFFSET $3"
         ))
         .bind(user_id)
@@ -406,11 +539,12 @@ impl SetlistRepository for SetlistRepositoryImpl {
         let setlist = sqlx::query_as::<_, Setlist>(concat!(
             "SELECT ",
             setlist_columns!(),
-            ", EXISTS(SELECT 1 FROM favorite_setlists f WHERE f.setlist_id = s.id AND f.user_id = $2) AS is_favorite
+            ", EXISTS(SELECT 1 FROM favorite_setlists f WHERE f.setlist_id = s.id AND f.user_id = $2) AS is_favorite,
+            (SELECT co.role FROM setlist_collaborators co
+             WHERE co.setlist_id = s.id AND co.user_id = $2 AND co.accepted_at IS NOT NULL) AS collaborator_role
             FROM setlists s
-            LEFT JOIN band_members bm ON bm.band_id = s.band_id AND bm.user_id = $2
-            WHERE s.id = $1 AND s.deleted_at IS NULL
-              AND ((s.band_id IS NULL AND s.user_id = $2) OR bm.user_id IS NOT NULL)"
+            WHERE s.id = $1 AND s.deleted_at IS NULL AND ",
+            visible_to_caller!()
         ))
         .bind(id)
         .bind(user_id)
@@ -693,14 +827,10 @@ impl SetlistRepository for SetlistRepositoryImpl {
     }
 
     async fn exists(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
-        let exists = sqlx::query(
-            r#"
-            SELECT s.id FROM setlists s
-            LEFT JOIN band_members bm ON bm.band_id = s.band_id AND bm.user_id = $2
-            WHERE s.id = $1 AND s.deleted_at IS NULL
-              AND ((s.band_id IS NULL AND s.user_id = $2) OR bm.user_id IS NOT NULL);
-            "#,
-        )
+        let exists = sqlx::query(concat!(
+            "SELECT s.id FROM setlists s WHERE s.id = $1 AND s.deleted_at IS NULL AND ",
+            visible_to_caller!()
+        ))
         .bind(id)
         .bind(user_id)
         .fetch_optional(&self.db)
@@ -716,11 +846,23 @@ impl SetlistRepository for SetlistRepositoryImpl {
     }
 
     async fn can_manage(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
-        self.check_permission(id, user_id, "manage_setlists").await
+        self.check_permission(id, user_id, SetlistAction::Manage)
+            .await
+    }
+
+    async fn can_edit_items(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
+        self.check_permission(id, user_id, SetlistAction::EditItems)
+            .await
+    }
+
+    async fn can_edit_details(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
+        self.check_permission(id, user_id, SetlistAction::EditDetails)
+            .await
     }
 
     async fn can_export_pdf(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
-        self.check_permission(id, user_id, "export_pdf").await
+        self.check_permission(id, user_id, SetlistAction::ExportPdf)
+            .await
     }
 
     async fn enable_sharing(&self, id: Uuid) -> Result<Setlist, ApiError> {
@@ -793,6 +935,7 @@ impl SetlistRepository for SetlistRepositoryImpl {
         &self,
         setlist_id: Uuid,
         song_id: Uuid,
+        added_by: Uuid,
         quota: &[QuotaGuard],
     ) -> Result<(), ApiError> {
         let mut tx = self.db.begin().await?;
@@ -813,7 +956,7 @@ impl SetlistRepository for SetlistRepositoryImpl {
         };
         QuotaGuard::enforce_all(quota, &mut tx).await?;
 
-        append_song(&mut tx, setlist_id, song_id).await?;
+        append_song(&mut tx, setlist_id, song_id, added_by).await?;
 
         // Every song a band plays belongs to its repertoire.
         if let (Some(band_id), false) = (band_id, is_repertoire) {
@@ -838,7 +981,7 @@ impl SetlistRepository for SetlistRepositoryImpl {
                 .bind(song_id)
                 .execute(&mut *tx)
                 .await?;
-                append_song(&mut tx, repertoire, song_id).await?;
+                append_song(&mut tx, repertoire, song_id, added_by).await?;
             }
         }
 
@@ -915,8 +1058,9 @@ impl SetlistRepository for SetlistRepositoryImpl {
         let songs = sqlx::query_as::<_, SongWithArtist>(concat!(
             "SELECT ",
             song_columns!(),
-            ", a.name AS artist_name, ss.transpose
-             FROM songs s
+            ", a.name AS artist_name, ss.transpose, ",
+            added_by_columns!(),
+            " FROM songs s
              INNER JOIN setlist_songs ss ON s.id = ss.song_id
              INNER JOIN setlists st ON st.id = ss.setlist_id
              INNER JOIN artists a ON a.id = s.artist_id
@@ -1084,7 +1228,11 @@ impl SetlistRepository for SetlistRepositoryImpl {
         let mut transposes: Vec<i16> = Vec::with_capacity(source_songs.len());
         let mut skipped = 0i64;
         for row in &source_songs {
-            let resolved = if row.song.band_id.is_none() {
+            // Only the caller's own personal songs are referenced: band
+            // songs, and the songs a collaborator (or the owner, when a
+            // collaborator duplicates) brought, become copies in the
+            // caller's library.
+            let resolved = if row.song.band_id.is_none() && row.song.user_id == user_id {
                 Some(row.song.id)
             } else {
                 forker.personal_copy(&mut tx, &row.song).await?
@@ -1103,8 +1251,8 @@ impl SetlistRepository for SetlistRepositoryImpl {
 
         if !song_ids.is_empty() {
             sqlx::query(
-                "INSERT INTO setlist_songs (setlist_id, song_id, position, transpose)
-                 SELECT $1, t.song_id, t.position, t.transpose
+                "INSERT INTO setlist_songs (setlist_id, song_id, position, transpose, added_by, added_at)
+                 SELECT $1, t.song_id, t.position, t.transpose, $5, $6
                  FROM UNNEST($2::uuid[], $3::int[], $4::smallint[]) AS t(song_id, position, transpose)
                  ON CONFLICT (setlist_id, song_id) DO NOTHING",
             )
@@ -1112,6 +1260,8 @@ impl SetlistRepository for SetlistRepositoryImpl {
             .bind(&song_ids)
             .bind(&positions)
             .bind(&transposes)
+            .bind(user_id)
+            .bind(new_setlist.created_at)
             .execute(&mut *tx)
             .await?;
         }
@@ -1446,8 +1596,9 @@ impl SetlistRepositoryImpl {
         let rows = sqlx::query_as::<_, SongItemRow>(concat!(
             "SELECT ss.position, ",
             song_columns!(),
-            ", a.name AS artist_name, ss.transpose
-             FROM songs s
+            ", a.name AS artist_name, ss.transpose, ",
+            added_by_columns!(),
+            " FROM songs s
              INNER JOIN setlist_songs ss ON s.id = ss.song_id
              INNER JOIN setlists st ON st.id = ss.setlist_id
              INNER JOIN artists a ON a.id = s.artist_id
@@ -1462,27 +1613,34 @@ impl SetlistRepositoryImpl {
         Ok(rows)
     }
 
-    /// Owner, or a band member whose role satisfies `permission` (admin
-    /// and owner always do). Trashed setlists are not found.
+    /// Whether `user_id` may do `action` to the setlist: its personal
+    /// owner, a band member whose role clears the band's permission (admin
+    /// and owner always do), or a collaborator with a high enough role.
+    /// Trashed setlists are not found.
     async fn check_permission(
         &self,
         id: Uuid,
         user_id: Uuid,
-        permission: &'static str,
+        action: SetlistAction,
     ) -> Result<(), ApiError> {
+        let permission = action.band_permission();
         let row = sqlx::query_as::<_, SetlistAccessRow>(
             r#"
             SELECT
                 s.user_id AS owner_id,
                 s.band_id,
                 bm.role AS band_role,
-                brp.allowed AS role_permission_allowed
+                brp.allowed AS role_permission_allowed,
+                co.role AS collaborator_role
             FROM setlists s
             LEFT JOIN band_members bm ON bm.band_id = s.band_id AND bm.user_id = $2
             LEFT JOIN band_role_permissions brp
                 ON brp.band_id = s.band_id
                 AND brp.role = bm.role
                 AND brp.permission = $3::band_permission
+            LEFT JOIN setlist_collaborators co
+                ON co.setlist_id = s.id AND co.user_id = $2
+                AND co.accepted_at IS NOT NULL AND s.band_id IS NULL
             WHERE s.id = $1 AND s.deleted_at IS NULL
             "#,
         )
@@ -1497,7 +1655,13 @@ impl SetlistRepositoryImpl {
         // band's configurable permission (defaulting to denied if no row
         // exists at all — e.g. a race with band creation).
         let allowed = match row.band_id {
-            None => row.owner_id == user_id,
+            None => {
+                row.owner_id == user_id
+                    || match (row.collaborator_role, action.collaborator_minimum()) {
+                        (Some(role), Some(minimum)) => role >= minimum,
+                        _ => false,
+                    }
+            }
             Some(_) => match row.band_role {
                 Some(role) if role.satisfies(BandRole::Admin) => true,
                 Some(_) => row.role_permission_allowed.unwrap_or(false),
@@ -1505,13 +1669,18 @@ impl SetlistRepositoryImpl {
             },
         };
 
-        match (allowed, row.band_id, row.band_role) {
-            (true, _, _) => Ok(()),
+        let knows_it = match row.band_id {
+            None => row.collaborator_role.is_some(),
+            Some(_) => row.band_role.is_some(),
+        };
+
+        match (allowed, knows_it) {
+            (true, _) => Ok(()),
             // Someone else's personal setlist, or a band the caller isn't
             // in: don't reveal that it exists.
-            (false, None, _) | (false, Some(_), None) => Err(ApiError::NotFound),
-            (false, Some(_), Some(_)) => {
-                error!(%id, %user_id, permission, "Band member lacks the permission for this setlist.");
+            (false, false) => Err(ApiError::NotFound),
+            (false, true) => {
+                error!(%id, %user_id, ?action, "Caller lacks the permission for this setlist.");
                 Err(ApiError::Forbidden)
             }
         }

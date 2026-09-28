@@ -48,15 +48,22 @@ use validator::Validate;
 pub const MAX_LISTED_ITEMS: usize = 2_000;
 
 /// The public link of a band setlist is only shown to members who may
-/// manage it (its personal owner always may): anyone else could hand it
-/// out, and keep using it after leaving the band. Staff viewing as a
-/// member never see it either (redacted by the middleware).
+/// manage it, and that of a personal setlist only to its owner (never to
+/// its collaborators): anyone else could hand it out, and keep using it
+/// after leaving the band or the setlist. Staff viewing as a member never
+/// see it either (redacted by the middleware).
 async fn withhold_share_token_from_non_managers(
     state: &AppState,
     user_id: Uuid,
     setlist: &mut Setlist,
 ) -> Result<(), ApiError> {
-    if setlist.share_token.is_none() || setlist.band_id.is_none() {
+    if setlist.share_token.is_none() {
+        return Ok(());
+    }
+    if setlist.band_id.is_none() {
+        if setlist.user_id != user_id {
+            setlist.share_token = None;
+        }
         return Ok(());
     }
     match state.setlist_repo.can_manage(setlist.id, user_id).await {
@@ -382,7 +389,7 @@ pub async fn update_setlist(
 
     payload.validate()?;
 
-    state.setlist_repo.can_manage(id, user_id).await?;
+    state.setlist_repo.can_edit_details(id, user_id).await?;
 
     if let Some(title) = &payload.title {
         let setlist = state
@@ -391,9 +398,11 @@ pub async fn update_setlist(
             .await?
             .ok_or(ApiError::NotFound)?;
 
+        // Unique among the owner's setlists: a manager collaborator
+        // renames someone else's setlist.
         state
             .setlist_repo
-            .is_unique(title, user_id, setlist.band_id, Some(id))
+            .is_unique(title, setlist.user_id, setlist.band_id, Some(id))
             .await?;
     }
 
@@ -498,7 +507,10 @@ pub async fn add_song_to_setlist(
         "Processing request to add song to setlist"
     );
 
-    state.setlist_repo.can_manage(setlist_id, user_id).await?;
+    state
+        .setlist_repo
+        .can_edit_items(setlist_id, user_id)
+        .await?;
     // The song being contributed must always be one of the caller's own
     // personal songs, or a copy the setlist's band already owns.
     let source_song = state
@@ -558,7 +570,7 @@ pub async fn add_song_to_setlist(
 
     state
         .setlist_repo
-        .add_song(setlist_id, song_id_to_link, quota.as_slice())
+        .add_song(setlist_id, song_id_to_link, user_id, quota.as_slice())
         .await?;
     state.setlist_repo.touch(setlist_id, user_id).await?;
 
@@ -617,7 +629,10 @@ pub async fn update_setlist_song(
     let user_id = access.user_id();
     payload.validate()?;
 
-    state.setlist_repo.can_manage(setlist_id, user_id).await?;
+    state
+        .setlist_repo
+        .can_edit_items(setlist_id, user_id)
+        .await?;
     state
         .setlist_repo
         .set_song_transpose(setlist_id, song_id, payload.transpose)
@@ -661,7 +676,10 @@ pub async fn remove_song_from_setlist(
         "Processing request to remove song from setlist"
     );
 
-    state.setlist_repo.can_manage(setlist_id, user_id).await?;
+    state
+        .setlist_repo
+        .can_edit_items(setlist_id, user_id)
+        .await?;
     let setlist = state
         .setlist_repo
         .find_by_id(setlist_id, user_id)
@@ -811,7 +829,10 @@ pub async fn reorder_setlist_songs(
 
     payload.validate()?;
 
-    state.setlist_repo.can_manage(setlist_id, user_id).await?;
+    state
+        .setlist_repo
+        .can_edit_items(setlist_id, user_id)
+        .await?;
 
     state
         .setlist_repo
@@ -897,7 +918,10 @@ pub async fn reorder_setlist_items(
 
     payload.validate()?;
 
-    state.setlist_repo.can_manage(setlist_id, user_id).await?;
+    state
+        .setlist_repo
+        .can_edit_items(setlist_id, user_id)
+        .await?;
     state
         .setlist_repo
         .reorder_items(setlist_id, &payload.items)
@@ -935,7 +959,10 @@ pub async fn create_setlist_block(
 
     payload.validate()?;
 
-    state.setlist_repo.can_manage(setlist_id, user_id).await?;
+    state
+        .setlist_repo
+        .can_edit_items(setlist_id, user_id)
+        .await?;
 
     let quota = item_room(&state, setlist_id, user_id).await?;
 
@@ -978,7 +1005,10 @@ pub async fn update_setlist_block(
 
     payload.validate()?;
 
-    state.setlist_repo.can_manage(setlist_id, user_id).await?;
+    state
+        .setlist_repo
+        .can_edit_items(setlist_id, user_id)
+        .await?;
 
     let marker = state
         .setlist_repo
@@ -1017,7 +1047,10 @@ pub async fn create_setlist_break(
 
     payload.validate()?;
 
-    state.setlist_repo.can_manage(setlist_id, user_id).await?;
+    state
+        .setlist_repo
+        .can_edit_items(setlist_id, user_id)
+        .await?;
 
     let quota = item_room(&state, setlist_id, user_id).await?;
 
@@ -1065,7 +1098,10 @@ pub async fn update_setlist_break(
 
     payload.validate()?;
 
-    state.setlist_repo.can_manage(setlist_id, user_id).await?;
+    state
+        .setlist_repo
+        .can_edit_items(setlist_id, user_id)
+        .await?;
 
     let marker = state
         .setlist_repo
@@ -1107,7 +1143,10 @@ pub async fn delete_setlist_marker(
 
     debug!(%user_id, %setlist_id, %marker_id, "Processing request to delete setlist marker");
 
-    state.setlist_repo.can_manage(setlist_id, user_id).await?;
+    state
+        .setlist_repo
+        .can_edit_items(setlist_id, user_id)
+        .await?;
     state
         .setlist_repo
         .delete_marker(setlist_id, marker_id)

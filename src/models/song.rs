@@ -878,6 +878,21 @@ pub struct SongWithArtist {
     #[sqlx(default)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transpose: Option<i16>,
+    /// Songs read as part of a setlist: who added it there, and when
+    /// (unknown for songs added to band setlists before this was
+    /// recorded). Absent everywhere else.
+    #[sqlx(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_by: Option<Uuid>,
+    #[sqlx(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_by_username: Option<String>,
+    #[sqlx(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_by_avatar_url: Option<String>,
+    #[sqlx(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_at: Option<NaiveDateTime>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }

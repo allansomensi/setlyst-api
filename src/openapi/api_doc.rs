@@ -1,8 +1,8 @@
 use crate::{
     controllers::{
         account, admin, announcement, artist, auth, backup, band, band_note, billing, gig, metrics,
-        moderation, notification, pin, public, release_note, setlist, song, status, suggestion,
-        tour, trash, user,
+        moderation, notification, pin, public, release_note, setlist, setlist_collaborator, song,
+        status, suggestion, tour, trash, user,
     },
     export::pdf::{ChordMode, MarginSize, Orientation, PaperFormat, PdfLocale},
     models::{
@@ -83,6 +83,10 @@ use crate::{
         setlist::{
             DuplicateSetlistResponse, PublicMarker, PublicSetlist, Setlist, SetlistItem,
             SetlistMarker,
+        },
+        setlist_collaborator::{
+            CollaboratorRole, InviteCollaboratorPayload, SetlistCollaborator, SetlistCollaborators,
+            SetlistInvitation, SetlistOwner, UpdateCollaboratorPayload,
         },
         song::{
             Genre, PublicSong, RenameTagPayload, Song, SongSetlistRef, SongVersion, SongWithArtist,
@@ -256,6 +260,14 @@ use utoipa::{
         setlist::unfavorite_setlist,
         setlist::get_public_setlist,
         setlist::export_public_setlist_pdf,
+        setlist_collaborator::find_shared_setlists,
+        setlist_collaborator::find_setlist_invitations,
+        setlist_collaborator::accept_setlist_invitation,
+        setlist_collaborator::decline_setlist_invitation,
+        setlist_collaborator::list_setlist_collaborators,
+        setlist_collaborator::invite_setlist_collaborator,
+        setlist_collaborator::update_setlist_collaborator,
+        setlist_collaborator::remove_setlist_collaborator,
 
         // Gigs
         gig::find_gig_by_id,
@@ -520,6 +532,13 @@ use utoipa::{
             crate::import::chordpro::ImportWarning,
             SetlistMarker,
             SetlistItem,
+            CollaboratorRole,
+            SetlistCollaborator,
+            SetlistCollaborators,
+            SetlistInvitation,
+            SetlistOwner,
+            InviteCollaboratorPayload,
+            UpdateCollaboratorPayload,
             Gig,
             GigStatus,
             PublicGig,
