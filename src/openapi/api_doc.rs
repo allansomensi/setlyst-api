@@ -1,8 +1,8 @@
 use crate::{
     controllers::{
         account, admin, announcement, artist, auth, backup, band, band_note, billing, gig, metrics,
-        moderation, notification, pin, public, release_note, setlist, setlist_collaborator, song,
-        song_analysis, status, suggestion, tour, trash, user,
+        moderation, notification, pin, public, release_note, setlist, setlist_collaborator,
+        shared_file, song, song_analysis, status, suggestion, tour, trash, user,
     },
     export::pdf::{ChordMode, MarginSize, Orientation, PaperFormat, PdfLocale},
     models::{
@@ -259,8 +259,12 @@ use utoipa::{
         setlist::update_setlist_break,
         setlist::delete_setlist_marker,
         setlist::export_setlist_pdf,
-        backup::export_setlist,
-        backup::import_setlist,
+        shared_file::export_setlist,
+        shared_file::import_setlist,
+        shared_file::export_gig,
+        shared_file::import_gig,
+        shared_file::export_tour,
+        shared_file::import_tour,
         setlist::enable_setlist_sharing,
         setlist::disable_setlist_sharing,
         setlist::favorite_setlist,

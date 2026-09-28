@@ -7,6 +7,7 @@ use crate::models::song::{
 use crate::validations::{link::MAX_LINKS, tag::MAX_TAGS_PER_SONG};
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -20,19 +21,23 @@ use uuid::Uuid;
 /// - 3: song versions (`version_label`, `version_of`) and the key each
 ///   setlist plays a song in (`transpose`). Optional as well.
 /// - 4: each song's harmonic analysis (`analysis`). Optional as well.
-/// - 5: each setlist's blocks and breaks (`markers`), and a file holding a
-///   single setlist (`GET /setlists/{id}/export`, `kind: "setlist"`).
+/// - 5: each setlist's blocks and breaks (`markers`), and files holding a
+///   single setlist, gig or tour with what it needs (`kind`; see
+///   `GET /setlists/{id}/export`, `/gigs/{id}/export`, `/tours/{id}/export`).
 ///   Optional as well.
 pub const BACKUP_FORMAT_VERSION: u32 = 5;
 
-/// What a file holds: a whole account, or one setlist with the songs and
-/// artists it needs (since version 5; older files are backups).
+/// What a file holds: a whole account, or one setlist, gig or tour with
+/// the setlists, songs and artists it needs (since version 5; older files
+/// are backups).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum BackupKind {
     #[default]
     Backup,
     Setlist,
+    Gig,
+    Tour,
 }
 
 /// A fully self-contained, portable snapshot of a user's data.
@@ -187,10 +192,15 @@ pub struct ImportSummary {
     /// `tours` feature (their gigs are imported without a tour).
     #[serde(default)]
     pub skipped_tours: usize,
-    /// The setlists created, in the file's order (since version 5): where
-    /// to go after importing a shared setlist.
+    /// The setlists, gigs and tours created, in the file's order (since
+    /// version 5): where to go after importing a shared setlist, gig or
+    /// tour.
     #[serde(default)]
     pub setlist_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub gig_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub tour_ids: Vec<Uuid>,
 }
 
 /// Largest number of records of each kind a single backup may carry.
@@ -199,7 +209,75 @@ pub const MAX_BACKUP_RECORDS: usize = 20_000;
 /// Largest song position accepted inside a backed-up setlist.
 pub const MAX_BACKUP_POSITION: i32 = 1_000_000;
 
+impl BackupKind {
+    fn noun(self) -> &'static str {
+        match self {
+            BackupKind::Backup => "full backup",
+            BackupKind::Setlist => "setlist",
+            BackupKind::Gig => "gig",
+            BackupKind::Tour => "tour",
+        }
+    }
+}
+
 impl BackupFile {
+    /// Checks that the file is a shared file of `kind` and holds what such
+    /// a file holds, and nothing else — a backup (older files carry no
+    /// `kind`) would bring a whole library along:
+    ///
+    /// - a setlist file: one setlist;
+    /// - a gig file: one gig and, if it has one, its setlist;
+    /// - a tour file: one tour, its gigs and their setlists.
+    ///
+    /// Every gig points at a setlist of the file (or none), and every
+    /// setlist is some gig's.
+    pub fn check_shared(&self, kind: BackupKind) -> Result<(), String> {
+        if self.kind != kind {
+            return Err(format!(
+                "This file holds a {}, not a {}.",
+                self.kind.noun(),
+                kind.noun()
+            ));
+        }
+        let setlist_ids: HashSet<Uuid> = self.setlists.iter().map(|s| s.id).collect();
+        if setlist_ids.len() != self.setlists.len() {
+            return Err("The file lists a setlist twice.".to_string());
+        }
+        let shape = match kind {
+            BackupKind::Backup => false,
+            BackupKind::Setlist => {
+                self.setlists.len() == 1 && self.gigs.is_empty() && self.tours.is_empty()
+            }
+            BackupKind::Gig => {
+                self.gigs.len() == 1 && self.setlists.len() <= 1 && self.tours.is_empty()
+            }
+            BackupKind::Tour => {
+                self.tours.len() == 1
+                    && self
+                        .gigs
+                        .iter()
+                        .all(|gig| gig.tour_id == Some(self.tours[0].id))
+            }
+        };
+        if !shape {
+            return Err(format!(
+                "A {} file holds one {} and what it needs.",
+                kind.noun(),
+                kind.noun()
+            ));
+        }
+        if kind != BackupKind::Setlist {
+            let used: HashSet<Uuid> = self.gigs.iter().filter_map(|g| g.setlist_id).collect();
+            if kind == BackupKind::Gig && self.gigs[0].tour_id.is_some() {
+                return Err("A gig file holds no tour.".to_string());
+            }
+            if used != setlist_ids {
+                return Err("Every setlist in the file must be one of its gigs'.".to_string());
+            }
+        }
+        Ok(())
+    }
+
     /// Structural validation run before anything touches the database, so
     /// a malformed or hand-edited file fails with a clear 400 instead of a
     /// database error halfway through the import.

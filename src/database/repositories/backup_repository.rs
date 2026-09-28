@@ -122,15 +122,19 @@ pub trait BackupRepository: Send + Sync {
     /// [`BackupFile`].
     async fn export(&self, user_id: Uuid) -> Result<BackupFile, ApiError>;
 
-    /// One setlist as a file of its own (`kind: "setlist"`): the setlist
-    /// with its blocks and breaks, every song in it (whoever's library it
-    /// comes from, held songs included) with its harmonic analysis, and
-    /// the artists they need. Imported with the same rules as a backup, it
-    /// gives someone without any of it the same setlist.
-    async fn export_setlist(
+    /// A setlist, a gig or a tour as a file of its own (`kind`): the
+    /// setlists given with their blocks and breaks, every song in them
+    /// (whoever's library it comes from, held songs included) with its
+    /// harmonic analysis, the artists they need, and the gigs and tours
+    /// given, which point at those setlists by id. Imported with the same
+    /// rules as a backup, it gives someone without any of it the same
+    /// setlist, gig or tour.
+    async fn export_shared(
         &self,
-        setlist: &Setlist,
-        items: Vec<SetlistItem>,
+        kind: BackupKind,
+        setlists: Vec<(Setlist, Vec<SetlistItem>)>,
+        gigs: Vec<BackupGig>,
+        tours: Vec<BackupTour>,
     ) -> Result<BackupFile, ApiError>;
 
     /// Atomically imports a [`BackupFile`] (current or older version) into
@@ -366,13 +370,16 @@ impl BackupRepository for BackupRepositoryImpl {
         })
     }
 
-    async fn export_setlist(
+    async fn export_shared(
         &self,
-        setlist: &Setlist,
-        items: Vec<SetlistItem>,
+        kind: BackupKind,
+        setlists: Vec<(Setlist, Vec<SetlistItem>)>,
+        gigs: Vec<BackupGig>,
+        tours: Vec<BackupTour>,
     ) -> Result<BackupFile, ApiError> {
-        let song_ids: Vec<Uuid> = items
+        let song_ids: Vec<Uuid> = setlists
             .iter()
+            .flat_map(|(_, items)| items)
             .filter_map(|item| match item {
                 SetlistItem::Song { song, .. } if !song.held => Some(song.id),
                 _ => None,
@@ -391,7 +398,7 @@ impl BackupRepository for BackupRepositoryImpl {
             .map(|(id, content)| (id, content.0))
             .collect()
         };
-        Ok(setlist_file(setlist, items, analyses))
+        Ok(shared_file(kind, setlists, gigs, tours, analyses))
     }
 
     async fn import(
@@ -836,10 +843,12 @@ impl BackupRepository for BackupRepositoryImpl {
 
         // Tours: one statement.
         let mut tour_id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(tours.len());
+        let mut created_tours = Vec::with_capacity(tours.len());
         let mut tour_rows = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for tour in tours {
             let new_tour_id = Uuid::new_v4();
             tour_id_map.insert(tour.id, new_tour_id);
+            created_tours.push(new_tour_id);
             tour_rows.0.push(new_tour_id);
             tour_rows.1.push(tour.name.trim().to_string());
             tour_rows.2.push(
@@ -870,8 +879,10 @@ impl BackupRepository for BackupRepositoryImpl {
             .await?;
         }
 
+        let mut created_gigs = Vec::with_capacity(backup.gigs.len());
         for gig in &backup.gigs {
             let new_gig_id = Uuid::new_v4();
+            created_gigs.push(new_gig_id);
             // Unlike songs referenced by a setlist, a dangling setlist or
             // tour reference on a gig is not fatal to the whole import —
             // the gig itself still carries useful information (venue,
@@ -931,6 +942,8 @@ impl BackupRepository for BackupRepositoryImpl {
             tours_imported: tours.len(),
             skipped_tours,
             setlist_ids: created_setlists,
+            gig_ids: created_gigs,
+            tour_ids: created_tours,
         })
     }
 }
@@ -949,92 +962,110 @@ fn free_title(title: &str, taken: &mut HashSet<String>) -> String {
     candidate
 }
 
-/// Builds the file of [`BackupRepository::export_setlist`] from the
+/// Builds the file of [`BackupRepository::export_shared`] from each
 /// setlist's running order. Artists are keyed by name (a held song keeps
-/// only its artist's name), and a song's `version_of` is kept only when the
-/// original is in the setlist too.
-pub fn setlist_file(
-    setlist: &Setlist,
-    items: Vec<SetlistItem>,
+/// only its artist's name), a song in several setlists is written once,
+/// and a song's `version_of` is kept only when the original is in the file
+/// too.
+pub fn shared_file(
+    kind: BackupKind,
+    setlists: Vec<(Setlist, Vec<SetlistItem>)>,
+    gigs: Vec<BackupGig>,
+    tours: Vec<BackupTour>,
     mut analyses: HashMap<Uuid, serde_json::Value>,
 ) -> BackupFile {
     let mut artists: Vec<BackupArtist> = Vec::new();
     let mut artist_by_name: HashMap<String, Uuid> = HashMap::new();
     let mut songs: Vec<BackupSong> = Vec::new();
-    let mut entries: Vec<BackupSetlistSong> = Vec::new();
-    let mut markers: Vec<BackupMarker> = Vec::new();
+    let mut song_ids: HashSet<Uuid> = HashSet::new();
+    let mut backup_setlists = Vec::with_capacity(setlists.len());
 
-    for item in items {
-        match item {
-            SetlistItem::Song { position, song } => {
-                let song = *song;
-                let name = song.artist_name.trim().to_string();
-                let artist_id = *artist_by_name
-                    .entry(name.to_lowercase())
-                    .or_insert_with(|| {
-                        let id = Uuid::new_v4();
-                        artists.push(BackupArtist {
-                            id,
-                            name: name.clone(),
-                        });
-                        id
+    for (setlist, items) in setlists {
+        let mut entries: Vec<BackupSetlistSong> = Vec::new();
+        let mut markers: Vec<BackupMarker> = Vec::new();
+        for item in items {
+            match item {
+                SetlistItem::Song { position, song } => {
+                    let song = *song;
+                    entries.push(BackupSetlistSong {
+                        song_id: song.id,
+                        position,
+                        transpose: song.transpose.unwrap_or(0),
                     });
-                entries.push(BackupSetlistSong {
-                    song_id: song.id,
+                    if !song_ids.insert(song.id) {
+                        continue;
+                    }
+                    let name = song.artist_name.trim().to_string();
+                    let artist_id =
+                        *artist_by_name
+                            .entry(name.to_lowercase())
+                            .or_insert_with(|| {
+                                let id = Uuid::new_v4();
+                                artists.push(BackupArtist {
+                                    id,
+                                    name: name.clone(),
+                                });
+                                id
+                            });
+                    let analysis = if song.held {
+                        None
+                    } else {
+                        analyses.remove(&song.id)
+                    };
+                    songs.push(BackupSong {
+                        id: song.id,
+                        title: song.title,
+                        artist_id,
+                        tempo: song.tempo,
+                        lyrics: song.lyrics,
+                        tonality: song.tonality,
+                        genre: song.genre,
+                        duration: song.duration,
+                        tags: song.tags,
+                        energy: song.energy,
+                        time_signature: song.time_signature,
+                        capo: song.capo,
+                        tuning: song.tuning,
+                        performance_notes: song.performance_notes,
+                        links: link_inputs(&song.links),
+                        version_label: song.version_label,
+                        version_of: song.version_of,
+                        analysis,
+                    });
+                }
+                SetlistItem::Block { position, name, .. } => markers.push(BackupMarker {
+                    marker_type: SetlistMarkerType::Block,
+                    label: Some(name),
+                    duration_minutes: None,
                     position,
-                    transpose: song.transpose.unwrap_or(0),
-                });
-                let analysis = if song.held {
-                    None
-                } else {
-                    analyses.remove(&song.id)
-                };
-                songs.push(BackupSong {
-                    id: song.id,
-                    title: song.title,
-                    artist_id,
-                    tempo: song.tempo,
-                    lyrics: song.lyrics,
-                    tonality: song.tonality,
-                    genre: song.genre,
-                    duration: song.duration,
-                    tags: song.tags,
-                    energy: song.energy,
-                    time_signature: song.time_signature,
-                    capo: song.capo,
-                    tuning: song.tuning,
-                    performance_notes: song.performance_notes,
-                    links: link_inputs(&song.links),
-                    version_label: song.version_label,
-                    version_of: song.version_of,
-                    analysis,
-                });
+                }),
+                SetlistItem::Break {
+                    position,
+                    label,
+                    duration_minutes,
+                    ..
+                } => markers.push(BackupMarker {
+                    marker_type: SetlistMarkerType::Break,
+                    label,
+                    duration_minutes,
+                    position,
+                }),
             }
-            SetlistItem::Block { position, name, .. } => markers.push(BackupMarker {
-                marker_type: SetlistMarkerType::Block,
-                label: Some(name),
-                duration_minutes: None,
-                position,
-            }),
-            SetlistItem::Break {
-                position,
-                label,
-                duration_minutes,
-                ..
-            } => markers.push(BackupMarker {
-                marker_type: SetlistMarkerType::Break,
-                label,
-                duration_minutes,
-                position,
-            }),
         }
+        backup_setlists.push(BackupSetlist {
+            id: setlist.id,
+            title: setlist.title,
+            description: setlist.description,
+            songs: entries,
+            links: link_inputs(&setlist.links),
+            markers,
+        });
     }
 
-    let in_file: HashSet<Uuid> = songs.iter().map(|s| s.id).collect();
     for song in &mut songs {
         if song
             .version_of
-            .is_some_and(|original| !in_file.contains(&original))
+            .is_some_and(|original| !song_ids.contains(&original))
         {
             song.version_of = None;
         }
@@ -1042,20 +1073,13 @@ pub fn setlist_file(
 
     BackupFile {
         version: BACKUP_FORMAT_VERSION,
-        kind: BackupKind::Setlist,
+        kind,
         exported_at: Utc::now().naive_utc(),
         artists,
         songs,
-        setlists: vec![BackupSetlist {
-            id: setlist.id,
-            title: setlist.title.clone(),
-            description: setlist.description.clone(),
-            songs: entries,
-            links: link_inputs(&setlist.links),
-            markers,
-        }],
-        gigs: Vec::new(),
-        tours: Vec::new(),
+        setlists: backup_setlists,
+        gigs,
+        tours,
     }
 }
 

@@ -17,6 +17,7 @@ pub mod public;
 pub mod release_note;
 pub mod setlist;
 pub mod setlist_collaborator;
+pub mod shared_file;
 pub mod song;
 pub mod song_analysis;
 pub mod status;

@@ -77,13 +77,13 @@ pub mod presets {
     /// `GET /backup/export`: 10 per account per hour.
     pub static BACKUP_EXPORT: LazyLock<SlidingWindowLimiter<Uuid>> =
         LazyLock::new(|| SlidingWindowLimiter::new(10, HOUR));
-    /// `GET /setlists/{id}/export` (a setlist as a file): 30 per account
-    /// per hour.
-    pub static SETLIST_EXPORT: LazyLock<SlidingWindowLimiter<Uuid>> =
+    /// `GET /{setlists,gigs,tours}/{id}/export` (a setlist, gig or tour as
+    /// a file), together: 30 per account per hour.
+    pub static SHARED_EXPORT: LazyLock<SlidingWindowLimiter<Uuid>> =
         LazyLock::new(|| SlidingWindowLimiter::new(30, HOUR));
-    /// `POST /setlists/import`: 10 per account per hour. Each import is one
-    /// transaction, like a backup's, only smaller.
-    pub static SETLIST_IMPORT: LazyLock<SlidingWindowLimiter<Uuid>> =
+    /// `POST /{setlists,gigs,tours}/import`, together: 10 per account per
+    /// hour. Each import is one transaction, like a backup's, only smaller.
+    pub static SHARED_IMPORT: LazyLock<SlidingWindowLimiter<Uuid>> =
         LazyLock::new(|| SlidingWindowLimiter::new(10, HOUR));
     /// `GET /songs/export/chordpro` (the whole library): 10 per account per
     /// hour.
