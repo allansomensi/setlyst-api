@@ -18,7 +18,8 @@ use uuid::Uuid;
 ///   new field is optional, so version 1 files still import.
 /// - 3: song versions (`version_label`, `version_of`) and the key each
 ///   setlist plays a song in (`transpose`). Optional as well.
-pub const BACKUP_FORMAT_VERSION: u32 = 3;
+/// - 4: each song's harmonic analysis (`analysis`). Optional as well.
+pub const BACKUP_FORMAT_VERSION: u32 = 4;
 
 /// A fully self-contained, portable snapshot of a user's data.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -85,6 +86,12 @@ pub struct BackupSong {
     /// The `id` (in this file) of the original this song is a version of.
     #[serde(default)]
     pub version_of: Option<Uuid>,
+    /// Since version 4: the song's harmonic analysis document (see
+    /// `PUT /songs/{id}/analysis`). On import it only fills songs that
+    /// don't have one yet.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub analysis: Option<serde_json::Value>,
 }
 
 /// Setlist entry inside a backup file.
@@ -249,6 +256,14 @@ impl BackupFile {
             }
             if song.tags.len() > MAX_TAGS_PER_SONG {
                 return Err(format!("\"{}\" has too many tags.", song.title));
+            }
+            if let Some(analysis) = &song.analysis
+                && crate::models::song_analysis::check_content(analysis).is_err()
+            {
+                return Err(format!(
+                    "The harmonic analysis of \"{}\" is invalid or too large.",
+                    song.title
+                ));
             }
         }
         for setlist in &self.setlists {

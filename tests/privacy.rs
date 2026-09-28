@@ -183,6 +183,7 @@ async fn every_reference_to_an_account_is_exported_or_excluded_on_purpose() {
         "setlists.share_locked_by",
         "songs.updated_by",
         "songs.deleted_by",
+        "song_analyses.updated_by",
         "subscriptions.updated_by",
         "tours.updated_by",
         "tours.deleted_by",

@@ -2,7 +2,7 @@ use crate::{
     controllers::{
         account, admin, announcement, artist, auth, backup, band, band_note, billing, gig, metrics,
         moderation, notification, pin, public, release_note, setlist, setlist_collaborator, song,
-        status, suggestion, tour, trash, user,
+        song_analysis, status, suggestion, tour, trash, user,
     },
     export::pdf::{ChordMode, MarginSize, Orientation, PaperFormat, PdfLocale},
     models::{
@@ -234,6 +234,9 @@ use utoipa::{
         song::export_song_pdf,
         song::export_song_chordpro,
         song::import_chordpro,
+        song_analysis::find_song_analysis,
+        song_analysis::save_song_analysis,
+        song_analysis::delete_song_analysis,
 
         // Setlists
         setlist::find_setlist_by_id,
@@ -531,6 +534,8 @@ use utoipa::{
             ReorderPinsPayload,
             BackupTour,
             song::ImportChordProPayload,
+            crate::models::song_analysis::SongAnalysis,
+            crate::models::song_analysis::SaveSongAnalysisPayload,
             song::ChordProPreview,
             crate::import::chordpro::ImportWarning,
             SetlistMarker,

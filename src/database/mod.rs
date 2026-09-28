@@ -30,6 +30,7 @@ use repositories::{
         SetlistCollaboratorRepository, SetlistCollaboratorRepositoryImpl,
     },
     setlist_repository::{SetlistRepository, SetlistRepositoryImpl},
+    song_analysis_repository::{SongAnalysisRepository, SongAnalysisRepositoryImpl},
     song_repository::{SongRepository, SongRepositoryImpl},
     suggestion_repository::{SuggestionRepository, SuggestionRepositoryImpl},
     tour_repository::{TourRepository, TourRepositoryImpl},
@@ -49,6 +50,7 @@ pub struct AppState {
     pub user_prefs_repo: Arc<dyn UserPreferencesRepository>,
     pub artist_repo: Arc<dyn ArtistRepository>,
     pub song_repo: Arc<dyn SongRepository>,
+    pub song_analysis_repo: Arc<dyn SongAnalysisRepository>,
     pub setlist_repo: Arc<dyn SetlistRepository>,
     pub setlist_collaborator_repo: Arc<dyn SetlistCollaboratorRepository>,
     pub gig_repo: Arc<dyn GigRepository>,
@@ -104,6 +106,7 @@ impl AppState {
             user_prefs_repo: Arc::new(UserPreferencesRepositoryImpl::new(pool.clone())),
             artist_repo: Arc::new(ArtistRepositoryImpl::new(pool.clone())),
             song_repo: Arc::new(SongRepositoryImpl::new(pool.clone())),
+            song_analysis_repo: Arc::new(SongAnalysisRepositoryImpl::new(pool.clone())),
             setlist_repo: Arc::new(SetlistRepositoryImpl::new(pool.clone())),
             setlist_collaborator_repo: Arc::new(SetlistCollaboratorRepositoryImpl::new(
                 pool.clone(),

@@ -127,6 +127,9 @@ pub const MAX_BODY_BYTES: usize = 256 * 1024;
 /// characters, which a client escaping non-ASCII as `\uXXXX` sends as
 /// six bytes each.
 pub const MAX_SONG_BODY_BYTES: usize = 1024 * 1024;
+/// A song's harmonic analysis: the document is up to 256 KiB serialized,
+/// with room for a client's escaping.
+pub const MAX_SONG_ANALYSIS_BODY_BYTES: usize = 512 * 1024;
 /// A full backup import, the only large upload.
 pub const MAX_IMPORT_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// How long a request may take to produce its response.

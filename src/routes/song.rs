@@ -1,4 +1,8 @@
-use crate::{controllers::song, database::AppState, routes::MAX_SONG_BODY_BYTES};
+use crate::{
+    controllers::{song, song_analysis},
+    database::AppState,
+    routes::{MAX_SONG_ANALYSIS_BODY_BYTES, MAX_SONG_BODY_BYTES},
+};
 use axum::{
     Router,
     extract::DefaultBodyLimit,
@@ -21,6 +25,13 @@ pub fn create_routes(state: AppState) -> Router {
         .route("/{id}/versions", get(song::find_song_versions))
         .route("/{id}/band-copies", get(song::find_song_band_copies))
         .route("/{id}/sync", post(song::sync_band_song))
+        .route(
+            "/{id}/analysis",
+            get(song_analysis::find_song_analysis)
+                .put(song_analysis::save_song_analysis)
+                .delete(song_analysis::delete_song_analysis)
+                .layer(DefaultBodyLimit::max(MAX_SONG_ANALYSIS_BODY_BYTES)),
+        )
         .route("/{id}/export/pdf", get(song::export_song_pdf))
         .route("/{id}/export/chordpro", get(song::export_song_chordpro))
         // Lyrics make song bodies the largest ordinary payloads.

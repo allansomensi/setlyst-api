@@ -27,6 +27,7 @@ Built with Rust for reliability and performance, using Axum, SQLx, and PostgreSQ
 - **User management** — Registration, authentication (JWT), role-based access control (`user`, `moderator`, `admin`), and per-user preferences (theme, language, live mode font size)
 - **Artists & Songs** — Full CRUD with pagination, user-scoped data isolation, uniqueness enforcement, and metadata fields (tonality, BPM, genre, duration, lyrics)
 - **Song versions** — Keep several charts of one song (a simplified one, an acoustic arrangement) as versions of it (`version_of`, `version_label`, `GET /songs/{id}/versions`)
+- **Harmonic analysis** — One manual harmonic analysis per song (chord degrees, resolutions, modal borrowings, notes), stored as a client-defined JSON document with optimistic concurrency (`GET`/`PUT`/`DELETE /songs/{id}/analysis`); same visibility and edit rights as the song
 - **Setlists** — Create and manage ordered song lists, reorder tracks, and compute total duration automatically
 - **Per-setlist keys** — Each setlist remembers the key it plays every song in (`PATCH /setlists/{id}/songs/{song_id}`, `transpose` in semitones); band setlists start from the repertoire's key, and the setlist PDF and public share print the chords in that key
 - **PDF Export** — Generate printable setlist PDFs with optional title, duration, key, and BPM display; supports `en`, `pt-BR`, and `es` locales
@@ -178,7 +179,7 @@ Full interactive documentation is available via Swagger UI at `/swagger-ui` when
 | Auth | `/api/v1/auth` | Login (password, 2FA, Google), register, password recovery, token verification |
 | Users | `/api/v1/users` | User management, profiles, preferences |
 | Artists | `/api/v1/artists` | Artist CRUD |
-| Songs | `/api/v1/songs` | Song CRUD, ChordPro export |
+| Songs | `/api/v1/songs` | Song CRUD, harmonic analysis, ChordPro export |
 | Bands | `/api/v1/bands` | Band, membership and invite endpoints |
 | Setlists | `/api/v1/setlists` | Setlist management, song ordering, PDF export |
 | Metrics | `/api/v1/metrics` | User and admin dashboard metrics |
@@ -228,6 +229,7 @@ The backup system uses a versioned, self-contained JSON structure:
 
 **Import merge rules:**
 - Existing artists and songs (matched by name/title) are reused — not duplicated
+- A song's harmonic analysis (`analysis`, since version 4) is only imported into songs that don't have one yet
 - Setlists are always created fresh
 - The entire import is atomic — any failure rolls back completely
 

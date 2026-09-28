@@ -44,6 +44,7 @@ struct SongRow {
     links: sqlx::types::Json<Vec<StoredLink>>,
     version_label: Option<String>,
     version_of: Option<Uuid>,
+    analysis: Option<sqlx::types::Json<serde_json::Value>>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -156,7 +157,8 @@ impl BackupRepository for BackupRepositoryImpl {
                     COALESCE((SELECT array_agg(st.tag ORDER BY st.tag) FROM song_tags st WHERE st.song_id = s.id), '{}') AS tags,
                     s.energy, s.time_signature, s.capo, s.tuning, s.performance_notes, s.links,
                     s.version_label,
-                    (SELECT o.id FROM songs o WHERE o.id = s.version_of AND o.deleted_at IS NULL) AS version_of
+                    (SELECT o.id FROM songs o WHERE o.id = s.version_of AND o.deleted_at IS NULL) AS version_of,
+                    (SELECT a.content FROM song_analyses a WHERE a.song_id = s.id) AS analysis
              FROM songs s
              WHERE s.user_id = $1 AND s.band_id IS NULL AND s.deleted_at IS NULL
              ORDER BY s.title ASC",
@@ -254,6 +256,7 @@ impl BackupRepository for BackupRepositoryImpl {
                 links: to_inputs(r.links.0),
                 version_label: r.version_label,
                 version_of: r.version_of,
+                analysis: r.analysis.map(|a| a.0),
             })
             .collect();
 
@@ -463,6 +466,7 @@ impl BackupRepository for BackupRepositoryImpl {
         let mut version_links: Vec<(Uuid, Uuid)> = Vec::new();
         let mut song_id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(backup.songs.len());
         let (mut tag_song_ids, mut tag_values) = (Vec::new(), Vec::new());
+        let (mut analysis_song_ids, mut analyses) = (Vec::new(), Vec::new());
         for (song, links) in backup.songs.iter().zip(song_links) {
             let Some(&resolved_artist_id) = artist_id_map.get(&song.artist_id) else {
                 return Err(ApiError::BadRequest(format!(
@@ -525,6 +529,10 @@ impl BackupRepository for BackupRepositoryImpl {
                 tag_song_ids.push(resolved_id);
                 tag_values.push(tag);
             }
+            if let Some(analysis) = &song.analysis {
+                analysis_song_ids.push(resolved_id);
+                analyses.push(analysis.clone());
+            }
             song_id_map.insert(song.id, resolved_id);
         }
         let (version_ids, version_roots): (Vec<Uuid>, Vec<Uuid>) = version_links
@@ -570,6 +578,22 @@ impl BackupRepository for BackupRepositoryImpl {
             .bind(&tag_values)
             .bind(now)
             .bind(crate::validations::tag::MAX_TAGS_PER_SONG as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        if !analysis_song_ids.is_empty() {
+            // A song merged into an existing one keeps its own analysis.
+            sqlx::query(
+                "INSERT INTO song_analyses (song_id, content, created_at, updated_at, updated_by)
+                 SELECT t.song_id, t.content, $3, $3, $4
+                 FROM UNNEST($1::uuid[], $2::jsonb[]) AS t(song_id, content)
+                 ON CONFLICT (song_id) DO NOTHING",
+            )
+            .bind(&analysis_song_ids)
+            .bind(&analyses)
+            .bind(now)
+            .bind(user_id)
             .execute(&mut *tx)
             .await?;
         }

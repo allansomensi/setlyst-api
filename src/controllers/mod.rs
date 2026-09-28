@@ -18,6 +18,7 @@ pub mod release_note;
 pub mod setlist;
 pub mod setlist_collaborator;
 pub mod song;
+pub mod song_analysis;
 pub mod status;
 pub mod suggestion;
 pub mod tour;

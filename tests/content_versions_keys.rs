@@ -297,7 +297,7 @@ async fn backups_keep_versions_and_keys() {
 
     let backup = app.get("/backup/export", &user).await;
     assert_eq!(backup.status, StatusCode::OK, "{}", backup.body);
-    assert_eq!(backup.body["version"], 3);
+    assert_eq!(backup.body["version"], 4);
 
     let (_, other) = app.user("restorer", Role::User).await;
     let imported = app.post("/backup/import", &other, backup.body).await;
