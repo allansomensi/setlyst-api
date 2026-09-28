@@ -1851,6 +1851,7 @@ mod tests {
             added_by_username: None,
             added_by_avatar_url: None,
             added_at: None,
+            held: false,
             created_at: now,
             updated_at: now,
         }

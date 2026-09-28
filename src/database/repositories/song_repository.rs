@@ -1,4 +1,5 @@
 use crate::database::repositories::quota_repository::QuotaGuard;
+use crate::database::repositories::setlist_repository::detach_contributed_songs;
 use crate::{
     errors::api_error::ApiError,
     models::{
@@ -586,6 +587,19 @@ impl SongRepository for SongRepositoryImpl {
     }
 
     async fn trash(&self, id: Uuid, actor_id: Uuid) -> Result<(), ApiError> {
+        let mut tx = self.db.begin().await?;
+        // A personal song in setlists shared with its owner stays in them,
+        // held by each setlist.
+        let owner: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT user_id, band_id FROM songs WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((owner_id, None)) = owner {
+            detach_contributed_songs(&mut tx, owner_id, None, Some(&[id])).await?;
+        }
+
         let result = sqlx::query(
             "UPDATE songs SET deleted_at = $2, deleted_by = $3, trash_batch = $4
              WHERE id = $1 AND deleted_at IS NULL",
@@ -594,11 +608,12 @@ impl SongRepository for SongRepositoryImpl {
         .bind(chrono::Utc::now().naive_utc())
         .bind(actor_id)
         .bind(Uuid::new_v4())
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
             return Err(ApiError::NotFound);
         }
+        tx.commit().await?;
         Ok(())
     }
 

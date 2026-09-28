@@ -1,3 +1,4 @@
+use crate::database::repositories::setlist_repository::detach_contributed_songs;
 use crate::{
     errors::api_error::{ApiError, codes},
     models::user::{
@@ -795,6 +796,10 @@ impl UserRepository for UserRepositoryImpl {
         .bind(id)
         .execute(&mut *tx)
         .await?;
+
+        // Songs the account contributed to other people's setlists stay
+        // there, held by each setlist.
+        detach_contributed_songs(&mut tx, id, None, None).await?;
 
         let username: Option<String> =
             sqlx::query_scalar("DELETE FROM users WHERE id = $1 RETURNING username")

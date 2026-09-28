@@ -9,8 +9,8 @@ use crate::{
         link::Links,
         quota::{QuotaLimits, QuotaResource},
         setlist::{
-            CreateSetlistPayload, Setlist, SetlistItem, SetlistItemRef, SetlistItemType,
-            SetlistMarker, SetlistMarkerType, UpdateSetlistPayload,
+            CopiedSetlistSong, CreateSetlistPayload, Setlist, SetlistItem, SetlistItemRef,
+            SetlistItemType, SetlistMarker, SetlistMarkerType, UpdateSetlistPayload,
         },
         setlist_collaborator::CollaboratorRole,
         song::{Song, SongWithArtist},
@@ -41,7 +41,8 @@ macro_rules! setlist_columns {
                          OR EXISTS (SELECT 1 FROM setlist_collaborators co
                                     WHERE co.setlist_id = s.id AND co.user_id = so.user_id
                                       AND co.accepted_at IS NOT NULL)))
-                   OR so.band_id = s.band_id)) AS song_count,
+                   OR so.band_id = s.band_id))
+         + (SELECT COUNT(*) FROM setlist_held_songs h WHERE h.setlist_id = s.id) AS song_count,
          (SELECT COUNT(*) FROM setlist_collaborators co
             WHERE co.setlist_id = s.id AND co.accepted_at IS NOT NULL) AS collaborator_count,
          setlist_total_duration(s.id) AS total_duration"
@@ -73,6 +74,66 @@ macro_rules! added_by_columns {
         "ss.added_by, ss.added_at,
          (SELECT u.username FROM users u WHERE u.id = ss.added_by) AS added_by_username,
          (SELECT u.avatar_url FROM users u WHERE u.id = ss.added_by) AS added_by_avatar_url"
+    };
+}
+
+/// A held song (`setlist_held_songs h` of `setlists st`) in the columns of
+/// a setlist song: [`song_columns!`], artist name, key, attribution and
+/// `held`, in that order, so the two can be `UNION`ed. It belongs to no
+/// library: no artist record (nil id), and the setlist's owner as
+/// `user_id`.
+macro_rules! held_song_columns {
+    () => {
+        "h.id, h.title, '00000000-0000-0000-0000-000000000000'::uuid AS artist_id, st.user_id,
+         NULL::uuid AS band_id, NULL::uuid AS forked_from, h.version_label, NULL::uuid AS version_of,
+         h.tempo, h.lyrics, h.tonality, h.genre, h.duration, h.energy, h.time_signature, h.capo,
+         h.tuning, h.performance_notes, h.links, h.tags::varchar[] AS tags,
+         NULL::uuid AS updated_by, NULL::varchar AS updated_by_username,
+         NULL::timestamp AS source_synced_at, h.created_at, h.held_at AS updated_at,
+         h.artist_name, h.transpose,
+         h.added_by, h.added_at,
+         (SELECT u.username FROM users u WHERE u.id = h.added_by) AS added_by_username,
+         (SELECT u.avatar_url FROM users u WHERE u.id = h.added_by) AS added_by_avatar_url,
+         TRUE AS held"
+    };
+}
+
+/// The next position at the end of setlist `$1`'s running order (songs,
+/// held songs and markers share one ordering space).
+macro_rules! next_position {
+    () => {
+        "COALESCE(GREATEST(
+            (SELECT MAX(position) FROM setlist_songs WHERE setlist_id = $1),
+            (SELECT MAX(position) FROM setlist_held_songs WHERE setlist_id = $1),
+            (SELECT MAX(position) FROM setlist_markers WHERE setlist_id = $1)
+        ), 0) + 1"
+    };
+}
+
+/// Every song of setlist `$1` with its `position`: the songs it links to
+/// (of its own scope, see [`scoped_songs!`]) and the ones it holds. A
+/// subquery to order and page.
+macro_rules! setlist_song_rows {
+    () => {
+        concat!(
+            "SELECT ss.position, ",
+            song_columns!(),
+            ", a.name AS artist_name, ss.transpose, ",
+            added_by_columns!(),
+            ", FALSE AS held
+             FROM songs s
+             INNER JOIN setlist_songs ss ON s.id = ss.song_id
+             INNER JOIN setlists st ON st.id = ss.setlist_id
+             INNER JOIN artists a ON a.id = s.artist_id
+             WHERE ss.setlist_id = $1 AND ",
+            scoped_songs!(),
+            " UNION ALL
+             SELECT h.position, ",
+            held_song_columns!(),
+            " FROM setlist_held_songs h
+             INNER JOIN setlists st ON st.id = h.setlist_id
+             WHERE h.setlist_id = $1"
+        )
     };
 }
 
@@ -320,6 +381,19 @@ pub trait SetlistRepository: Send + Sync {
         setlist_id: Uuid,
         items: &[SetlistItemRef],
     ) -> Result<(), ApiError>;
+    /// Copies one song of a personal setlist into `user_id`'s library
+    /// (their song and artist limits apply): a song the setlist holds, or
+    /// one of someone else's library it links. When `adopt` (the caller
+    /// owns the setlist) and the song is held, the setlist links the copy
+    /// from then on and the held song goes.
+    async fn copy_song_to_library(
+        &self,
+        setlist_id: Uuid,
+        song_id: Uuid,
+        user_id: Uuid,
+        limits: Option<QuotaLimits>,
+        adopt: bool,
+    ) -> Result<CopiedSetlistSong, ApiError>;
     /// The id of a band's repertoire.
     async fn find_repertoire_id(&self, band_id: Uuid) -> Result<Option<Uuid>, ApiError>;
     /// Live songs of a band's repertoire, alphabetically, optionally
@@ -410,16 +484,13 @@ async fn append_song(
     song_id: Uuid,
     added_by: Uuid,
 ) -> Result<(), ApiError> {
-    sqlx::query(
-        r#"
-        INSERT INTO setlist_songs (setlist_id, song_id, position, added_by, added_at)
-        SELECT $1, $2, COALESCE(GREATEST(
-            (SELECT MAX(position) FROM setlist_songs WHERE setlist_id = $1),
-            (SELECT MAX(position) FROM setlist_markers WHERE setlist_id = $1)
-        ), 0) + 1, $3, $4
-        ON CONFLICT (setlist_id, song_id) DO NOTHING
-        "#,
-    )
+    sqlx::query(concat!(
+        "INSERT INTO setlist_songs (setlist_id, song_id, position, added_by, added_at)
+         SELECT $1, $2, ",
+        next_position!(),
+        ", $3, $4
+         ON CONFLICT (setlist_id, song_id) DO NOTHING"
+    ))
     .bind(setlist_id)
     .bind(song_id)
     .bind(added_by)
@@ -1002,14 +1073,21 @@ impl SetlistRepository for SetlistRepositoryImpl {
     }
 
     async fn remove_song(&self, setlist_id: Uuid, song_id: Uuid) -> Result<(), ApiError> {
-        let result =
-            sqlx::query("DELETE FROM setlist_songs WHERE setlist_id = $1 AND song_id = $2;")
-                .bind(setlist_id)
-                .bind(song_id)
-                .execute(&self.db)
-                .await?;
+        // A linked song, or one the setlist holds (which is then gone).
+        let removed: i64 = sqlx::query_scalar(
+            "WITH linked AS (
+                 DELETE FROM setlist_songs WHERE setlist_id = $1 AND song_id = $2 RETURNING 1
+             ), held AS (
+                 DELETE FROM setlist_held_songs WHERE setlist_id = $1 AND id = $2 RETURNING 1
+             )
+             SELECT (SELECT COUNT(*) FROM linked) + (SELECT COUNT(*) FROM held)",
+        )
+        .bind(setlist_id)
+        .bind(song_id)
+        .fetch_one(&self.db)
+        .await?;
 
-        if result.rows_affected() == 0 {
+        if removed == 0 {
             return Err(ApiError::NotFound);
         }
 
@@ -1022,16 +1100,23 @@ impl SetlistRepository for SetlistRepositoryImpl {
         song_id: Uuid,
         transpose: i16,
     ) -> Result<(), ApiError> {
-        let result = sqlx::query(
-            "UPDATE setlist_songs SET transpose = $3 WHERE setlist_id = $1 AND song_id = $2",
+        let updated: i64 = sqlx::query_scalar(
+            "WITH linked AS (
+                 UPDATE setlist_songs SET transpose = $3
+                 WHERE setlist_id = $1 AND song_id = $2 RETURNING 1
+             ), held AS (
+                 UPDATE setlist_held_songs SET transpose = $3
+                 WHERE setlist_id = $1 AND id = $2 RETURNING 1
+             )
+             SELECT (SELECT COUNT(*) FROM linked) + (SELECT COUNT(*) FROM held)",
         )
         .bind(setlist_id)
         .bind(song_id)
         .bind(transpose)
-        .execute(&self.db)
+        .fetch_one(&self.db)
         .await?;
 
-        if result.rows_affected() == 0 {
+        if updated == 0 {
             return Err(ApiError::NotFound);
         }
         Ok(())
@@ -1046,28 +1131,20 @@ impl SetlistRepository for SetlistRepositoryImpl {
         let offset = (page - 1) * size;
 
         let count = sqlx::query_scalar(concat!(
-            "SELECT COUNT(*) FROM setlist_songs ss
+            "SELECT (SELECT COUNT(*) FROM setlist_songs ss
              INNER JOIN songs s ON s.id = ss.song_id
              INNER JOIN setlists st ON st.id = ss.setlist_id
              WHERE ss.setlist_id = $1 AND ",
-            scoped_songs!()
+            scoped_songs!(),
+            ") + (SELECT COUNT(*) FROM setlist_held_songs WHERE setlist_id = $1)"
         ))
         .bind(setlist_id)
         .fetch_one(&self.db);
 
         let songs = sqlx::query_as::<_, SongWithArtist>(concat!(
-            "SELECT ",
-            song_columns!(),
-            ", a.name AS artist_name, ss.transpose, ",
-            added_by_columns!(),
-            " FROM songs s
-             INNER JOIN setlist_songs ss ON s.id = ss.song_id
-             INNER JOIN setlists st ON st.id = ss.setlist_id
-             INNER JOIN artists a ON a.id = s.artist_id
-             WHERE ss.setlist_id = $1 AND ",
-            scoped_songs!(),
-            " ORDER BY ss.position ASC
-             LIMIT $2 OFFSET $3;"
+            "SELECT x.* FROM (",
+            setlist_song_rows!(),
+            ") x ORDER BY x.position ASC LIMIT $2 OFFSET $3"
         ))
         .bind(setlist_id)
         .bind(size)
@@ -1098,7 +1175,8 @@ impl SetlistRepository for SetlistRepositoryImpl {
                      INNER JOIN setlists st ON st.id = ss.setlist_id
                      WHERE ss.setlist_id = $1 AND ",
             scoped_songs!(),
-            ") + (SELECT COUNT(*) FROM setlist_markers WHERE setlist_id = $1)"
+            ") + (SELECT COUNT(*) FROM setlist_held_songs WHERE setlist_id = $1)
+               + (SELECT COUNT(*) FROM setlist_markers WHERE setlist_id = $1)"
         ))
         .bind(setlist_id)
         .fetch_one(&self.db)
@@ -1108,13 +1186,15 @@ impl SetlistRepository for SetlistRepositoryImpl {
     async fn reorder_songs(&self, setlist_id: Uuid, song_ids: &[Uuid]) -> Result<(), ApiError> {
         sqlx::query(
             r#"
-            UPDATE setlist_songs AS ss
-            SET position = u.new_position
-            FROM (
+            WITH u AS (
                 SELECT unnest($1::uuid[]) AS id,
                        generate_series(1, array_length($1::uuid[], 1)) AS new_position
-            ) AS u
-            WHERE ss.setlist_id = $2 AND ss.song_id = u.id
+            ), linked AS (
+                UPDATE setlist_songs AS ss SET position = u.new_position
+                FROM u WHERE ss.setlist_id = $2 AND ss.song_id = u.id
+            )
+            UPDATE setlist_held_songs AS h SET position = u.new_position
+            FROM u WHERE h.setlist_id = $2 AND h.id = u.id
             "#,
         )
         .bind(song_ids)
@@ -1228,11 +1308,24 @@ impl SetlistRepository for SetlistRepositoryImpl {
         let mut transposes: Vec<i16> = Vec::with_capacity(source_songs.len());
         let mut skipped = 0i64;
         for row in &source_songs {
-            // Only the caller's own personal songs are referenced: band
-            // songs, and the songs a collaborator (or the owner, when a
-            // collaborator duplicates) brought, become copies in the
-            // caller's library.
-            let resolved = if row.song.band_id.is_none() && row.song.user_id == user_id {
+            // The copy links the caller's own personal songs, and copies
+            // band songs into their library (as a band setlist's copy
+            // always has). Songs of anyone else's library, and the ones
+            // the original holds, stay the copy's alone: held by it, never
+            // added to the caller's library unasked.
+            if row.song.held || (row.song.band_id.is_none() && row.song.user_id != user_id) {
+                insert_held_song(
+                    &mut tx,
+                    new_setlist.id,
+                    row.position,
+                    &row.song,
+                    Some(user_id),
+                    new_setlist.created_at,
+                )
+                .await?;
+                continue;
+            }
+            let resolved = if row.song.band_id.is_none() {
                 Some(row.song.id)
             } else {
                 forker.personal_copy(&mut tx, &row.song).await?
@@ -1436,12 +1529,14 @@ impl SetlistRepository for SetlistRepositoryImpl {
         if !song_ids.is_empty() {
             sqlx::query(
                 r#"
-                UPDATE setlist_songs AS ss
-                SET position = u.new_position
-                FROM (
+                WITH u AS (
                     SELECT unnest($1::uuid[]) AS id, unnest($2::int[]) AS new_position
-                ) AS u
-                WHERE ss.setlist_id = $3 AND ss.song_id = u.id
+                ), linked AS (
+                    UPDATE setlist_songs AS ss SET position = u.new_position
+                    FROM u WHERE ss.setlist_id = $3 AND ss.song_id = u.id
+                )
+                UPDATE setlist_held_songs AS h SET position = u.new_position
+                FROM u WHERE h.setlist_id = $3 AND h.id = u.id
                 "#,
             )
             .bind(&song_ids)
@@ -1480,6 +1575,86 @@ impl SetlistRepository for SetlistRepositoryImpl {
         tx.commit().await?;
 
         Ok(())
+    }
+
+    async fn copy_song_to_library(
+        &self,
+        setlist_id: Uuid,
+        song_id: Uuid,
+        user_id: Uuid,
+        limits: Option<QuotaLimits>,
+        adopt: bool,
+    ) -> Result<CopiedSetlistSong, ApiError> {
+        let mut tx = self.db.begin().await?;
+        // The setlist row first, like every other change to its order.
+        sqlx::query("SELECT 1 FROM setlists WHERE id = $1 AND deleted_at IS NULL FOR UPDATE")
+            .bind(setlist_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+
+        let row = sqlx::query_as::<_, SongItemRow>(concat!(
+            "SELECT x.* FROM (",
+            setlist_song_rows!(),
+            ") x WHERE x.id = $2"
+        ))
+        .bind(setlist_id)
+        .bind(song_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+        let source = &row.song;
+
+        if source.band_id.is_some() {
+            // Band songs leave the band through a duplicate, which needs
+            // the band's `export_pdf` permission.
+            return Err(ApiError::NotFound);
+        }
+        if !source.held && source.user_id == user_id {
+            return Err(ApiError::rule(
+                StatusCode::CONFLICT,
+                codes::SONG_ALREADY_IN_LIBRARY,
+                "This song is already in your library.",
+            ));
+        }
+
+        lock_scope(&mut tx, QuotaResource::Songs, user_id).await?;
+        lock_scope(&mut tx, QuotaResource::Artists, user_id).await?;
+        let mut forker = PersonalForker::new(&mut tx, user_id, limits).await?;
+        let Some(copy_id) = forker.personal_copy(&mut tx, source).await? else {
+            let limits = limits.expect("only limits refuse a copy");
+            return Err(if forker.songs_used + 1 > limits.songs {
+                ApiError::quota_exceeded("songs", limits.songs)
+            } else {
+                ApiError::quota_exceeded("artists", limits.artists)
+            });
+        };
+
+        let adopted = adopt && source.held;
+        if adopted {
+            sqlx::query(
+                "INSERT INTO setlist_songs (setlist_id, song_id, position, transpose, added_by, added_at)
+                 SELECT setlist_id, $3, position, transpose, added_by, added_at
+                 FROM setlist_held_songs WHERE setlist_id = $1 AND id = $2
+                 ON CONFLICT (setlist_id, song_id) DO NOTHING",
+            )
+            .bind(setlist_id)
+            .bind(song_id)
+            .bind(copy_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM setlist_held_songs WHERE setlist_id = $1 AND id = $2")
+                .bind(setlist_id)
+                .bind(song_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+        Ok(CopiedSetlistSong {
+            song_id: copy_id,
+            adopted,
+        })
     }
 
     async fn find_repertoire_id(&self, band_id: Uuid) -> Result<Option<Uuid>, ApiError> {
@@ -1594,17 +1769,9 @@ impl SetlistRepositoryImpl {
         limit: Option<i64>,
     ) -> Result<Vec<SongItemRow>, ApiError> {
         let rows = sqlx::query_as::<_, SongItemRow>(concat!(
-            "SELECT ss.position, ",
-            song_columns!(),
-            ", a.name AS artist_name, ss.transpose, ",
-            added_by_columns!(),
-            " FROM songs s
-             INNER JOIN setlist_songs ss ON s.id = ss.song_id
-             INNER JOIN setlists st ON st.id = ss.setlist_id
-             INNER JOIN artists a ON a.id = s.artist_id
-             WHERE ss.setlist_id = $1 AND ",
-            scoped_songs!(),
-            " ORDER BY ss.position ASC LIMIT $2"
+            "SELECT x.* FROM (",
+            setlist_song_rows!(),
+            ") x ORDER BY x.position ASC LIMIT $2"
         ))
         .bind(setlist_id)
         .bind(limit)
@@ -1723,17 +1890,10 @@ impl SetlistRepositoryImpl {
         }
 
         // Append at the end of the shared song/marker ordering space.
-        let next_position: i32 = sqlx::query_scalar(
-            r#"
-            SELECT COALESCE(GREATEST(
-                (SELECT MAX(position) FROM setlist_songs WHERE setlist_id = $1),
-                (SELECT MAX(position) FROM setlist_markers WHERE setlist_id = $1)
-            ), 0) + 1
-            "#,
-        )
-        .bind(setlist_id)
-        .fetch_one(&mut *tx)
-        .await?;
+        let next_position: i32 = sqlx::query_scalar(concat!("SELECT ", next_position!()))
+            .bind(setlist_id)
+            .fetch_one(&mut *tx)
+            .await?;
 
         sqlx::query(
             "INSERT INTO setlist_markers (id, setlist_id, marker_type, label, duration_minutes, position, created_at)
@@ -1803,6 +1963,100 @@ impl SetlistRepositoryImpl {
 
         Ok(marker)
     }
+}
+
+/// Adds `song` to `setlist_id` as a song the setlist holds (see
+/// `0018_setlist_held_songs.sql`), at `position`, in the key it is played
+/// in there.
+async fn insert_held_song(
+    tx: &mut Transaction<'_, Postgres>,
+    setlist_id: Uuid,
+    position: i32,
+    song: &SongWithArtist,
+    added_by: Option<Uuid>,
+    now: chrono::NaiveDateTime,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "INSERT INTO setlist_held_songs (id, setlist_id, position, transpose, added_by, added_at,
+             held_at, title, artist_name, version_label, tempo, lyrics, tonality, genre, duration,
+             energy, time_signature, capo, tuning, performance_notes, links, tags, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                 $18, $19, $20, $21, $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(setlist_id)
+    .bind(position)
+    .bind(song.transpose.unwrap_or(0))
+    .bind(added_by)
+    .bind(now)
+    .bind(&song.title)
+    .bind(&song.artist_name)
+    .bind(&song.version_label)
+    .bind(song.tempo)
+    .bind(&song.lyrics)
+    .bind(song.tonality)
+    .bind(song.genre)
+    .bind(song.duration)
+    .bind(song.energy)
+    .bind(&song.time_signature)
+    .bind(song.capo)
+    .bind(&song.tuning)
+    .bind(&song.performance_notes)
+    .bind(sqlx::types::Json(song.links.to_stored()))
+    .bind(&song.tags)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Detaches the songs `from_user` contributed to other people's personal
+/// setlists into those setlists, within `tx`: each becomes a song the
+/// setlist holds (see `0018_setlist_held_songs.sql`), in the same place,
+/// key and attribution, belonging to no one's library.
+///
+/// Called whenever the link between a setlist and a contributor's song is
+/// about to break — they leave or are removed, move the song (or its
+/// artist) to the trash, or delete their account — so what they
+/// contributed never vanishes from someone else's show. Narrowed to one
+/// setlist and/or some songs; only live personal songs are concerned.
+/// Returns how many songs were detached.
+pub(crate) async fn detach_contributed_songs(
+    tx: &mut Transaction<'_, Postgres>,
+    from_user: Uuid,
+    setlist_id: Option<Uuid>,
+    song_ids: Option<&[Uuid]>,
+) -> Result<u64, ApiError> {
+    let detached = sqlx::query(
+        "WITH moved AS (
+             DELETE FROM setlist_songs ss
+             USING songs s, setlists st
+             WHERE s.id = ss.song_id AND st.id = ss.setlist_id
+               AND s.user_id = $1 AND s.band_id IS NULL AND s.deleted_at IS NULL
+               AND st.band_id IS NULL AND st.user_id <> $1
+               AND ($2::uuid IS NULL OR ss.setlist_id = $2)
+               AND ($3::uuid[] IS NULL OR ss.song_id = ANY($3))
+             RETURNING ss.setlist_id, ss.song_id, ss.position, ss.transpose, ss.added_by, ss.added_at
+         )
+         INSERT INTO setlist_held_songs (id, setlist_id, position, transpose, added_by, added_at,
+             held_at, title, artist_name, version_label, tempo, lyrics, tonality, genre, duration,
+             energy, time_signature, capo, tuning, performance_notes, links, tags, created_at)
+         SELECT gen_random_uuid(), m.setlist_id, m.position, m.transpose, m.added_by, m.added_at,
+                $4, s.title, a.name, s.version_label, s.tempo, s.lyrics, s.tonality, s.genre,
+                s.duration, s.energy, s.time_signature, s.capo, s.tuning, s.performance_notes,
+                s.links,
+                COALESCE((SELECT array_agg(t.tag ORDER BY t.tag) FROM song_tags t WHERE t.song_id = s.id), '{}'),
+                $4
+         FROM moved m
+         INNER JOIN songs s ON s.id = m.song_id
+         INNER JOIN artists a ON a.id = s.artist_id",
+    )
+    .bind(from_user)
+    .bind(setlist_id)
+    .bind(song_ids)
+    .bind(chrono::Utc::now().naive_utc())
+    .execute(&mut **tx)
+    .await?;
+    Ok(detached.rows_affected())
 }
 
 /// Copies band songs into one user's personal library while duplicating a

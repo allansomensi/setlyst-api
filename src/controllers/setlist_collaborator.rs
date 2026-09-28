@@ -303,7 +303,7 @@ pub async fn update_setlist_collaborator(
     path = "/api/v1/setlists/{id}/collaborators/{user_id}",
     tags = ["Setlists"],
     summary = "Remove a collaborator, withdraw an invite, or leave a setlist.",
-    description = "The owner removes anyone; a `manager` only viewers and editors. A collaborator removing themselves leaves the setlist. The songs of their own library a collaborator had added leave the setlist with them.",
+    description = "The owner removes anyone; a `manager` only viewers and editors. A collaborator removing themselves leaves the setlist. The songs of their library a collaborator had added stay in the setlist, held by it (`held`: in no one's library; see `POST /setlists/{id}/songs/{song_id}/copy`).",
     params(
         ("id" = Uuid, Path, description = "The ID of the setlist"),
         ("user_id" = Uuid, Path, description = "The collaborator")

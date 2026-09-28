@@ -100,6 +100,8 @@ pub mod codes {
     pub const COLLABORATION_UNAVAILABLE: &str = "COLLABORATION_UNAVAILABLE";
     /// No (active) account with the given username.
     pub const USER_NOT_FOUND: &str = "USER_NOT_FOUND";
+    /// The song to copy is already one of the caller's own.
+    pub const SONG_ALREADY_IN_LIBRARY: &str = "SONG_ALREADY_IN_LIBRARY";
     pub const SUGGESTION_CLOSED: &str = "SUGGESTION_CLOSED";
     pub const NOT_IN_TRASH: &str = "NOT_IN_TRASH";
     pub const RESTORE_CONFLICT: &str = "RESTORE_CONFLICT";

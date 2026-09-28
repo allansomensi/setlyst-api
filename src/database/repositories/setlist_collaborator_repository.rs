@@ -1,3 +1,4 @@
+use crate::database::repositories::setlist_repository::detach_contributed_songs;
 use crate::{
     errors::api_error::{ApiError, codes},
     models::setlist_collaborator::{
@@ -55,8 +56,8 @@ pub trait SetlistCollaboratorRepository: Send + Sync {
 
     /// `actor_id` removes `user_id` (or withdraws their invite); a
     /// collaborator removing themselves leaves the setlist. The songs of
-    /// their own library they had added leave the setlist with them: they
-    /// are theirs, and the setlist can no longer show them.
+    /// their library they had added stay in it, held by the setlist (see
+    /// [`detach_contributed_songs`]).
     async fn remove(&self, setlist_id: Uuid, actor_id: Uuid, user_id: Uuid)
     -> Result<(), ApiError>;
 
@@ -349,15 +350,8 @@ impl SetlistCollaboratorRepository for SetlistCollaboratorRepositoryImpl {
             return Err(ApiError::NotFound);
         }
 
-        sqlx::query(
-            "DELETE FROM setlist_songs ss USING songs so
-             WHERE ss.setlist_id = $1 AND so.id = ss.song_id
-               AND so.user_id = $2 AND so.band_id IS NULL",
-        )
-        .bind(setlist_id)
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
+        // What they contributed stays: their songs become the setlist's.
+        detach_contributed_songs(&mut tx, user_id, Some(setlist_id), None).await?;
 
         sqlx::query("UPDATE setlists SET updated_at = $2, updated_by = $3 WHERE id = $1")
             .bind(setlist_id)

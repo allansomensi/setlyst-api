@@ -18,12 +18,12 @@ use crate::{
         band::{BandPermission, BandRole},
         quota::QuotaResource,
         setlist::{
-            AddSongToSetlistPayload, AddedSetlistSong, BandCopyOutcome, CreateSetlistBlockPayload,
-            CreateSetlistBreakPayload, CreateSetlistPayload, DuplicateSetlistPayload,
-            DuplicateSetlistResponse, PublicMarker, PublicSetlist, ReorderSetlistItemsPayload,
-            ReorderSetlistSongsPayload, Setlist, SetlistItem, SetlistMarker,
-            UpdateSetlistBlockPayload, UpdateSetlistBreakPayload, UpdateSetlistPayload,
-            UpdateSetlistSongPayload,
+            AddSongToSetlistPayload, AddedSetlistSong, BandCopyOutcome, CopiedSetlistSong,
+            CreateSetlistBlockPayload, CreateSetlistBreakPayload, CreateSetlistPayload,
+            DuplicateSetlistPayload, DuplicateSetlistResponse, PublicMarker, PublicSetlist,
+            ReorderSetlistItemsPayload, ReorderSetlistSongsPayload, Setlist, SetlistItem,
+            SetlistMarker, UpdateSetlistBlockPayload, UpdateSetlistBreakPayload,
+            UpdateSetlistPayload, UpdateSetlistSongPayload,
         },
         song::{PublicSong, SongWithArtist},
     },
@@ -715,6 +715,52 @@ pub async fn remove_song_from_setlist(
     );
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/setlists/{id}/songs/{song_id}/copy",
+    tags = ["Setlists"],
+    summary = "Copy a song of a setlist into your library.",
+    description = "For personal setlists: copies a song the setlist holds (`held`: a collaborator's song kept after they left), or a song of someone else's library it links, into the caller's personal library. The caller's song and artist limits apply (`QUOTA_EXCEEDED`); an identical song they already have is reused. A song already in the caller's library is `SONG_ALREADY_IN_LIBRARY`.\n\nWhen the setlist's owner copies a held song, the setlist links their copy from then on (`adopted`), so editing it in their library shows up in the setlist. Anyone who can see the setlist may copy.",
+    params(
+        ("id" = Uuid, Path, description = "The ID of the setlist"),
+        ("song_id" = Uuid, Path, description = "The song, as the setlist lists it")
+    ),
+    security(("jwt_token" = [])),
+    responses(
+        (status = 201, description = "Copied.", body = CopiedSetlistSong),
+        (status = 404, description = "Setlist or song not found, or a band setlist."),
+        (status = 409, description = "Already in the caller's library.")
+    )
+)]
+pub async fn copy_setlist_song(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path((setlist_id, song_id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+    let setlist = state
+        .setlist_repo
+        .find_by_id(setlist_id, user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if setlist.band_id.is_some() {
+        return Err(ApiError::NotFound);
+    }
+
+    let limits = state.quota_repo.effective_limits(user_id).await?;
+    let adopt = setlist.user_id == user_id;
+    let copied = state
+        .setlist_repo
+        .copy_song_to_library(setlist_id, song_id, user_id, limits, adopt)
+        .await?;
+    if copied.adopted {
+        state.setlist_repo.touch(setlist_id, user_id).await?;
+    }
+
+    info!(%user_id, %setlist_id, %song_id, copy_id = %copied.song_id, adopted = copied.adopted, "Setlist song copied to the library");
+    Ok((StatusCode::CREATED, Json(copied)))
 }
 
 #[utoipa::path(

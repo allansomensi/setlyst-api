@@ -247,7 +247,7 @@ async fn roles_decide_what_a_collaborator_may_do() {
 }
 
 #[tokio::test]
-async fn songs_record_who_added_them_and_leave_with_their_owner() {
+async fn songs_record_who_added_them_and_stay_when_their_owner_leaves() {
     let app = app!();
     let (owner_id, owner) = app.user("violao", Role::User).await;
     let (guest_id, guest) = app.user("voz", Role::User).await;
@@ -295,14 +295,8 @@ async fn songs_record_who_added_them_and_leave_with_their_owner() {
     assert_eq!(setlist_row.body["song_count"], 2);
     assert_eq!(setlist_row.body["updated_by_username"], "voz");
 
-    // Duplicating keeps every song, as copies in the duplicator's library.
-    let copy = app
-        .post(&format!("/setlists/{setlist}/duplicate"), &owner, json!({}))
-        .await;
-    assert_eq!(copy.status, StatusCode::CREATED, "{}", copy.body);
-    assert_eq!(copy.body["song_count"], 2);
-
-    // Leaving takes the guest's songs out of the setlist.
+    // Leaving keeps the guest's song in the setlist, held by it: same
+    // place, key and attribution, in no one's library.
     let left = app
         .delete(
             &format!("/setlists/{setlist}/collaborators/{guest_id}"),
@@ -310,14 +304,194 @@ async fn songs_record_who_added_them_and_leave_with_their_owner() {
         )
         .await;
     assert_eq!(left.status, StatusCode::NO_CONTENT);
-    let after = app.get(&format!("/setlists/{setlist}/songs"), &owner).await;
-    assert_eq!(after.body["meta"]["total_items"], 1, "{}", after.body);
     assert_eq!(
         app.get(&format!("/setlists/{setlist}"), &guest)
             .await
             .status,
         StatusCode::NOT_FOUND
     );
+    let items = app.get(&format!("/setlists/{setlist}/items"), &owner).await;
+    let songs: Vec<_> = items
+        .body
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["item_type"] == "song")
+        .map(|i| i["song"].clone())
+        .collect();
+    assert_eq!(songs.len(), 2, "{}", items.body);
+    assert_eq!(songs[0]["id"], mine.as_str());
+    assert!(songs[0].get("held").is_none());
+    assert_eq!(songs[1]["title"], "Dele");
+    assert_eq!(songs[1]["held"], true);
+    assert_eq!(songs[1]["added_by_username"], "voz");
+    assert_ne!(songs[1]["id"], theirs.as_str());
+    let setlist_row = app.get(&format!("/setlists/{setlist}"), &owner).await;
+    assert_eq!(setlist_row.body["song_count"], 2);
+
+    // It went to nobody's library.
+    let library = app.get("/songs", &owner).await;
+    assert_eq!(library.body["meta"]["total_items"], 1, "{}", library.body);
+
+    // Held songs are reordered, retuned and removed like any other.
+    let held_id = songs[1]["id"].as_str().unwrap().to_string();
+    let key = app
+        .patch(
+            &format!("/setlists/{setlist}/songs/{held_id}"),
+            &owner,
+            json!({ "transpose": -2 }),
+        )
+        .await;
+    assert_eq!(key.status, StatusCode::NO_CONTENT, "{}", key.body);
+    let reorder = app
+        .patch(
+            &format!("/setlists/{setlist}/songs/reorder"),
+            &owner,
+            json!({ "song_ids": [held_id, mine] }),
+        )
+        .await;
+    assert_eq!(reorder.status, StatusCode::OK, "{}", reorder.body);
+    let listed = app.get(&format!("/setlists/{setlist}/songs"), &owner).await;
+    assert_eq!(listed.body["data"][0]["id"], held_id.as_str());
+    assert_eq!(listed.body["data"][0]["transpose"], -2);
+
+    // Duplicating keeps the held song held (not added to a library).
+    let copy = app
+        .post(&format!("/setlists/{setlist}/duplicate"), &owner, json!({}))
+        .await;
+    assert_eq!(copy.status, StatusCode::CREATED, "{}", copy.body);
+    assert_eq!(copy.body["song_count"], 2);
+    assert_eq!(
+        app.get("/songs", &owner).await.body["meta"]["total_items"],
+        1
+    );
+
+    let removed = app
+        .delete(&format!("/setlists/{setlist}/songs/{held_id}"), &owner)
+        .await;
+    assert_eq!(removed.status, StatusCode::NO_CONTENT);
+    let after = app.get(&format!("/setlists/{setlist}/songs"), &owner).await;
+    assert_eq!(after.body["meta"]["total_items"], 1, "{}", after.body);
+}
+
+#[tokio::test]
+async fn copying_a_held_song_puts_it_in_the_library_on_request() {
+    let app = app!();
+    let (_, owner) = app.user("guitarra", Role::User).await;
+    let (guest_id, guest) = app.user("cantora", Role::User).await;
+    let (_, viewer) = app.user("plateia", Role::User).await;
+    let setlist = app.setlist(&owner, "Casamento", None).await;
+    collaborate(&app, &owner, &guest, "cantora", &setlist, "editor").await;
+    collaborate(&app, &owner, &viewer, "plateia", &setlist, "viewer").await;
+    let theirs = app.song_id(&guest, "Artista", "Da cantora").await;
+    app.post(
+        &format!("/setlists/{setlist}/songs"),
+        &guest,
+        json!({ "song_id": theirs }),
+    )
+    .await;
+
+    // While she collaborates, anyone may copy her song for themselves.
+    let viewer_copy = app
+        .post(
+            &format!("/setlists/{setlist}/songs/{theirs}/copy"),
+            &viewer,
+            json!({}),
+        )
+        .await;
+    assert_eq!(
+        viewer_copy.status,
+        StatusCode::CREATED,
+        "{}",
+        viewer_copy.body
+    );
+    assert_eq!(viewer_copy.body["adopted"], false);
+    assert_eq!(
+        app.get("/songs", &viewer).await.body["meta"]["total_items"],
+        1
+    );
+    let own = app
+        .post(
+            &format!("/setlists/{setlist}/songs/{theirs}/copy"),
+            &guest,
+            json!({}),
+        )
+        .await;
+    assert_eq!(own.status, StatusCode::CONFLICT);
+    assert_eq!(own.code(), "SONG_ALREADY_IN_LIBRARY");
+
+    app.delete(
+        &format!("/setlists/{setlist}/collaborators/{guest_id}"),
+        &owner,
+    )
+    .await;
+    let held = app.get(&format!("/setlists/{setlist}/songs"), &owner).await;
+    let held_id = held.body["data"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(held.body["data"][0]["held"], true);
+
+    // The owner adopts it: it joins their library and the setlist links it.
+    let adopted = app
+        .post(
+            &format!("/setlists/{setlist}/songs/{held_id}/copy"),
+            &owner,
+            json!({}),
+        )
+        .await;
+    assert_eq!(adopted.status, StatusCode::CREATED, "{}", adopted.body);
+    assert_eq!(adopted.body["adopted"], true);
+    let copy_id = adopted.body["song_id"].as_str().unwrap().to_string();
+    let songs = app.get(&format!("/setlists/{setlist}/songs"), &owner).await;
+    assert_eq!(songs.body["meta"]["total_items"], 1);
+    assert_eq!(songs.body["data"][0]["id"], copy_id.as_str());
+    assert!(songs.body["data"][0].get("held").is_none());
+    assert_eq!(songs.body["data"][0]["added_by_username"], "cantora");
+    assert_eq!(
+        app.get(&format!("/songs/{copy_id}"), &owner).await.status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn trashing_or_deleting_the_account_keeps_contributed_songs_held() {
+    let app = app!();
+    let (_, owner) = app.user("teclado", Role::User).await;
+    let (guest_id, guest) = app.user("baterista", Role::User).await;
+    let setlist = app.setlist(&owner, "Festival", None).await;
+    collaborate(&app, &owner, &guest, "baterista", &setlist, "editor").await;
+    let first = app.song_id(&guest, "Banda A", "Primeira").await;
+    let second = app.song_id(&guest, "Banda B", "Segunda").await;
+    for song in [&first, &second] {
+        app.post(
+            &format!("/setlists/{setlist}/songs"),
+            &guest,
+            json!({ "song_id": song }),
+        )
+        .await;
+    }
+
+    // Trashing her song: the setlist keeps it.
+    let trashed = app.delete(&format!("/songs/{first}"), &guest).await;
+    assert_eq!(trashed.status, StatusCode::NO_CONTENT, "{}", trashed.body);
+    let songs = app.get(&format!("/setlists/{setlist}/songs"), &owner).await;
+    assert_eq!(songs.body["meta"]["total_items"], 2, "{}", songs.body);
+    assert_eq!(songs.body["data"][0]["title"], "Primeira");
+    assert_eq!(songs.body["data"][0]["held"], true);
+
+    // Deleting her account: the setlist keeps the rest too.
+    app.state.user_repo.delete(guest_id).await.unwrap();
+    let songs = app.get(&format!("/setlists/{setlist}/songs"), &owner).await;
+    assert_eq!(songs.body["meta"]["total_items"], 2, "{}", songs.body);
+    assert_eq!(songs.body["data"][1]["title"], "Segunda");
+    assert_eq!(songs.body["data"][1]["held"], true);
+
+    // Deleting the setlist takes its held songs with it.
+    let setlist_uuid: uuid::Uuid = setlist.parse().unwrap();
+    app.state.setlist_repo.delete(setlist_uuid).await.unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM setlist_held_songs")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
 }
 
 #[tokio::test]

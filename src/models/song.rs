@@ -830,6 +830,10 @@ pub struct SongExport {
     pub energy: Option<i16>,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// A [`Song`] with its artist's name resolved via a join, so callers don't
 /// need a separate (and possibly ownership-scoped) artist lookup to display
 /// it — e.g. a band setlist can contain songs owned by different members,
@@ -893,6 +897,13 @@ pub struct SongWithArtist {
     #[sqlx(default)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added_at: Option<NaiveDateTime>,
+    /// Songs read as part of a setlist: `true` when the setlist holds the
+    /// song itself — a contributor's song kept after they left — rather
+    /// than linking a library's song (see `0018_setlist_held_songs.sql`).
+    /// It belongs to no library, and its `artist_id` is nil.
+    #[sqlx(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub held: bool,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }

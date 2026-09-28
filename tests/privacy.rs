@@ -203,6 +203,7 @@ async fn every_reference_to_an_account_is_exported_or_excluded_on_purpose() {
         // setlist's content rather than the account's.
         "setlist_collaborators.invited_by",
         "setlist_songs.added_by",
+        "setlist_held_songs.added_by",
         // Covered through `referrals` (`referrals_made` / `referred`).
         "users.referred_by",
         // Second-factor material: secrets, never exported (the account's

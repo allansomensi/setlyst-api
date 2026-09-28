@@ -1,4 +1,5 @@
 use crate::database::repositories::quota_repository::QuotaGuard;
+use crate::database::repositories::setlist_repository::detach_contributed_songs;
 use crate::{
     errors::api_error::ApiError,
     models::artist::{Artist, CreateArtistPayload, UpdateArtistPayload},
@@ -212,6 +213,24 @@ impl ArtistRepository for ArtistRepositoryImpl {
         .await?;
         if result.rows_affected() == 0 {
             return Err(ApiError::NotFound);
+        }
+
+        // Its songs in setlists shared with its owner stay in them, held
+        // by each setlist (see `detach_contributed_songs`).
+        let personal: Option<(Uuid, Vec<Uuid>)> = sqlx::query_as(
+            "SELECT a.user_id, COALESCE(array_agg(s.id) FILTER (WHERE s.id IS NOT NULL), '{}')
+             FROM artists a
+             LEFT JOIN songs s ON s.artist_id = a.id AND s.deleted_at IS NULL
+             WHERE a.id = $1 AND a.band_id IS NULL
+             GROUP BY a.user_id",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((owner_id, song_ids)) = personal
+            && !song_ids.is_empty()
+        {
+            detach_contributed_songs(&mut tx, owner_id, None, Some(&song_ids)).await?;
         }
 
         let songs = sqlx::query(

@@ -139,6 +139,17 @@ pub enum BandCopyOutcome {
     Outdated,
 }
 
+/// `POST /setlists/{id}/songs/{song_id}/copy`.
+#[derive(ToSchema, Debug, Clone, Serialize, Deserialize)]
+pub struct CopiedSetlistSong {
+    /// The song in the caller's library: the new copy, or an identical
+    /// song they already had.
+    pub song_id: Uuid,
+    /// The setlist was holding the song and the caller owns it: the
+    /// setlist now links the copy instead.
+    pub adopted: bool,
+}
+
 /// `POST /setlists/{id}/songs`.
 #[derive(ToSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct AddedSetlistSong {
