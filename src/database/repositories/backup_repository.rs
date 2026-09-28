@@ -3,11 +3,12 @@ use crate::{
     errors::api_error::{ApiError, codes},
     models::{
         backup::{
-            BACKUP_FORMAT_VERSION, BackupArtist, BackupFile, BackupGig, BackupSetlist,
-            BackupSetlistSong, BackupSong, BackupTour, ImportSummary,
+            BACKUP_FORMAT_VERSION, BackupArtist, BackupFile, BackupGig, BackupKind, BackupMarker,
+            BackupSetlist, BackupSetlistSong, BackupSong, BackupTour, ImportSummary,
         },
         link::{LinkInput, StoredLink},
         quota::{QuotaLimits, QuotaResource},
+        setlist::{Setlist, SetlistItem, SetlistMarkerType},
         song::clean_text,
     },
     validations::{link::normalize_links, tag::normalize_tags},
@@ -64,6 +65,15 @@ struct SetlistSongRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct MarkerRow {
+    setlist_id: Uuid,
+    marker_type: SetlistMarkerType,
+    label: Option<String>,
+    duration_minutes: Option<i32>,
+    position: i32,
+}
+
+#[derive(sqlx::FromRow)]
 struct GigRow {
     id: Uuid,
     venue: String,
@@ -94,12 +104,34 @@ fn to_inputs(links: Vec<StoredLink>) -> Vec<LinkInput> {
         .collect()
 }
 
+fn link_inputs(links: &crate::models::link::Links) -> Vec<LinkInput> {
+    links
+        .0
+        .iter()
+        .map(|l| LinkInput {
+            url: l.url.clone(),
+            label: l.label.clone(),
+        })
+        .collect()
+}
+
 #[async_trait::async_trait]
 pub trait BackupRepository: Send + Sync {
     /// Collects all of a user's live personal artists, songs, setlists,
     /// gigs and tours and returns them as a portable, self-contained
     /// [`BackupFile`].
     async fn export(&self, user_id: Uuid) -> Result<BackupFile, ApiError>;
+
+    /// One setlist as a file of its own (`kind: "setlist"`): the setlist
+    /// with its blocks and breaks, every song in it (whoever's library it
+    /// comes from, held songs included) with its harmonic analysis, and
+    /// the artists they need. Imported with the same rules as a backup, it
+    /// gives someone without any of it the same setlist.
+    async fn export_setlist(
+        &self,
+        setlist: &Setlist,
+        items: Vec<SetlistItem>,
+    ) -> Result<BackupFile, ApiError>;
 
     /// Atomically imports a [`BackupFile`] (current or older version) into
     /// the target user's account.
@@ -216,6 +248,31 @@ impl BackupRepository for BackupRepositoryImpl {
             .await?
         };
 
+        let marker_rows: Vec<MarkerRow> = if setlist_ids.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query_as::<_, MarkerRow>(
+                "SELECT setlist_id, marker_type, label, duration_minutes, position
+                 FROM setlist_markers WHERE setlist_id = ANY($1)
+                 ORDER BY setlist_id, position ASC",
+            )
+            .bind(&setlist_ids)
+            .fetch_all(&self.db)
+            .await?
+        };
+        let mut markers_by_setlist: HashMap<Uuid, Vec<BackupMarker>> = HashMap::new();
+        for row in marker_rows {
+            markers_by_setlist
+                .entry(row.setlist_id)
+                .or_default()
+                .push(BackupMarker {
+                    marker_type: row.marker_type,
+                    label: row.label,
+                    duration_minutes: row.duration_minutes,
+                    position: row.position,
+                });
+        }
+
         let mut songs_by_setlist: HashMap<Uuid, Vec<BackupSetlistSong>> = HashMap::new();
         for row in setlist_song_rows {
             songs_by_setlist
@@ -268,6 +325,7 @@ impl BackupRepository for BackupRepositoryImpl {
                 description: r.description,
                 songs: songs_by_setlist.remove(&r.id).unwrap_or_default(),
                 links: to_inputs(r.links.0),
+                markers: markers_by_setlist.remove(&r.id).unwrap_or_default(),
             })
             .collect();
 
@@ -298,6 +356,7 @@ impl BackupRepository for BackupRepositoryImpl {
 
         Ok(BackupFile {
             version: BACKUP_FORMAT_VERSION,
+            kind: BackupKind::Backup,
             exported_at: Utc::now().naive_utc(),
             artists,
             songs,
@@ -305,6 +364,34 @@ impl BackupRepository for BackupRepositoryImpl {
             gigs,
             tours,
         })
+    }
+
+    async fn export_setlist(
+        &self,
+        setlist: &Setlist,
+        items: Vec<SetlistItem>,
+    ) -> Result<BackupFile, ApiError> {
+        let song_ids: Vec<Uuid> = items
+            .iter()
+            .filter_map(|item| match item {
+                SetlistItem::Song { song, .. } if !song.held => Some(song.id),
+                _ => None,
+            })
+            .collect();
+        let analyses: HashMap<Uuid, serde_json::Value> = if song_ids.is_empty() {
+            HashMap::new()
+        } else {
+            sqlx::query_as::<_, (Uuid, sqlx::types::Json<serde_json::Value>)>(
+                "SELECT song_id, content FROM song_analyses WHERE song_id = ANY($1)",
+            )
+            .bind(&song_ids)
+            .fetch_all(&self.db)
+            .await?
+            .into_iter()
+            .map(|(id, content)| (id, content.0))
+            .collect()
+        };
+        Ok(setlist_file(setlist, items, analyses))
     }
 
     async fn import(
@@ -330,7 +417,7 @@ impl BackupRepository for BackupRepositoryImpl {
         if let Some(limits) = limits {
             for setlist in &backup.setlists {
                 let distinct: HashSet<Uuid> = setlist.songs.iter().map(|s| s.song_id).collect();
-                if distinct.len() as i64 > limits.setlist_items {
+                if (distinct.len() + setlist.markers.len()) as i64 > limits.setlist_items {
                     return Err(ApiError::quota_exceeded(
                         "setlist_items",
                         limits.setlist_items,
@@ -602,11 +689,53 @@ impl BackupRepository for BackupRepositoryImpl {
         let mut setlist_id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(backup.setlists.len());
         let mut setlist_rows = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut entries = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut markers = (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut created_setlists = Vec::with_capacity(backup.setlists.len());
+        // A title already in the account (the same setlist imported twice,
+        // a restore into the account it came from) becomes "<title> (2)",
+        // as when duplicating a setlist.
+        let mut taken_titles: HashSet<String> = sqlx::query_scalar::<_, String>(
+            "SELECT title FROM setlists
+             WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .collect();
         for (setlist, links) in backup.setlists.iter().zip(setlist_links) {
             let new_setlist_id = Uuid::new_v4();
             setlist_id_map.insert(setlist.id, new_setlist_id);
+            created_setlists.push(new_setlist_id);
+            for marker in &setlist.markers {
+                markers.0.push(Uuid::new_v4());
+                markers.1.push(new_setlist_id);
+                markers.2.push(marker.marker_type);
+                markers.3.push(
+                    marker
+                        .label
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .map(str::to_string),
+                );
+                markers.4.push(match marker.marker_type {
+                    SetlistMarkerType::Break => marker.duration_minutes,
+                    SetlistMarkerType::Block => None,
+                });
+                markers.5.push(marker.position);
+            }
             setlist_rows.0.push(new_setlist_id);
-            setlist_rows.1.push(setlist.title.trim().to_string());
+            setlist_rows
+                .1
+                .push(free_title(setlist.title.trim(), &mut taken_titles));
             setlist_rows.2.push(
                 setlist
                     .description
@@ -684,6 +813,23 @@ impl BackupRepository for BackupRepositoryImpl {
             .bind(&entries.1)
             .bind(&entries.2)
             .bind(&entries.3)
+            .execute(&mut *tx)
+            .await?;
+        }
+        if !markers.0.is_empty() {
+            sqlx::query(
+                "INSERT INTO setlist_markers (id, setlist_id, marker_type, label, duration_minutes, position, created_at)
+                 SELECT t.id, t.setlist_id, t.marker_type, t.label, t.duration_minutes, t.position, $7
+                 FROM UNNEST($1::uuid[], $2::uuid[], $3::setlist_marker_type[], $4::text[], $5::int[], $6::int[])
+                      AS t(id, setlist_id, marker_type, label, duration_minutes, position)",
+            )
+            .bind(&markers.0)
+            .bind(&markers.1)
+            .bind(&markers.2)
+            .bind(&markers.3)
+            .bind(&markers.4)
+            .bind(&markers.5)
+            .bind(now)
             .execute(&mut *tx)
             .await?;
         }
@@ -784,7 +930,132 @@ impl BackupRepository for BackupRepositoryImpl {
             gigs_imported: backup.gigs.len(),
             tours_imported: tours.len(),
             skipped_tours,
+            setlist_ids: created_setlists,
         })
+    }
+}
+
+/// `title`, or the first of "<title> (2)", "<title> (3)", ... not in
+/// `taken` (which it then joins).
+fn free_title(title: &str, taken: &mut HashSet<String>) -> String {
+    let mut candidate = title.to_string();
+    let base: String = title.chars().take(240).collect();
+    let mut suffix = 2;
+    while taken.contains(&candidate) && suffix <= 1_000 {
+        candidate = format!("{base} ({suffix})");
+        suffix += 1;
+    }
+    taken.insert(candidate.clone());
+    candidate
+}
+
+/// Builds the file of [`BackupRepository::export_setlist`] from the
+/// setlist's running order. Artists are keyed by name (a held song keeps
+/// only its artist's name), and a song's `version_of` is kept only when the
+/// original is in the setlist too.
+pub fn setlist_file(
+    setlist: &Setlist,
+    items: Vec<SetlistItem>,
+    mut analyses: HashMap<Uuid, serde_json::Value>,
+) -> BackupFile {
+    let mut artists: Vec<BackupArtist> = Vec::new();
+    let mut artist_by_name: HashMap<String, Uuid> = HashMap::new();
+    let mut songs: Vec<BackupSong> = Vec::new();
+    let mut entries: Vec<BackupSetlistSong> = Vec::new();
+    let mut markers: Vec<BackupMarker> = Vec::new();
+
+    for item in items {
+        match item {
+            SetlistItem::Song { position, song } => {
+                let song = *song;
+                let name = song.artist_name.trim().to_string();
+                let artist_id = *artist_by_name
+                    .entry(name.to_lowercase())
+                    .or_insert_with(|| {
+                        let id = Uuid::new_v4();
+                        artists.push(BackupArtist {
+                            id,
+                            name: name.clone(),
+                        });
+                        id
+                    });
+                entries.push(BackupSetlistSong {
+                    song_id: song.id,
+                    position,
+                    transpose: song.transpose.unwrap_or(0),
+                });
+                let analysis = if song.held {
+                    None
+                } else {
+                    analyses.remove(&song.id)
+                };
+                songs.push(BackupSong {
+                    id: song.id,
+                    title: song.title,
+                    artist_id,
+                    tempo: song.tempo,
+                    lyrics: song.lyrics,
+                    tonality: song.tonality,
+                    genre: song.genre,
+                    duration: song.duration,
+                    tags: song.tags,
+                    energy: song.energy,
+                    time_signature: song.time_signature,
+                    capo: song.capo,
+                    tuning: song.tuning,
+                    performance_notes: song.performance_notes,
+                    links: link_inputs(&song.links),
+                    version_label: song.version_label,
+                    version_of: song.version_of,
+                    analysis,
+                });
+            }
+            SetlistItem::Block { position, name, .. } => markers.push(BackupMarker {
+                marker_type: SetlistMarkerType::Block,
+                label: Some(name),
+                duration_minutes: None,
+                position,
+            }),
+            SetlistItem::Break {
+                position,
+                label,
+                duration_minutes,
+                ..
+            } => markers.push(BackupMarker {
+                marker_type: SetlistMarkerType::Break,
+                label,
+                duration_minutes,
+                position,
+            }),
+        }
+    }
+
+    let in_file: HashSet<Uuid> = songs.iter().map(|s| s.id).collect();
+    for song in &mut songs {
+        if song
+            .version_of
+            .is_some_and(|original| !in_file.contains(&original))
+        {
+            song.version_of = None;
+        }
+    }
+
+    BackupFile {
+        version: BACKUP_FORMAT_VERSION,
+        kind: BackupKind::Setlist,
+        exported_at: Utc::now().naive_utc(),
+        artists,
+        songs,
+        setlists: vec![BackupSetlist {
+            id: setlist.id,
+            title: setlist.title.clone(),
+            description: setlist.description.clone(),
+            songs: entries,
+            links: link_inputs(&setlist.links),
+            markers,
+        }],
+        gigs: Vec::new(),
+        tours: Vec::new(),
     }
 }
 

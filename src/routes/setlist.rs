@@ -1,10 +1,11 @@
 use crate::{
-    controllers::{setlist, setlist_collaborator},
+    controllers::{backup, setlist, setlist_collaborator},
     database::AppState,
     middlewares::client_ip::ClientIpKeyExtractor,
 };
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{delete, get, patch},
 };
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
@@ -18,6 +19,13 @@ pub fn create_routes(state: AppState) -> Router {
                 .delete(setlist::delete_setlist),
         )
         .route("/{id}/export/pdf", get(setlist::export_setlist_pdf))
+        .route("/{id}/export", get(backup::export_setlist))
+        // A setlist file carries its songs' lyrics: a large upload.
+        .route(
+            "/import",
+            axum::routing::post(backup::import_setlist)
+                .layer(DefaultBodyLimit::max(crate::routes::MAX_IMPORT_BODY_BYTES)),
+        )
         .route(
             "/{id}/share",
             axum::routing::post(setlist::enable_setlist_sharing)

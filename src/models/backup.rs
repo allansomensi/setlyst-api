@@ -1,5 +1,6 @@
 use crate::models::gig::GigStatus;
 use crate::models::link::LinkInput;
+use crate::models::setlist::SetlistMarkerType;
 use crate::models::song::{
     Genre, Tonality, validate_performance_notes, validate_time_signature, validate_tuning,
 };
@@ -19,12 +20,28 @@ use uuid::Uuid;
 /// - 3: song versions (`version_label`, `version_of`) and the key each
 ///   setlist plays a song in (`transpose`). Optional as well.
 /// - 4: each song's harmonic analysis (`analysis`). Optional as well.
-pub const BACKUP_FORMAT_VERSION: u32 = 4;
+/// - 5: each setlist's blocks and breaks (`markers`), and a file holding a
+///   single setlist (`GET /setlists/{id}/export`, `kind: "setlist"`).
+///   Optional as well.
+pub const BACKUP_FORMAT_VERSION: u32 = 5;
+
+/// What a file holds: a whole account, or one setlist with the songs and
+/// artists it needs (since version 5; older files are backups).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum BackupKind {
+    #[default]
+    Backup,
+    Setlist,
+}
 
 /// A fully self-contained, portable snapshot of a user's data.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct BackupFile {
     pub version: u32,
+    /// Since version 5.
+    #[serde(default)]
+    pub kind: BackupKind,
     pub exported_at: NaiveDateTime,
     pub artists: Vec<BackupArtist>,
     pub songs: Vec<BackupSong>,
@@ -104,6 +121,23 @@ pub struct BackupSetlist {
     /// Since version 2.
     #[serde(default)]
     pub links: Vec<LinkInput>,
+    /// Since version 5: block headers and breaks, in the same position
+    /// space as `songs`.
+    #[serde(default)]
+    pub markers: Vec<BackupMarker>,
+}
+
+/// A block header or a break inside a backed-up setlist.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct BackupMarker {
+    pub marker_type: SetlistMarkerType,
+    /// The block's name (required for blocks) or the break's label.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Breaks only.
+    #[serde(default)]
+    pub duration_minutes: Option<i32>,
+    pub position: i32,
 }
 
 /// A song reference within a setlist, preserving its display position.
@@ -153,6 +187,10 @@ pub struct ImportSummary {
     /// `tours` feature (their gigs are imported without a tour).
     #[serde(default)]
     pub skipped_tours: usize,
+    /// The setlists created, in the file's order (since version 5): where
+    /// to go after importing a shared setlist.
+    #[serde(default)]
+    pub setlist_ids: Vec<Uuid>,
 }
 
 /// Largest number of records of each kind a single backup may carry.
@@ -285,6 +323,38 @@ impl BackupFile {
             }
             if setlist.songs.len() > MAX_BACKUP_RECORDS {
                 return Err(format!("\"{}\" has too many songs.", setlist.title));
+            }
+            if setlist.markers.len() > MAX_BACKUP_RECORDS {
+                return Err(format!(
+                    "\"{}\" has too many blocks and breaks.",
+                    setlist.title
+                ));
+            }
+            for marker in &setlist.markers {
+                if !(0..=MAX_BACKUP_POSITION).contains(&marker.position) {
+                    return Err(format!(
+                        "\"{}\" has a block or break position outside 0..={MAX_BACKUP_POSITION}.",
+                        setlist.title
+                    ));
+                }
+                let label = marker.label.as_deref().map(str::trim).unwrap_or_default();
+                let valid = match marker.marker_type {
+                    SetlistMarkerType::Block => {
+                        bounded(label, 255) && marker.duration_minutes.is_none()
+                    }
+                    SetlistMarkerType::Break => {
+                        label.chars().count() <= 255
+                            && marker
+                                .duration_minutes
+                                .is_none_or(|d| (0..=1440).contains(&d))
+                    }
+                };
+                if !valid {
+                    return Err(format!(
+                        "\"{}\" has an invalid block or break.",
+                        setlist.title
+                    ));
+                }
             }
             // Positions are appended to (`MAX(position) + 1`) later on; a
             // value near `i32::MAX` would make every later add overflow.

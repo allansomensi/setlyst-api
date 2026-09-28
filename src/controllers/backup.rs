@@ -1,13 +1,16 @@
 use crate::{
     database::AppState,
     errors::api_error::{ApiError, codes},
-    models::{auth::access::AccessControl, backup::BackupFile},
+    models::{
+        auth::access::AccessControl,
+        backup::{BackupFile, BackupKind},
+    },
     services::entitlements::{Feature, has_feature},
     utils::rate_limit::presets,
 };
 use axum::{
     Json,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
 };
@@ -15,6 +18,7 @@ use serde_json::json;
 use std::{sync::LazyLock, time::Duration};
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 /// Bulk imports and exports (backups, the whole ChordPro library) running
 /// at once, process-wide: each holds a pooled connection for a long time
@@ -197,6 +201,165 @@ pub async fn import_backup(
         }
         Err(e) => {
             error!(%user_id, error = %e, "Failed to import backup");
+            Err(e)
+        }
+    }
+}
+
+/// A JSON download (`attachment`, RFC 5987 file name).
+fn json_attachment(filename: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    if let Ok(disposition) =
+        HeaderValue::from_str(&crate::export::pdf::content_disposition(filename))
+    {
+        headers.insert(header::CONTENT_DISPOSITION, disposition);
+    }
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/setlists/{id}/export",
+    tags = ["Setlists"],
+    summary = "Export a setlist as a file.",
+    description = "Returns a downloadable JSON file (the backup format, `kind: \"setlist\"`) holding \
+                   the setlist — title, description, links, blocks, breaks and the key each song \
+                   is played in — with every song in it (lyrics, chords, BPM, key, tags, notes, \
+                   links and harmonic analysis) and their artists. Imported with \
+                   `POST /setlists/import`, it gives any account the same setlist, even one that \
+                   has none of its songs or artists.\n\n\
+                   Allowed to whoever may export the setlist to PDF (its owner, its \
+                   collaborators, band members with the band's `export_pdf` permission). At most \
+                   30 per hour (`TOO_MANY_ATTEMPTS`, 429). Refused under impersonation \
+                   (`IMPERSONATION_READ_ONLY`).",
+    params(("id" = Uuid, Path, description = "The ID of the setlist")),
+    security(("jwt_token" = [])),
+    responses(
+        (status = 200, description = "The setlist file.", content_type = "application/json", body = BackupFile),
+        (status = 403, description = "Not allowed to export this setlist."),
+        (status = 404, description = "Setlist not found."),
+        (status = 429, description = "Too many exports.")
+    )
+)]
+pub async fn export_setlist(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
+    debug!(%user_id, setlist_id = %id, "Processing request to export setlist file");
+
+    if access.impersonator().is_some() {
+        return Err(ApiError::impersonation_read_only());
+    }
+    presets::limit(&presets::SETLIST_EXPORT, user_id)?;
+    state.setlist_repo.can_export_pdf(id, user_id).await?;
+
+    let setlist = state
+        .setlist_repo
+        .find_by_id(id, user_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let items = state
+        .setlist_repo
+        .get_items_capped(id, crate::controllers::setlist::MAX_LISTED_ITEMS)
+        .await?;
+    let file = state.backup_repo.export_setlist(&setlist, items).await?;
+
+    let filename = crate::export::pdf::slug_filename("setlist", &setlist.title, "setlyst.json");
+
+    info!(
+        %user_id,
+        setlist_id = %id,
+        songs = file.songs.len(),
+        "Setlist file exported successfully"
+    );
+
+    Ok((StatusCode::OK, json_attachment(&filename), Json(file)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/setlists/import",
+    tags = ["Setlists"],
+    summary = "Import a setlist file.",
+    description = "Accepts a file from `GET /setlists/{id}/export` and creates the setlist in the \
+                   caller's personal setlists, with its blocks, breaks and keys.\n\n\
+                   Same merge rules as a backup import: artists already in the account under the \
+                   same name are reused, and so are songs with the same title, artist and version \
+                   name (keeping their own lyrics and analysis); everything else is created. A \
+                   title already taken gets a suffix (\"Show (2)\"). The answer's `setlist_ids` \
+                   holds the new setlist.\n\n\
+                   The file must be a setlist file (`kind: \"setlist\"`) holding exactly one \
+                   setlist and no gigs or tours (`400`). Quotas \
+                   apply (`QUOTA_EXCEEDED`), and the whole import is atomic. Needs a verified \
+                   e-mail address (`EMAIL_NOT_VERIFIED`, 403); at most 10 per hour \
+                   (`TOO_MANY_ATTEMPTS`, 429); `IMPORT_IN_PROGRESS` (409) and `SERVICE_BUSY` (503) \
+                   as for backups. Bodies up to 10 MB.",
+    request_body = BackupFile,
+    security(("jwt_token" = [])),
+    responses(
+        (status = 201, description = "Setlist imported.", body = crate::models::backup::ImportSummary),
+        (status = 400, description = "Invalid file, or not a setlist file."),
+        (status = 403, description = "Quota exceeded, or e-mail not verified."),
+        (status = 409, description = "Another import is running for this account."),
+        (status = 429, description = "Too many imports.")
+    )
+)]
+pub async fn import_setlist(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Json(payload): Json<BackupFile>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = access.user_id();
+
+    debug!(
+        %user_id,
+        songs = payload.songs.len(),
+        "Processing request to import a setlist file"
+    );
+
+    // A backup (older files carry no `kind`) would bring a whole library.
+    if payload.kind != BackupKind::Setlist {
+        return Err(ApiError::BadRequest(
+            "This is a full backup, not a setlist file. Import it from the backup settings."
+                .to_string(),
+        ));
+    }
+    if payload.setlists.len() != 1 || !payload.gigs.is_empty() || !payload.tours.is_empty() {
+        return Err(ApiError::BadRequest(
+            "A setlist file holds exactly one setlist and no gigs or tours.".to_string(),
+        ));
+    }
+
+    crate::services::account::require_verified_email(&state, user_id).await?;
+    presets::limit(&presets::SETLIST_IMPORT, user_id)?;
+
+    let limits = state.quota_repo.effective_limits(user_id).await?;
+
+    let _slot = bulk_slot().await?;
+    match state
+        .backup_repo
+        .import(user_id, payload, limits, false)
+        .await
+    {
+        Ok(summary) => {
+            info!(
+                %user_id,
+                songs_imported = summary.songs_imported,
+                setlist_ids = ?summary.setlist_ids,
+                "Setlist file imported successfully"
+            );
+            Ok((StatusCode::CREATED, Json(summary)))
+        }
+        Err(e) => {
+            error!(%user_id, error = %e, "Failed to import setlist file");
             Err(e)
         }
     }
