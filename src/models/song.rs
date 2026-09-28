@@ -503,6 +503,12 @@ pub struct Song {
     /// [`SongOrigin`]). `None` for personal songs.
     #[sqlx(default)]
     pub source_synced_at: Option<NaiveDateTime>,
+    /// `GET /songs`: how many live songs its version family holds (the
+    /// original and its versions, this one included); 1 for a song with no
+    /// versions. Absent elsewhere.
+    #[sqlx(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_count: Option<i64>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -752,6 +758,7 @@ impl Song {
             updated_by: None,
             updated_by_username: None,
             is_pinned: false,
+            version_count: None,
             source_synced_at: None,
             created_at: now,
             updated_at: now,
@@ -795,6 +802,7 @@ impl Song {
             updated_by: None,
             updated_by_username: None,
             is_pinned: false,
+            version_count: None,
             source_synced_at: Some(now),
             created_at: now,
             updated_at: now,

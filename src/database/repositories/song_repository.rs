@@ -255,7 +255,10 @@ impl SongRepository for SongRepositoryImpl {
         let songs = sqlx::query_as::<_, Song>(concat!(
             "SELECT ",
             song_columns!(),
-            ", a.name AS artist_name
+            ", a.name AS artist_name,
+             (SELECT COUNT(*) FROM songs v
+              WHERE (v.id = COALESCE(s.version_of, s.id) OR v.version_of = COALESCE(s.version_of, s.id))
+                AND v.user_id = s.user_id AND v.band_id IS NULL AND v.deleted_at IS NULL) AS version_count
              FROM songs s
              INNER JOIN artists a ON a.id = s.artist_id
              WHERE s.user_id = $1 AND s.band_id IS NULL AND s.deleted_at IS NULL

@@ -320,3 +320,60 @@ async fn backups_keep_versions_and_keys() {
         .await;
     assert_eq!(entries.body["data"][0]["transpose"], 5);
 }
+
+#[tokio::test]
+async fn the_song_list_counts_each_version_family() {
+    let app = app!();
+    let (_, user) = app.user("contagem", Role::User).await;
+    let artist = app.artist(&user, "Artista").await;
+    let original = app.song_id(&user, "Artista", "Canção").await;
+    app.song_id(&user, "Artista", "Sozinha").await;
+    for label in ["Acústica", "Simplificada"] {
+        let version = app
+            .post(
+                "/songs",
+                &user,
+                json!({
+                    "title": "Canção",
+                    "artist_id": artist,
+                    "version_of": original,
+                    "version_label": label
+                }),
+            )
+            .await;
+        assert_eq!(version.status, StatusCode::CREATED, "{}", version.body);
+    }
+
+    let list = app.get("/songs", &user).await;
+    let songs = list.body["data"].as_array().unwrap();
+    let count_of = |title: &str, label: Option<&str>| {
+        songs
+            .iter()
+            .find(|s| s["title"] == title && s["version_label"].as_str() == label)
+            .map(|s| s["version_count"].clone())
+            .unwrap()
+    };
+    // Every member of the family reports its size; a lone song, 1.
+    assert_eq!(count_of("Canção", None), 3);
+    assert_eq!(count_of("Canção", Some("Acústica")), 3);
+    assert_eq!(count_of("Sozinha", None), 1);
+
+    // A version in the trash doesn't count.
+    let acoustic = songs
+        .iter()
+        .find(|s| s["version_label"] == "Acústica")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    app.delete(&format!("/songs/{acoustic}"), &user).await;
+    let list = app.get("/songs", &user).await;
+    let original_row = list.body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["title"] == "Canção" && s["version_label"].is_null())
+        .unwrap()
+        .clone();
+    assert_eq!(original_row["version_count"], 2);
+}
