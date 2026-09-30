@@ -138,7 +138,7 @@ pub struct DefaultModerationService {
 impl DefaultModerationService {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::builder()
+            http: crate::utils::http::client_builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .unwrap_or_default(),

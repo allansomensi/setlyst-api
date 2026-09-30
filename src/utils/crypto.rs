@@ -24,12 +24,18 @@ use base64::{
 };
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use rand::{RngCore, rngs::OsRng};
+use rand::{Rng, rand_core::UnwrapErr, rngs::SysRng};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tracing::error;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// The operating system's CSPRNG as an infallible generator (a failure to
+/// read entropy is not something to carry on from).
+pub fn os_rng() -> UnwrapErr<SysRng> {
+    UnwrapErr(SysRng)
+}
 
 /// Prefix of the current at-rest encryption format.
 const ENCRYPTION_VERSION: &str = "v1:";
@@ -83,7 +89,7 @@ pub fn unsubscribe_key() -> [u8; 32] {
 fn encrypt_with(key: &[u8; 32], plaintext: &[u8]) -> Result<String, ApiError> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| internal("invalid key length"))?;
     let mut nonce = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce);
+    os_rng().fill_bytes(&mut nonce);
     let ciphertext = cipher
         .encrypt(&Nonce::from(nonce), plaintext)
         .map_err(|_| internal("encryption failed"))?;
@@ -136,7 +142,8 @@ pub fn hmac_hex(key: &[u8], value: &[u8]) -> String {
 
 pub fn hmac_bytes(key: &[u8], value: &[u8]) -> Vec<u8> {
     // HMAC accepts keys of any length, so `new_from_slice` can't fail.
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut mac =
+        <HmacSha256 as hmac::KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(value);
     mac.finalize().into_bytes().to_vec()
 }
@@ -161,14 +168,14 @@ pub fn verify_code(scope: &str, code: &str, stored_hash: &str) -> bool {
 /// A random, URL-safe token with `bytes` bytes of entropy.
 pub fn random_token(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
-    OsRng.fill_bytes(&mut buf);
+    os_rng().fill_bytes(&mut buf);
     BASE64URL.encode(buf)
 }
 
 /// Random bytes from the operating system's CSPRNG.
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];
-    OsRng.fill_bytes(&mut buf);
+    os_rng().fill_bytes(&mut buf);
     buf
 }
 

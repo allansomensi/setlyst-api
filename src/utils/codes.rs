@@ -4,7 +4,8 @@
 //! person types (recovery codes, referral codes) use an alphabet without
 //! look-alike characters (no 0/O, 1/I/L).
 
-use rand::{Rng, rngs::OsRng};
+use crate::utils::crypto::os_rng;
+use rand::RngExt;
 
 /// Letters and digits that can't be confused with each other when read
 /// aloud or copied by hand.
@@ -17,12 +18,12 @@ pub const RECOVERY_CODE_COUNT: usize = 10;
 /// A 6-digit numeric code (e-mail verification, password recovery),
 /// uniformly distributed, zero-padded.
 pub fn numeric_code() -> String {
-    format!("{:06}", OsRng.gen_range(0..1_000_000u32))
+    format!("{:06}", os_rng().random_range(0..1_000_000u32))
 }
 
 fn unambiguous(len: usize) -> String {
     (0..len)
-        .map(|_| UNAMBIGUOUS[OsRng.gen_range(0..UNAMBIGUOUS.len())] as char)
+        .map(|_| UNAMBIGUOUS[os_rng().random_range(0..UNAMBIGUOUS.len())] as char)
         .collect()
 }
 
@@ -54,7 +55,7 @@ pub fn lowercase_suffix(len: usize) -> String {
 
 /// A random number in `lo..hi`.
 pub fn random_in(lo: u32, hi: u32) -> u32 {
-    OsRng.gen_range(lo..hi)
+    os_rng().random_range(lo..hi)
 }
 
 #[cfg(test)]

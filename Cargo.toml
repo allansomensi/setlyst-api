@@ -16,7 +16,7 @@ name = "create_superuser"
 path = "src/bin/create_superuser.rs"
 
 [dependencies]
-argon2 = { version = "0.5", features = ["std"] }
+argon2 = { version = "0.6", features = ["password-hash", "getrandom"] }
 async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
@@ -46,18 +46,18 @@ tower-http = { version = "0.7", features = [
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-utoipa = { version = "5.3", features = ["chrono", "uuid"] }
-utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
+utoipa = { version = "6.0", features = ["chrono", "uuid"] }
+utoipa-swagger-ui = { version = "10.0", features = ["axum"] }
 uuid = { version = "1.23", features = ["serde", "v4", "v7"] }
 validator = { version = "0.21", features = ["derive"] }
 tower_governor = { version = "0.8", features = ["tracing"] }
 genpdf = "0.2.0"
-serde_json = "1.0.151"
+serde_json = "1"
 serde_urlencoded = "0.7"
-aes-gcm = "0.10"
-base64 = "0.22"
-hkdf = "0.12"
-hmac = "0.12"
+aes-gcm = "0.11"
+base64 = "0.23"
+hkdf = "0.13"
+hmac = "0.13"
 ipnet = "2"
 lettre = { version = "0.11", default-features = false, features = [
     "builder",
@@ -67,14 +67,18 @@ lettre = { version = "0.11", default-features = false, features = [
     "tokio1",
     "tokio1-rustls-tls",
 ] }
-rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = [
+rand = "0.10"
+reqwest = { version = "0.13", default-features = false, features = [
+    "form",
     "json",
-    "rustls-tls",
+    "query",
+    "rustls-no-provider",
 ] }
 rpassword = "7"
-sha1 = "0.10"
-sha2 = "0.10"
+# The TLS provider reqwest uses (the same `ring` lettre already builds).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+sha1 = "0.11"
+sha2 = "0.11"
 subtle = "2.6"
 unicode-normalization = "0.1"
 

@@ -21,7 +21,7 @@
 use crate::errors::api_error::{ApiError, codes};
 use argon2::{
     Argon2,
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
+    password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash},
 };
 use axum::http::StatusCode;
 use serde_json::json;
@@ -60,15 +60,14 @@ pub fn normalize_password(password: &str) -> Cow<'_, str> {
 
 /// Encrypt a password (blocking; prefer [`hash_password`] in handlers).
 pub fn encrypt_password(password: &str) -> Result<String, ApiError> {
-    let salt = SaltString::generate(&mut OsRng);
+    // The salt is generated from the operating system's CSPRNG.
     let argon2 = Argon2::default();
-
     Ok(argon2
-        .hash_password(normalize_password(password).as_bytes(), &salt)
+        .hash_password(normalize_password(password).as_bytes())
         .map(|hashed_password| hashed_password.to_string())?)
 }
 
-fn verify_exact(plain_password: &str, parsed_hash: &PasswordHash<'_>) -> bool {
+fn verify_exact(plain_password: &str, parsed_hash: &PasswordHash) -> bool {
     Argon2::default()
         .verify_password(plain_password.as_bytes(), parsed_hash)
         .is_ok()
@@ -265,9 +264,8 @@ mod tests {
         assert!(!verify_password_upgrading(decomposed, &hash).unwrap());
 
         // A hash of the raw decomposed form, made before normalization.
-        let salt = SaltString::generate(&mut OsRng);
         let legacy = Argon2::default()
-            .hash_password(decomposed.as_bytes(), &salt)
+            .hash_password(decomposed.as_bytes())
             .unwrap()
             .to_string();
         assert!(verify_password_upgrading(decomposed, &legacy).unwrap());

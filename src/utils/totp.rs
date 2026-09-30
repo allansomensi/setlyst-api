@@ -6,7 +6,7 @@
 //! reports *which* step matched, so the caller can refuse a code whose
 //! step was already used (replay protection).
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 
 pub const DIGITS: u32 = 6;
@@ -64,7 +64,8 @@ pub fn base32_decode(input: &str) -> Option<Vec<u8>> {
 
 /// HOTP value (RFC 4226 §5.3) with `digits` digits.
 pub fn hotp(secret: &[u8], counter: u64, digits: u32) -> u32 {
-    let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
+    let mut mac =
+        <Hmac<Sha1> as KeyInit>::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(&counter.to_be_bytes());
     let hash = mac.finalize().into_bytes();
     let offset = (hash[hash.len() - 1] & 0x0f) as usize;

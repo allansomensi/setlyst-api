@@ -155,7 +155,7 @@ pub struct GoogleJwksVerifier {
 impl GoogleJwksVerifier {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::builder()
+            http: crate::utils::http::client_builder()
                 .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),

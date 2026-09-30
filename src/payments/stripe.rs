@@ -12,7 +12,7 @@ use super::{
 };
 use crate::{config::StripeConfig, models::billing::BillingInterval};
 use chrono::Utc;
-use rand::Rng;
+use rand::RngExt;
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
 use std::time::Duration;
@@ -56,7 +56,7 @@ pub struct StripeGateway {
 
 impl StripeGateway {
     pub fn new(config: &StripeConfig) -> Result<Self, String> {
-        let client = reqwest::Client::builder()
+        let client = crate::utils::http::client_builder()
             .timeout(Duration::from_secs(CALL_TIMEOUT_SECS))
             .connect_timeout(Duration::from_secs(5))
             .user_agent(concat!("setlyst-api/", env!("CARGO_PKG_VERSION")))
@@ -85,7 +85,7 @@ impl StripeGateway {
             .await
         {
             Err(e) if repeatable && is_transient(&e) => {
-                let pause = rand::thread_rng().gen_range(200..700);
+                let pause = rand::rng().random_range(200..700);
                 warn!(%method, path, error = %e, "Stripe call failed; retrying once");
                 tokio::time::sleep(Duration::from_millis(pause)).await;
                 self.call_once(method, path, params, idempotency_key).await

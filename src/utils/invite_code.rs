@@ -1,4 +1,5 @@
-use argon2::password_hash::rand_core::{OsRng, RngCore};
+use crate::utils::crypto::os_rng;
+use rand::Rng;
 
 /// Alphabet chosen to avoid visually ambiguous characters (0/O, 1/I/l)
 /// since invite codes are meant to be read aloud and typed by hand.
@@ -16,7 +17,7 @@ pub fn generate_invite_code() -> String {
     let mut code = String::with_capacity(CODE_LENGTH);
     let mut buffer = [0u8; 32];
     while code.len() < CODE_LENGTH {
-        OsRng.fill_bytes(&mut buffer);
+        os_rng().fill_bytes(&mut buffer);
         for byte in buffer {
             if byte < limit && code.len() < CODE_LENGTH {
                 code.push(ALPHABET[(byte as usize) % ALPHABET.len()] as char);

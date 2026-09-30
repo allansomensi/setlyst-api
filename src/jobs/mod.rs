@@ -26,7 +26,7 @@ use crate::{
     utils::tasks,
 };
 use chrono::{Duration, NaiveDateTime, Utc};
-use rand::Rng;
+use rand::RngExt;
 use sqlx::PgPool;
 use std::{future::Future, time::Duration as StdDuration};
 use tokio::time::MissedTickBehavior;
@@ -84,7 +84,7 @@ pub(crate) fn every<F, Fut>(
     F: Fn() -> Fut + Send + 'static,
     Fut: Future<Output = Result<u64, ApiError>> + Send + 'static,
 {
-    let jitter = StdDuration::from_secs(rand::thread_rng().gen_range(0..=FIRST_RUN_JITTER_SECS));
+    let jitter = StdDuration::from_secs(rand::rng().random_range(0..=FIRST_RUN_JITTER_SECS));
     tasks::spawn(async move {
         let shutdown = tasks::shutdown_token();
         let start = tokio::time::Instant::now() + first_after + jitter;

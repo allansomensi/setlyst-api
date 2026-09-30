@@ -184,7 +184,7 @@ pub async fn is_breached(password: &str) -> bool {
     use std::sync::LazyLock;
 
     static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-        reqwest::Client::builder()
+        crate::utils::http::client_builder()
             .timeout(BREACH_CHECK_TIMEOUT)
             .build()
             .unwrap_or_default()

@@ -7,7 +7,7 @@
 //! attacks), comparison is constant-time, and a timestamp outside the
 //! tolerance is rejected so a captured request can't be replayed.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::Value;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;

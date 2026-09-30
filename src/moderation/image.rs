@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn the_vision_key_never_appears_in_the_url() {
-        let client = reqwest::Client::new();
+        let client = crate::utils::http::client();
         let request = vision_request(&client, "secret-vision-key", "https://img.test/a.png")
             .build()
             .unwrap();

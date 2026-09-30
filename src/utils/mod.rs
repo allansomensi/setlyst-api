@@ -1,6 +1,7 @@
 pub mod codes;
 pub mod crypto;
 pub mod hashing;
+pub mod http;
 pub mod invite_code;
 pub mod jwt;
 pub mod rate_limit;
