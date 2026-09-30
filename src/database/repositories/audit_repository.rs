@@ -112,6 +112,20 @@ impl AuditEvent {
         self
     }
 
+    /// What [`once_within`](Self::once_within) folds copies by: the
+    /// action, the actor, the impersonator, the target and the metadata.
+    fn dedupe_key(&self) -> String {
+        format!(
+            "audit:{}:{:?}:{:?}:{:?}:{:?}:{}",
+            self.action,
+            self.actor_id,
+            self.impersonator_id,
+            self.target_type,
+            self.target_id,
+            self.metadata
+        )
+    }
+
     /// Records the entry in the background, off the request's hot path
     /// (used where the time taken must not depend on the outcome, such as
     /// failed sign-ins).
@@ -174,6 +188,21 @@ impl AuditRepositoryImpl {
 #[async_trait::async_trait]
 impl AuditRepository for AuditRepositoryImpl {
     async fn record(&self, event: AuditEvent) -> Result<(), ApiError> {
+        // A deduplicated entry is written under a transaction-scoped
+        // advisory lock on its identity: the check below is a `NOT EXISTS`
+        // in the same statement, and two copies of the same read written
+        // at once (three spawned writes of a reloaded page, each waiting
+        // for a pooled connection, then landing together) would each see
+        // no earlier row and all go in. The lock serialises them, and the
+        // second one's statement runs after the first committed, so it
+        // sees the row and skips.
+        let mut tx = self.db.begin().await?;
+        if event.dedupe_seconds.is_some() {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(event.dedupe_key())
+                .execute(&mut *tx)
+                .await?;
+        }
         // The actor's name is looked up when the caller only knew the id
         // (e.g. the staff member behind a "view as" session), so the entry
         // never reads as done by "the system".
@@ -204,8 +233,9 @@ impl AuditRepository for AuditRepositoryImpl {
         .bind(event.ip_address)
         .bind(event.created_at)
         .bind(event.dedupe_seconds)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 

@@ -900,11 +900,16 @@ async fn audit_log_pages_are_stable_and_repeated_staff_reads_are_logged_once() {
         assert_eq!(ids(&again.body), first);
     }
 
-    // Opening the same account three times is one access, not three.
-    for _ in 0..3 {
-        let overview = app
-            .get(&format!("/users/{target_id}/overview"), &admin)
-            .await;
+    // Opening the same account three times is one access, not three,
+    // even when the reads (and the entries they write in the background)
+    // land at the same moment.
+    let overview_path = format!("/users/{target_id}/overview");
+    let (a, b, c) = tokio::join!(
+        app.get(&overview_path, &admin),
+        app.get(&overview_path, &admin),
+        app.get(&overview_path, &admin)
+    );
+    for overview in [a, b, c] {
         assert_eq!(overview.status, StatusCode::OK, "{}", overview.body);
     }
     let viewed = app
