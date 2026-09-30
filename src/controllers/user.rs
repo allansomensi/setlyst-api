@@ -288,19 +288,21 @@ pub async fn get_user_profile(
         .ok_or(ApiError::NotFound)?;
 
     let is_self = id == access.user_id();
-    let bands_in_common = if is_self {
-        Vec::new()
-    } else {
-        state
-            .user_repo
-            .bands_in_common(access.user_id(), id)
-            .await?
+    let bands_in_common = async {
+        if is_self {
+            Ok(Vec::new())
+        } else {
+            state.user_repo.bands_in_common(access.user_id(), id).await
+        }
     };
-    let open_flags = if access.is_staff() {
-        state.moderation_repo.count_open_for_user(id).await?
-    } else {
-        0
+    let open_flags = async {
+        if access.is_staff() {
+            state.moderation_repo.count_open_for_user(id).await
+        } else {
+            Ok(0)
+        }
     };
+    let (bands_in_common, open_flags) = tokio::try_join!(bands_in_common, open_flags)?;
 
     // Personal details only to people with a reason to see them: user
     // ids leak through band rosters, suggestions and setlists.
@@ -352,19 +354,16 @@ pub async fn report_user(
         .ok_or(ApiError::NotFound)?;
 
     let since = Utc::now().naive_utc() - Duration::hours(24);
-    if state
-        .moderation_repo
-        .count_reports_since(access.user_id(), since)
-        .await?
-        >= REPORTS_PER_DAY
-    {
+    let (reports_today, already_open) = tokio::try_join!(
+        state
+            .moderation_repo
+            .count_reports_since(access.user_id(), since),
+        state.moderation_repo.has_open_report(access.user_id(), id)
+    )?;
+    if reports_today >= REPORTS_PER_DAY {
         return Err(too_many_attempts(3600));
     }
-    if state
-        .moderation_repo
-        .has_open_report(access.user_id(), id)
-        .await?
-    {
+    if already_open {
         return Err(ApiError::AlreadyExists);
     }
 
@@ -1091,11 +1090,6 @@ pub async fn update_current_user(
             != Some(normalized_image_url(url));
         if avatar_changed {
             account::ensure_email_verified(&account)?;
-            for limiter in [&*AVATAR_HOURLY, &*AVATAR_DAILY] {
-                if let Err(wait) = limiter.check(&user_id) {
-                    return Err(too_many_attempts(wait.as_secs() as i64));
-                }
-            }
         }
     }
 
@@ -1127,6 +1121,17 @@ pub async fn update_current_user(
                     ),
                     json!({ "eligible_at": eligible_at }),
                 ));
+            }
+        }
+    }
+
+    // A new picture costs a paid review: counted against the per-account
+    // limits only once everything else about the request checked out, so
+    // a rejected username can't use up the avatar changes of the hour.
+    if avatar_changed {
+        for limiter in [&*AVATAR_HOURLY, &*AVATAR_DAILY] {
+            if let Err(wait) = limiter.check(&user_id) {
+                return Err(too_many_attempts(wait.as_secs() as i64));
             }
         }
     }

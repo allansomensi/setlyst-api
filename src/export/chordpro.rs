@@ -39,6 +39,9 @@ fn embeddable_lyrics(lyrics: &str) -> String {
     lyrics
         .lines()
         .filter(|line| {
+            if !line.trim_start().starts_with('{') {
+                return true;
+            }
             let directive = line
                 .trim()
                 .trim_start_matches('{')
@@ -47,11 +50,20 @@ fn embeddable_lyrics(lyrics: &str) -> String {
                 .unwrap_or_default()
                 .trim()
                 .to_ascii_lowercase();
-            !(line.trim_start().starts_with('{') && (directive == "new_song" || directive == "ns"))
+            !EMITTED_DIRECTIVES.contains(&directive.as_str())
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// Directives dropped from the lyrics because [`render_song`] emits its
+/// own from the song's fields (a chart pasted from a `.cho` file often
+/// still carries them): a second `{title}` would make the export a file
+/// the importer refuses as holding several songs.
+const EMITTED_DIRECTIVES: &[&str] = &[
+    "new_song", "ns", "title", "t", "subtitle", "st", "artist", "key", "tempo", "time", "capo",
+    "duration", "meta",
+];
 
 /// One song as ChordPro: metadata directives, a blank line, the lyrics.
 pub fn render_song(song: &SongExport) -> String {

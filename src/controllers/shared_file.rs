@@ -233,8 +233,19 @@ pub async fn export_tour(
     let mut setlists = Vec::new();
     let mut included: HashSet<Uuid> = HashSet::new();
     let mut refused: HashSet<Uuid> = HashSet::new();
-    for summary in state.tour_repo.gigs(id).await? {
-        let Some(gig) = state.gig_repo.find_by_id(summary.id, user_id).await? else {
+    // The tour's gigs in their order, read in one statement rather than
+    // one lookup per gig.
+    let summaries = state.tour_repo.gigs(id).await?;
+    let gig_ids: Vec<Uuid> = summaries.iter().map(|s| s.id).collect();
+    let mut by_id: std::collections::HashMap<Uuid, _> = state
+        .gig_repo
+        .find_many(&gig_ids, user_id)
+        .await?
+        .into_iter()
+        .map(|gig| (gig.id, gig))
+        .collect();
+    for summary in summaries {
+        let Some(gig) = by_id.remove(&summary.id) else {
             continue;
         };
         let mut setlist_id = None;

@@ -6,4 +6,5 @@ pub mod jwt;
 pub mod rate_limit;
 pub mod share_token;
 pub mod slug;
+pub mod tasks;
 pub mod totp;

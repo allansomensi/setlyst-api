@@ -53,6 +53,7 @@ pub fn spawn(state: AppState) {
     super::every(
         "unverified_account_purge",
         StdDuration::from_secs(3600),
+        StdDuration::from_secs(6 * 60),
         move || {
             let state = state.clone();
             async move { purge_unverified_accounts(&state).await }

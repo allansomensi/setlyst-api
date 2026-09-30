@@ -28,8 +28,15 @@ use crate::{
     services::billing::BILLING_NOTICE_KINDS,
 };
 use chrono::NaiveDateTime;
+use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
 use tracing::error;
+
+/// Notifications delivered at once by [`notify_all`]: each one is a few
+/// short queries, so a band-wide fan-out runs them a few at a time
+/// rather than one after the other (a 25-member band would otherwise wait
+/// for 75 sequential round trips on the request that triggered it).
+const NOTIFY_CONCURRENCY: usize = 4;
 
 /// Delivers `notification` to its recipient. Best effort: a failure is
 /// logged and never fails the action that triggered it.
@@ -39,11 +46,13 @@ pub async fn notify(state: &AppState, notification: Notification) {
     }
 }
 
-/// [`notify`] for several notifications.
+/// [`notify`] for several notifications, a few at a time.
 pub async fn notify_all(state: &AppState, notifications: Vec<Notification>) {
-    for notification in notifications {
-        notify(state, notification).await;
-    }
+    stream::iter(notifications)
+        .for_each_concurrent(NOTIFY_CONCURRENCY, |notification| {
+            notify(state, notification)
+        })
+        .await;
 }
 
 #[derive(sqlx::FromRow)]

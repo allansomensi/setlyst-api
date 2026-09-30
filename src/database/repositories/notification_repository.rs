@@ -71,12 +71,15 @@ impl NotificationRepository for NotificationRepositoryImpl {
     ) -> Result<(Vec<Notification>, i64), ApiError> {
         let offset = (page - 1) * per_page;
 
+        // `id` breaks ties: an announcement's fan-out gives thousands of
+        // rows the same `created_at`, and without a total order a row
+        // could appear on two pages (or on none) as the client paginates.
         let notifications = sqlx::query_as::<_, Notification>(
             r#"
             SELECT id, user_id, type, data, read_at, created_at
             FROM notifications
             WHERE user_id = $1 AND ($2 = FALSE OR read_at IS NULL)
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, id DESC
             LIMIT $3 OFFSET $4
             "#,
         )
@@ -84,8 +87,7 @@ impl NotificationRepository for NotificationRepositoryImpl {
         .bind(unread_only)
         .bind(per_page)
         .bind(offset)
-        .fetch_all(&self.db)
-        .await?;
+        .fetch_all(&self.db);
 
         let total_items = sqlx::query_scalar::<_, i64>(
             r#"
@@ -95,9 +97,9 @@ impl NotificationRepository for NotificationRepositoryImpl {
         )
         .bind(user_id)
         .bind(unread_only)
-        .fetch_one(&self.db)
-        .await?;
+        .fetch_one(&self.db);
 
+        let (notifications, total_items) = tokio::try_join!(notifications, total_items)?;
         Ok((notifications, total_items))
     }
 

@@ -35,9 +35,8 @@ pub const PDF_PERMITS: usize = 3;
 pub const PDF_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Most items (songs, blocks and breaks) a setlist PDF may carry.
 pub const MAX_PDF_ITEMS: usize = 200;
-/// Most characters of lyrics (and performance notes) a songbook may carry:
-/// roughly 100 pages, which renders in well under a second and a few tens
-/// of megabytes.
+/// Most characters of lyrics a songbook may carry: roughly 100 pages,
+/// which renders in well under a second and a few tens of megabytes.
 pub const MAX_SONGBOOK_CHARS: usize = 250_000;
 
 static PDF_SEMAPHORE: LazyLock<Arc<Semaphore>> =
@@ -65,8 +64,10 @@ pub fn pdf_too_large(message: impl Into<String>, meta: serde_json::Value) -> Api
 
 /// Refuses a setlist PDF that would be too big to render safely: more than
 /// [`MAX_PDF_ITEMS`] items, or (with the songbook) more than
-/// [`MAX_SONGBOOK_CHARS`] characters of lyrics and notes. Checked in the
-/// handler, before a rendering slot is taken.
+/// [`MAX_SONGBOOK_CHARS`] characters of lyrics — what the songbook prints
+/// (performance notes only appear on the single-song sheet), counted in
+/// characters as the limit says, not bytes. Checked in the handler,
+/// before a rendering slot is taken.
 pub fn ensure_pdf_fits(items: &[SetlistItem], include_lyrics: bool) -> Result<(), ApiError> {
     if items.len() > MAX_PDF_ITEMS {
         return Err(pdf_too_large(
@@ -78,10 +79,9 @@ pub fn ensure_pdf_fits(items: &[SetlistItem], include_lyrics: bool) -> Result<()
         let total: usize = items
             .iter()
             .filter_map(|item| match item {
-                SetlistItem::Song { song, .. } => Some(
-                    song.lyrics.as_deref().map_or(0, str::len)
-                        + song.performance_notes.as_deref().map_or(0, str::len),
-                ),
+                SetlistItem::Song { song, .. } => {
+                    Some(song.lyrics.as_deref().map_or(0, |l| l.chars().count()))
+                }
                 _ => None,
             })
             .sum();

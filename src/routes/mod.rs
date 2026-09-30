@@ -92,6 +92,7 @@ pub mod tour;
 pub mod trash;
 pub mod user;
 
+use crate::errors::api_error::ApiError;
 use crate::{
     config::Config,
     database::AppState,
@@ -103,6 +104,7 @@ use axum::{
     extract::{DefaultBodyLimit, MatchedPath},
     http::{HeaderName, HeaderValue, Request, Response, StatusCode, header},
     middleware,
+    response::IntoResponse,
 };
 use std::time::Duration;
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
@@ -207,6 +209,12 @@ fn access_log_line(response: &Response<Body>, latency: Duration, _: &Span) {
     );
 }
 
+/// The answer to a panicking handler: the API's own JSON error shape (and
+/// a logged `SERVER_ERROR`), not `tower_http`'s plain-text default.
+fn panic_response(_: Box<dyn std::any::Any + Send + 'static>) -> Response<Body> {
+    ApiError::ServerError(axum::Error::new("handler panicked")).into_response()
+}
+
 pub fn create_routes(state: AppState) -> Router {
     let global_governor_conf = GovernorConfigBuilder::default()
         .per_millisecond(25)
@@ -243,8 +251,12 @@ pub fn create_routes(state: AppState) -> Router {
         .on_eos(())
         .on_failure(());
 
+    // Layers apply bottom-up: the last `.layer` is the outermost. From the
+    // outside in: CORS (every answer needs the headers, a 429 or a 500
+    // included), the panic catcher, the access log and the security
+    // headers (so rate-limited and timed-out answers are logged and
+    // carry them too), the rate limiter, the timeout, compression.
     router
-        .layer(access_log)
         .layer(compression)
         // Outside compression, so the time spent producing the (possibly
         // compressed) answer counts. 503: a timeout is the server being
@@ -254,6 +266,7 @@ pub fn create_routes(state: AppState) -> Router {
             StatusCode::SERVICE_UNAVAILABLE,
             REQUEST_TIMEOUT,
         ))
+        .layer(GovernorLayer::new(pruned!(global_governor_conf)))
         // Conservative security headers. The API only serves JSON, PDFs and
         // the Swagger UI, none of which should ever be sniffed or framed.
         .layer(SetResponseHeaderLayer::if_not_present(
@@ -276,10 +289,10 @@ pub fn create_routes(state: AppState) -> Router {
             header::STRICT_TRANSPORT_SECURITY,
             HeaderValue::from_static("max-age=31536000; includeSubDomains"),
         ))
-        .layer(GovernorLayer::new(pruned!(global_governor_conf)))
-        // A panicking handler answers a plain 500 (with the CORS headers
+        .layer(access_log)
+        // A panicking handler answers a JSON 500 (with the CORS headers
         // added below) instead of resetting the connection.
-        .layer(CatchPanicLayer::new())
+        .layer(CatchPanicLayer::custom(panic_response))
         // Outermost, so every answer carries the CORS headers — including a
         // 429 from the rate limiter or a 503 from the timeout, which a
         // browser would otherwise report as an opaque CORS failure.

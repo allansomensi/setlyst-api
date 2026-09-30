@@ -119,22 +119,87 @@ impl Entitlements {
     }
 }
 
-/// Loads the entitlements of `user_id`.
+impl Entitlements {
+    /// Entitlements from the billing mode and the account facts of
+    /// [`account_facts`].
+    pub fn from_parts(enforced: bool, facts: AccountFacts) -> Self {
+        let (row, plan) = facts;
+        Self {
+            enforced,
+            is_staff: row.as_ref().is_some_and(|(role, _)| role.is_staff()),
+            email_verified: row.is_some_and(|(_, verified)| verified),
+            plan,
+        }
+    }
+
+    /// `Ok` when this account may use `feature`; otherwise the error the
+    /// feature gates answer: `EMAIL_NOT_VERIFIED` for an account that
+    /// hasn't verified its address, `FEATURE_NOT_IN_PLAN` (403, meta
+    /// `{feature, plan}`, `plan` being the cheapest plan that includes the
+    /// feature) for everyone else. Handlers that gate on more than one
+    /// feature load the entitlements once and ask this for each.
+    pub async fn require(&self, state: &AppState, feature: Feature) -> Result<(), ApiError> {
+        if self.has(feature) {
+            return Ok(());
+        }
+        if self.tier() == AccessTier::Unverified {
+            return Err(ApiError::rule_with_meta(
+                StatusCode::FORBIDDEN,
+                codes::EMAIL_NOT_VERIFIED,
+                "Verify your e-mail address to use this feature.",
+                json!({ "feature": feature.key() }),
+            ));
+        }
+        let plan = cheapest_plan_with(state, feature).await?;
+        Err(ApiError::rule_with_meta(
+            StatusCode::FORBIDDEN,
+            codes::FEATURE_NOT_IN_PLAN,
+            "Your current plan does not include this feature.",
+            json!({ "feature": feature.key(), "plan": plan }),
+        ))
+    }
+}
+
+/// What [`Entitlements`] are derived from besides the billing mode: the
+/// account's role and whether its e-mail is verified (`None` for an
+/// unknown account), and the plan in effect.
+pub type AccountFacts = (Option<(Role, bool)>, Option<Plan>);
+
+/// Reads the [`AccountFacts`] of `user_id` (two independent queries, run
+/// together).
+pub async fn account_facts(state: &AppState, user_id: Uuid) -> Result<AccountFacts, ApiError> {
+    let row = async {
+        sqlx::query_as::<_, (Role, bool)>(
+            "SELECT role, (email_verified_at IS NOT NULL AND email IS NOT NULL) FROM users WHERE id = $1",
+        )
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(ApiError::from)
+    };
+    tokio::try_join!(row, load_effective_plan(&state.db, user_id))
+}
+
+/// Loads the entitlements of `user_id`: the billing mode and the account
+/// facts, read together.
 pub async fn entitlements(state: &AppState, user_id: Uuid) -> Result<Entitlements, ApiError> {
-    let settings = state.billing_repo.get_settings().await?;
-    let row: Option<(Role, bool)> = sqlx::query_as(
-        "SELECT role, (email_verified_at IS NOT NULL AND email IS NOT NULL) FROM users WHERE id = $1",
-    )
-    .bind(user_id)
-    .fetch_optional(&state.db)
-    .await?;
-    let plan = load_effective_plan(&state.db, user_id).await?;
-    Ok(Entitlements {
-        enforced: settings.enforced,
-        is_staff: row.as_ref().is_some_and(|(role, _)| role.is_staff()),
-        email_verified: row.is_some_and(|(_, verified)| verified),
-        plan,
-    })
+    let (settings, facts) = tokio::try_join!(
+        state.billing_repo.get_settings(),
+        account_facts(state, user_id)
+    )?;
+    Ok(Entitlements::from_parts(settings.enforced, facts))
+}
+
+/// [`entitlements`] when the billing mode is already known (one read less).
+pub async fn entitlements_under(
+    state: &AppState,
+    user_id: Uuid,
+    enforced: bool,
+) -> Result<Entitlements, ApiError> {
+    Ok(Entitlements::from_parts(
+        enforced,
+        account_facts(state, user_id).await?,
+    ))
 }
 
 /// `true` when `user_id` may use `feature`.
@@ -167,7 +232,10 @@ pub async fn shared_content_visible(
     if !state.billing_repo.get_settings().await?.enforced {
         return Ok(true);
     }
-    if owner_can_share(state, creator_id).await? {
+    if entitlements_under(state, creator_id, true)
+        .await?
+        .has(Feature::PublicSharing)
+    {
         return Ok(true);
     }
     let Some(band_id) = band_id else {
@@ -180,7 +248,9 @@ pub async fn shared_content_visible(
     .fetch_optional(&state.db)
     .await?;
     match band_owner {
-        Some(owner) if owner != creator_id => owner_can_share(state, owner).await,
+        Some(owner) if owner != creator_id => Ok(entitlements_under(state, owner, true)
+            .await?
+            .has(Feature::PublicSharing)),
         _ => Ok(false),
     }
 }
@@ -207,25 +277,10 @@ pub async fn ensure_feature(
     user_id: Uuid,
     feature: Feature,
 ) -> Result<(), ApiError> {
-    let entitlements = entitlements(state, user_id).await?;
-    if entitlements.has(feature) {
-        return Ok(());
-    }
-    if entitlements.tier() == AccessTier::Unverified {
-        return Err(ApiError::rule_with_meta(
-            StatusCode::FORBIDDEN,
-            codes::EMAIL_NOT_VERIFIED,
-            "Verify your e-mail address to use this feature.",
-            json!({ "feature": feature.key() }),
-        ));
-    }
-    let plan = cheapest_plan_with(state, feature).await?;
-    Err(ApiError::rule_with_meta(
-        StatusCode::FORBIDDEN,
-        codes::FEATURE_NOT_IN_PLAN,
-        "Your current plan does not include this feature.",
-        json!({ "feature": feature.key(), "plan": plan }),
-    ))
+    entitlements(state, user_id)
+        .await?
+        .require(state, feature)
+        .await
 }
 
 #[cfg(test)]

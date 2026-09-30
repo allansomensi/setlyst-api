@@ -677,10 +677,15 @@ pub async fn get_user_subscription(
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_staff()?;
     state.user_repo.exists(id).await?;
+    let (subscription, events, credits_balance) = tokio::try_join!(
+        state.billing_repo.get_subscription(id),
+        state.billing_repo.subscription_events(id, 100),
+        state.billing_repo.credit_balance(id)
+    )?;
     Ok(Json(AdminSubscriptionView {
-        subscription: state.billing_repo.get_subscription(id).await?,
-        events: state.billing_repo.subscription_events(id, 100).await?,
-        credits_balance: state.billing_repo.credit_balance(id).await?,
+        subscription,
+        events,
+        credits_balance,
     }))
 }
 

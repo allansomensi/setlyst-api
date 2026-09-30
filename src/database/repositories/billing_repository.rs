@@ -393,20 +393,19 @@ impl BillingRepository for BillingRepositoryImpl {
         page: i64,
         per_page: i64,
     ) -> Result<(Vec<CreditEntry>, i64), ApiError> {
-        let total: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM credit_ledger WHERE user_id = $1")
+        let total =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM credit_ledger WHERE user_id = $1")
                 .bind(user_id)
-                .fetch_one(&self.db)
-                .await?;
+                .fetch_one(&self.db);
         let rows = sqlx::query_as::<_, CreditEntry>(
             "SELECT id, amount, reason, note, created_at FROM credit_ledger
-             WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+             WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3",
         )
         .bind(user_id)
         .bind(per_page)
         .bind((page - 1) * per_page)
-        .fetch_all(&self.db)
-        .await?;
+        .fetch_all(&self.db);
+        let (total, rows) = tokio::try_join!(total, rows)?;
         Ok((rows, total))
     }
 
@@ -426,22 +425,21 @@ impl BillingRepository for BillingRepositoryImpl {
         page: i64,
         per_page: i64,
     ) -> Result<(Vec<ReferralEntry>, i64), ApiError> {
-        let total: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM referrals WHERE referrer_id = $1")
+        let total =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM referrals WHERE referrer_id = $1")
                 .bind(user_id)
-                .fetch_one(&self.db)
-                .await?;
+                .fetch_one(&self.db);
         let rows = sqlx::query_as::<_, ReferralEntry>(
             "SELECT u.username, r.status, r.created_at, r.rewarded_at
              FROM referrals r JOIN users u ON u.id = r.referred_id
              WHERE r.referrer_id = $1
-             ORDER BY r.created_at DESC LIMIT $2 OFFSET $3",
+             ORDER BY r.created_at DESC, r.referred_id DESC LIMIT $2 OFFSET $3",
         )
         .bind(user_id)
         .bind(per_page)
         .bind((page - 1) * per_page)
-        .fetch_all(&self.db)
-        .await?;
+        .fetch_all(&self.db);
+        let (total, rows) = tokio::try_join!(total, rows)?;
         Ok((rows, total))
     }
 
@@ -451,25 +449,24 @@ impl BillingRepository for BillingRepositoryImpl {
         page: i64,
         per_page: i64,
     ) -> Result<(Vec<PromoCode>, i64), ApiError> {
-        let total: i64 = sqlx::query_scalar(
+        let total = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM promo_codes p
              WHERE ($1::text IS NULL OR p.code ILIKE $1 OR p.description ILIKE $1)",
         )
         .bind(search)
-        .fetch_one(&self.db)
-        .await?;
+        .fetch_one(&self.db);
         let rows = sqlx::query_as::<_, PromoCode>(concat!(
             "SELECT ",
             promo_columns!(),
             " FROM promo_codes p
               WHERE ($1::text IS NULL OR p.code ILIKE $1 OR p.description ILIKE $1)
-              ORDER BY p.created_at DESC LIMIT $2 OFFSET $3"
+              ORDER BY p.created_at DESC, p.code DESC LIMIT $2 OFFSET $3"
         ))
         .bind(search)
         .bind(per_page)
         .bind((page - 1) * per_page)
-        .fetch_all(&self.db)
-        .await?;
+        .fetch_all(&self.db);
+        let (total, rows) = tokio::try_join!(total, rows)?;
         Ok((rows, total))
     }
 

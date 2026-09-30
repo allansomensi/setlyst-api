@@ -831,14 +831,128 @@ impl Element for HorizontalRule {
     }
 }
 
+/// Splits `text` into lines no wider than `width` in `style`, breaking on
+/// spaces and, only when a token is wider than a whole line on its own (a
+/// guitar tab, a long URL, a run of dashes), inside the token. genpdf's
+/// own paragraph wrapping drops such a token altogether — the line simply
+/// goes missing from the page — so free text is laid out here instead.
+fn hard_wrap(
+    text: &str,
+    style: Style,
+    font_cache: &fonts::FontCache,
+    width: genpdf::Mm,
+) -> Vec<String> {
+    let fits = |s: &str| style.str_width(font_cache, s.trim_end()) <= width;
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_inclusive(' ') {
+        let candidate = format!("{current}{word}");
+        if fits(&candidate) {
+            current = candidate;
+            continue;
+        }
+        if !current.trim().is_empty() {
+            lines.push(current.trim_end().to_string());
+        }
+        if fits(word) {
+            current = word.to_string();
+            continue;
+        }
+        // Wider than a line on its own: as many characters per line as fit.
+        let mut piece = String::new();
+        for c in word.chars() {
+            piece.push(c);
+            if !fits(&piece) && piece.chars().count() > 1 {
+                piece.pop();
+                lines.push(std::mem::take(&mut piece));
+                piece.push(c);
+            }
+        }
+        current = piece;
+    }
+    if !current.trim().is_empty() {
+        lines.push(current.trim_end().to_string());
+    }
+    lines
+}
+
+/// Free text laid out line by line with [`hard_wrap`], left-aligned or
+/// centred. An element may span pages: the lines are laid out on the
+/// first render and printed from where the previous page stopped.
+struct WrappedText {
+    text: String,
+    style: Style,
+    alignment: Alignment,
+    lines: Option<Vec<String>>,
+    printed: usize,
+}
+
+impl WrappedText {
+    fn new(text: impl Into<String>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            style,
+            alignment: Alignment::Left,
+            lines: None,
+            printed: 0,
+        }
+    }
+
+    fn centered(mut self) -> Self {
+        self.alignment = Alignment::Center;
+        self
+    }
+}
+
+impl Element for WrappedText {
+    fn render(
+        &mut self,
+        context: &genpdf::Context,
+        area: render::Area<'_>,
+        style: Style,
+    ) -> Result<RenderResult, PdfError> {
+        let style = style.and(self.style);
+        let font_cache = &context.font_cache;
+        let width = area.size().width;
+        let lines = self
+            .lines
+            .get_or_insert_with(|| hard_wrap(&self.text, style, font_cache, width));
+        let line_height = style.line_height(font_cache);
+        let mut y = genpdf::Mm::from(0.0);
+        while self.printed < lines.len() {
+            if area.size().height < y + line_height {
+                return Ok(RenderResult {
+                    size: Size::new(width, y),
+                    has_more: true,
+                });
+            }
+            let line = &lines[self.printed];
+            let x = match self.alignment {
+                Alignment::Center => (width - style.str_width(font_cache, line)) / 2.0,
+                _ => genpdf::Mm::from(0.0),
+            };
+            area.print_str(font_cache, Position::new(x, y), style, line)?;
+            y += line_height;
+            self.printed += 1;
+        }
+        Ok(RenderResult {
+            size: Size::new(width, y),
+            has_more: false,
+        })
+    }
+}
+
 /// A lyric line with chords printed above the exact point they fall on.
 /// Positions are measured with the real font metrics, so alignment holds
-/// with a proportional font. Lines too wide for the page fall back to a
-/// wrapped paragraph with inline chords.
+/// with a proportional font. Lines too wide for the page fall back to
+/// hard-wrapped text with inline chords.
 struct ChordLyricLine {
     segments: Vec<ChordSegment>,
     lyric_style: Style,
     chord_style: Style,
+    /// The wrapped fallback of a line too wide for the column, kept
+    /// across pages.
+    fallback: Option<WrappedText>,
 }
 
 impl Element for ChordLyricLine {
@@ -886,16 +1000,19 @@ impl Element for ChordLyricLine {
         let total_width = x.max(last_chord_end);
 
         if total_width > area.size().width {
-            let text: String = self
-                .segments
-                .iter()
-                .map(|(chord, text)| match chord {
-                    Some(chord) => format!("[{chord}]{text}"),
-                    None => text.clone(),
-                })
-                .collect();
-            let mut paragraph = Paragraph::new(text).styled(self.lyric_style);
-            return paragraph.render(context, area, style);
+            let lyric_style = self.lyric_style;
+            let fallback = self.fallback.get_or_insert_with(|| {
+                let text: String = self
+                    .segments
+                    .iter()
+                    .map(|(chord, text)| match chord {
+                        Some(chord) => format!("[{chord}]{text}"),
+                        None => text.clone(),
+                    })
+                    .collect();
+                WrappedText::new(text, lyric_style)
+            });
+            return fallback.render(context, area, style);
         }
 
         if area.size().height < height {
@@ -1299,11 +1416,7 @@ fn push_header(
     {
         doc.push(elements::Break::new(0.4));
         for line in description.lines() {
-            doc.push(
-                Paragraph::new(line.to_string())
-                    .aligned(Alignment::Center)
-                    .styled(styles.muted(10.5).italic()),
-            );
+            doc.push(WrappedText::new(line, styles.muted(10.5).italic()).centered());
         }
         pushed = true;
     }
@@ -1459,15 +1572,16 @@ fn push_lyric_lines(
             LyricLine::Blank => layout.push(elements::Break::new(0.5)),
             LyricLine::Heading(text) => {
                 layout.push(elements::Break::new(0.3));
-                layout.push(Paragraph::new(text).styled(styles.text(11.0).bold()));
+                layout.push(WrappedText::new(text, styles.text(11.0).bold()));
             }
             LyricLine::Comment(text) => {
-                layout.push(Paragraph::new(text).styled(styles.muted(10.5).italic()));
+                layout.push(WrappedText::new(text, styles.muted(10.5).italic()));
             }
             LyricLine::Segments(segments) => layout.push(ChordLyricLine {
                 segments,
                 lyric_style,
                 chord_style,
+                fallback: None,
             }),
         }
     }
@@ -1753,7 +1867,7 @@ pub fn generate_song_pdf(
         doc.push(elements::Break::new(0.4));
         doc.push(Paragraph::new(format!("{}:", labels.notes)).styled(styles.text(10.5).bold()));
         for line in notes.lines() {
-            doc.push(Paragraph::new(line.to_string()).styled(styles.muted(10.5).italic()));
+            doc.push(WrappedText::new(line, styles.muted(10.5).italic()));
         }
     }
 
@@ -1912,6 +2026,41 @@ mod tests {
     fn renders_with_defaults() {
         let pdf = render("");
         assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn overlong_tokens_are_broken_across_lines_not_dropped() {
+        let font_cache = fonts::FontCache::new(font_family().unwrap());
+        let style = Style::new().with_font_size(12);
+        let width = genpdf::Mm::from(60.0);
+        let fits = |line: &str| style.str_width(&font_cache, line) <= width;
+
+        // Ordinary prose wraps on spaces.
+        let prose =
+            "Olha que coisa mais linda mais cheia de graça é ela menina que vem e que passa";
+        let lines = hard_wrap(prose, style, &font_cache, width);
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|line| fits(line)), "{lines:?}");
+        assert_eq!(lines.join(" "), prose);
+
+        // A guitar tab has no spaces: it is broken by characters, and not
+        // a single one of them is lost.
+        let tab =
+            "e|--------0-------0-------0-------0-------|--------3-------3-------3-------3-------|";
+        let lines = hard_wrap(tab, style, &font_cache, width);
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|line| fits(line)), "{lines:?}");
+        assert_eq!(lines.concat(), tab);
+
+        // A long word in the middle of a line keeps its neighbours.
+        let mixed = format!("Olá {} fim", "x".repeat(120));
+        let lines = hard_wrap(&mixed, style, &font_cache, width);
+        assert_eq!(lines.first().map(String::as_str), Some("Olá"));
+        assert!(lines.last().unwrap().ends_with("fim"));
+        assert_eq!(lines.concat().replace(' ', ""), mixed.replace(' ', ""));
+
+        assert!(hard_wrap("", style, &font_cache, width).is_empty());
+        assert!(hard_wrap("   ", style, &font_cache, width).is_empty());
     }
 
     #[test]

@@ -28,7 +28,7 @@ use crate::{
             SongSetlistRef, SongVersion, TagCount, Tonality, UpdateSongPayload,
         },
     },
-    services::entitlements::{Feature, ensure_feature, has_feature},
+    services::entitlements::{Feature, ensure_feature, entitlements, has_feature},
     validations::tag::{normalize_tag, normalize_tags},
 };
 use axum::{
@@ -226,11 +226,10 @@ pub async fn find_band_song_updates(
         .role_of(band_id, user_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let mut copies = state
+    let copies = state
         .song_repo
-        .band_copies(user_id, BandCopyScope::Band(band_id))
+        .band_copies(user_id, BandCopyScope::BandOutdated(band_id))
         .await?;
-    copies.retain(|copy| copy.has_updates);
     Ok(Json(copies))
 }
 
@@ -570,9 +569,26 @@ pub async fn export_songs_chordpro(
     presets::limit(&presets::CHORDPRO_EXPORT, user_id)?;
     let _slot = crate::controllers::backup::bulk_slot().await?;
 
-    let songs = state.song_repo.export_all_chordpro(user_id).await?;
+    let songs = state
+        .song_repo
+        .export_all_chordpro(user_id, MAX_CHORDPRO_EXPORT_SONGS + 1)
+        .await?;
+    if songs.len() > MAX_CHORDPRO_EXPORT_SONGS as usize {
+        return Err(ApiError::rule_with_meta(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            codes::CHORDPRO_TOO_LARGE,
+            format!(
+                "Your library is too large to export as one file (at most {MAX_CHORDPRO_EXPORT_SONGS} songs)."
+            ),
+            serde_json::json!({ "limit": MAX_CHORDPRO_EXPORT_SONGS }),
+        ));
+    }
     let songs_count = songs.len();
-    let body = render_songs(&songs);
+    // Rendering a whole library (megabytes of lyrics) is CPU work: off
+    // the async runtime, like the PDFs.
+    let body = tokio::task::spawn_blocking(move || render_songs(&songs))
+        .await
+        .map_err(|e| ApiError::ServerError(axum::Error::new(e)))?;
 
     let filename = format!(
         "setlyst-songs-{}.cho",
@@ -582,6 +598,9 @@ pub async fn export_songs_chordpro(
     info!(%user_id, %songs_count, "Songs exported in ChordPro format");
     Ok(chordpro_response(&filename, body))
 }
+
+/// Most songs one ChordPro file may carry (`CHORDPRO_TOO_LARGE`, 413).
+pub const MAX_CHORDPRO_EXPORT_SONGS: i64 = 5_000;
 
 /// Loads a song the caller may see and export: its owner, or a member of
 /// its band whose role has the band's `export_pdf` permission.
@@ -601,11 +620,8 @@ async fn exportable_song(
             .require_permission(band_id, user_id, BandPermission::ExportPdf)
             .await?;
     }
-    state
-        .song_repo
-        .find_with_artist_name(id)
-        .await?
-        .ok_or(ApiError::NotFound)
+    // The access read already resolved the artist's name.
+    crate::models::song::SongWithArtist::from_song(song).ok_or(ApiError::NotFound)
 }
 
 #[utoipa::path(
@@ -679,11 +695,12 @@ pub async fn export_song_pdf(
     }
     let user_id = access.user_id();
     presets::limit(&presets::PDF_EXPORT, user_id)?;
-    ensure_feature(&state, user_id, Feature::PdfExport).await?;
+    let entitlements = entitlements(&state, user_id).await?;
+    entitlements.require(&state, Feature::PdfExport).await?;
     let song = exportable_song(&state, user_id, id).await?;
     let options = SongPdfOptions::from(query);
     if options.is_advanced() {
-        ensure_feature(&state, user_id, Feature::AdvancedPdf).await?;
+        entitlements.require(&state, Feature::AdvancedPdf).await?;
     }
 
     let filename = slug_filename("song", &song.title, "pdf");

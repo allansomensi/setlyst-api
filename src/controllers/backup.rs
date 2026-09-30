@@ -106,7 +106,13 @@ pub async fn export_backup(
                 "Backup exported successfully"
             );
 
-            Ok((StatusCode::OK, headers, Json(backup)))
+            // A backup is tens of megabytes for a filled-up account:
+            // serialized off the async runtime, like the PDFs.
+            let body = tokio::task::spawn_blocking(move || serde_json::to_vec(&backup))
+                .await
+                .map_err(|e| ApiError::ServerError(axum::Error::new(e)))?
+                .map_err(|e| ApiError::ServerError(axum::Error::new(e)))?;
+            Ok((StatusCode::OK, headers, body))
         }
         Err(e) => {
             error!(%user_id, error = %e, "Failed to export backup");

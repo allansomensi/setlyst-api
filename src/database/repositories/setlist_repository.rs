@@ -1,6 +1,6 @@
 use crate::database::repositories::{
     quota_repository::{QuotaGuard, lock_scope},
-    song_repository::{like_pattern, song_columns},
+    song_repository::{like_pattern, song_columns, song_summary_columns},
 };
 use crate::{
     errors::api_error::{ApiError, codes},
@@ -107,6 +107,52 @@ macro_rules! next_position {
             (SELECT MAX(position) FROM setlist_held_songs WHERE setlist_id = $1),
             (SELECT MAX(position) FROM setlist_markers WHERE setlist_id = $1)
         ), 0) + 1"
+    };
+}
+
+/// [`held_song_columns!`] without the chart (`NULL` lyrics and notes), for
+/// views that don't show it.
+macro_rules! held_song_summary_columns {
+    () => {
+        "h.id, h.title, '00000000-0000-0000-0000-000000000000'::uuid AS artist_id, st.user_id,
+         NULL::uuid AS band_id, NULL::uuid AS forked_from, h.version_label, NULL::uuid AS version_of,
+         h.tempo, NULL::text AS lyrics, h.tonality, h.genre, h.duration, h.energy, h.time_signature, h.capo,
+         h.tuning, NULL::text AS performance_notes, h.links, h.tags::varchar[] AS tags,
+         NULL::uuid AS updated_by, NULL::varchar AS updated_by_username,
+         NULL::timestamp AS source_synced_at, h.created_at, h.held_at AS updated_at,
+         h.artist_name, h.transpose,
+         h.added_by, h.added_at,
+         (SELECT u.username FROM users u WHERE u.id = h.added_by) AS added_by_username,
+         (SELECT u.avatar_url FROM users u WHERE u.id = h.added_by) AS added_by_avatar_url,
+         TRUE AS held"
+    };
+}
+
+/// [`setlist_song_rows!`] without the chart: `NULL` lyrics and notes. The
+/// public share views and the PDFs that don't print the songbook read a
+/// whole running order (a repertoire can hold thousands of songs) and
+/// never show a line of it.
+macro_rules! setlist_song_summary_rows {
+    () => {
+        concat!(
+            "SELECT ss.position, ",
+            song_summary_columns!(),
+            ", a.name AS artist_name, ss.transpose, ",
+            added_by_columns!(),
+            ", FALSE AS held
+             FROM songs s
+             INNER JOIN setlist_songs ss ON s.id = ss.song_id
+             INNER JOIN setlists st ON st.id = ss.setlist_id
+             INNER JOIN artists a ON a.id = s.artist_id
+             WHERE ss.setlist_id = $1 AND ",
+            scoped_songs!(),
+            " UNION ALL
+             SELECT h.position, ",
+            held_song_summary_columns!(),
+            " FROM setlist_held_songs h
+             INNER JOIN setlists st ON st.id = h.setlist_id
+             WHERE h.setlist_id = $1"
+        )
     };
 }
 
@@ -333,6 +379,13 @@ pub trait SetlistRepository: Send + Sync {
     /// The full, position-merged view of a setlist's contents (songs,
     /// block headers, and breaks) used by the setlist builder UI.
     async fn get_items(&self, setlist_id: Uuid) -> Result<Vec<SetlistItem>, ApiError>;
+    /// [`get_items_capped`](Self::get_items_capped) without the songs'
+    /// lyrics and notes (`None` on every song), for what never prints them.
+    async fn get_items_capped_summary(
+        &self,
+        setlist_id: Uuid,
+        max_items: usize,
+    ) -> Result<Vec<SetlistItem>, ApiError>;
     /// Like [`get_items`](Self::get_items), but reads at most `max_items + 1`
     /// songs and `max_items + 1` markers: enough for the caller to tell the
     /// setlist is over `max_items` without loading all of it (a repertoire
@@ -1160,8 +1213,10 @@ impl SetlistRepository for SetlistRepositoryImpl {
         setlist_id: Uuid,
         max_songs: i64,
     ) -> Result<Vec<(i32, SongWithArtist)>, ApiError> {
+        // The public views never show a chart: the songs come back
+        // without their lyrics and notes.
         Ok(self
-            .song_rows_limited(setlist_id, Some(max_songs.max(0)))
+            .song_summary_rows_limited(setlist_id, max_songs.max(0))
             .await?
             .into_iter()
             .map(|row| (row.position, row.song))
@@ -1410,20 +1465,23 @@ impl SetlistRepository for SetlistRepositoryImpl {
         max_items: usize,
     ) -> Result<Vec<SetlistItem>, ApiError> {
         let limit = i64::try_from(max_items).unwrap_or(i64::MAX - 1) + 1;
-        let markers = async {
-            Ok::<_, ApiError>(
-                sqlx::query_as::<_, SetlistMarker>(
-                    "SELECT id, setlist_id, marker_type, label, duration_minutes, position, created_at
-                     FROM setlist_markers WHERE setlist_id = $1 ORDER BY position ASC LIMIT $2",
-                )
-                .bind(setlist_id)
-                .bind(limit)
-                .fetch_all(&self.db)
-                .await?,
-            )
-        };
-        let (song_rows, markers) =
-            tokio::try_join!(self.song_rows_limited(setlist_id, Some(limit)), markers)?;
+        let (song_rows, markers) = tokio::try_join!(
+            self.song_rows_limited(setlist_id, Some(limit)),
+            self.markers_limited(setlist_id, limit)
+        )?;
+        Ok(merge_items(song_rows, markers))
+    }
+
+    async fn get_items_capped_summary(
+        &self,
+        setlist_id: Uuid,
+        max_items: usize,
+    ) -> Result<Vec<SetlistItem>, ApiError> {
+        let limit = i64::try_from(max_items).unwrap_or(i64::MAX - 1) + 1;
+        let (song_rows, markers) = tokio::try_join!(
+            self.song_summary_rows_limited(setlist_id, limit),
+            self.markers_limited(setlist_id, limit)
+        )?;
         Ok(merge_items(song_rows, markers))
     }
 
@@ -1778,6 +1836,41 @@ impl SetlistRepositoryImpl {
         .fetch_all(&self.db)
         .await?;
         Ok(rows)
+    }
+
+    /// The first `limit` of the setlist's songs without their lyrics and
+    /// notes (see [`setlist_song_summary_rows!`]).
+    async fn song_summary_rows_limited(
+        &self,
+        setlist_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<SongItemRow>, ApiError> {
+        let rows = sqlx::query_as::<_, SongItemRow>(concat!(
+            "SELECT x.* FROM (",
+            setlist_song_summary_rows!(),
+            ") x ORDER BY x.position ASC LIMIT $2"
+        ))
+        .bind(setlist_id)
+        .bind(limit)
+        .fetch_all(&self.db)
+        .await?;
+        Ok(rows)
+    }
+
+    /// The first `limit` markers of the setlist, by position.
+    async fn markers_limited(
+        &self,
+        setlist_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<SetlistMarker>, ApiError> {
+        Ok(sqlx::query_as::<_, SetlistMarker>(
+            "SELECT id, setlist_id, marker_type, label, duration_minutes, position, created_at
+             FROM setlist_markers WHERE setlist_id = $1 ORDER BY position ASC LIMIT $2",
+        )
+        .bind(setlist_id)
+        .bind(limit)
+        .fetch_all(&self.db)
+        .await?)
     }
 
     /// Whether `user_id` may do `action` to the setlist: its personal

@@ -654,18 +654,23 @@ impl BackupRepository for BackupRepositoryImpl {
         }
         if !tag_song_ids.is_empty() {
             // A song merged into an existing one keeps the existing tags
-            // and takes the file's only up to the per-song limit.
+            // and takes the file's only up to the per-song limit: the new
+            // tags are numbered per song (in file order) and only those
+            // that fit after the existing ones go in. A window function,
+            // not a correlated rescan of the whole list per tag, which
+            // grew with the square of the file's tag count.
             sqlx::query(
                 "INSERT INTO song_tags (song_id, tag, created_at)
-                 SELECT t.song_id, t.tag, $3
-                 FROM UNNEST($1::uuid[], $2::text[]) WITH ORDINALITY AS t(song_id, tag, ord)
-                 WHERE t.tag NOT IN (SELECT tag FROM song_tags st WHERE st.song_id = t.song_id)
-                   AND (SELECT COUNT(*) FROM song_tags st WHERE st.song_id = t.song_id)
-                       + (SELECT COUNT(*) FROM UNNEST($1::uuid[], $2::text[]) WITH ORDINALITY
-                             AS u(song_id, tag, ord)
-                          WHERE u.song_id = t.song_id AND u.ord < t.ord
-                            AND u.tag NOT IN (SELECT tag FROM song_tags st WHERE st.song_id = u.song_id))
-                       < $4
+                 SELECT n.song_id, n.tag, $3
+                 FROM (
+                     SELECT t.song_id, t.tag,
+                            ROW_NUMBER() OVER (PARTITION BY t.song_id ORDER BY t.ord) AS rank,
+                            (SELECT COUNT(*) FROM song_tags st WHERE st.song_id = t.song_id) AS existing
+                     FROM UNNEST($1::uuid[], $2::text[]) WITH ORDINALITY AS t(song_id, tag, ord)
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM song_tags st WHERE st.song_id = t.song_id AND st.tag = t.tag)
+                 ) n
+                 WHERE n.existing + n.rank <= $4
                  ON CONFLICT DO NOTHING",
             )
             .bind(&tag_song_ids)

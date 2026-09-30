@@ -6,16 +6,13 @@
 //! after the commit, so nobody is told about a change that rolled back.
 
 use crate::{
-    database::{
-        AppState,
-        repositories::billing_repository::{load_effective_plan, load_settings},
-    },
+    database::{AppState, repositories::billing_repository::load_settings},
     errors::api_error::{ApiError, codes},
     models::{
         billing::{
             AccessTier, BillingInterval, BillingMe, BillingSettings, CreditsSummary, PromoKind,
-            RedemptionSummary, ReferralSummary, Subscription, SubscriptionSource,
-            SubscriptionStatus, WITHDRAWAL_DAYS, subscription_in_effect,
+            RedemptionSummary, ReferralSummary, SubscriptionSource, SubscriptionStatus,
+            WITHDRAWAL_DAYS, subscription_in_effect,
         },
         notification::{Notification, NotificationType},
     },
@@ -1909,26 +1906,37 @@ async fn withdrawal_eligible_until(
 
 /// The body of `GET /billing/me`.
 pub async fn billing_me(state: &AppState, user_id: Uuid) -> Result<BillingMe, ApiError> {
-    let settings = state.billing_repo.get_settings().await?;
-    let entitlements = entitlements::entitlements(state, user_id).await?;
-    let subscription: Option<Subscription> = state.billing_repo.get_subscription(user_id).await?;
-    let balance = state.billing_repo.credit_balance(user_id).await?;
-    let (rewarded, pending) = state.billing_repo.referral_counts(user_id).await?;
-    let code: Option<String> = sqlx::query_scalar("SELECT referral_code FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(&state.db)
-        .await?
-        .flatten();
-    let plan = load_effective_plan(&state.db, user_id).await?;
+    // Independent reads, a few at a time (each takes a pooled connection
+    // while it runs): the billing mode with the account facts, then the
+    // subscription with the credits and referrals, then the rest.
+    let (settings, facts) = tokio::try_join!(
+        state.billing_repo.get_settings(),
+        entitlements::account_facts(state, user_id)
+    )?;
+    let entitlements = entitlements::Entitlements::from_parts(settings.enforced, facts);
+    let plan = entitlements.plan.clone();
+    let (subscription, balance, (rewarded, pending)) = tokio::try_join!(
+        state.billing_repo.get_subscription(user_id),
+        state.billing_repo.credit_balance(user_id),
+        state.billing_repo.referral_counts(user_id)
+    )?;
+    let code = async {
+        sqlx::query_scalar::<_, Option<String>>("SELECT referral_code FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&state.db)
+            .await
+            .map(Option::flatten)
+            .map_err(ApiError::from)
+    };
+    let (code, withdrawal_eligible_until) =
+        tokio::try_join!(code, withdrawal_eligible_until(state, user_id))?;
+    let withdrawal_eligible_until = withdrawal_eligible_until.map(|t| t.and_utc());
     let past_due_since = subscription
         .as_ref()
         .filter(|s| {
             s.source == SubscriptionSource::Payment && s.status == SubscriptionStatus::PastDue
         })
         .and_then(|s| s.past_due_since)
-        .map(|t| t.and_utc());
-    let withdrawal_eligible_until = withdrawal_eligible_until(state, user_id)
-        .await?
         .map(|t| t.and_utc());
     let access = entitlements.tier();
     Ok(BillingMe {

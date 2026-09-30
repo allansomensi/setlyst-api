@@ -221,7 +221,7 @@ pub async fn authenticate(
         .filter(|token| !token.is_empty())
         .ok_or(ApiError::from(AuthError::MissingToken))?;
 
-    let mut claims = decode_jwt(token.to_string())
+    let mut claims = decode_jwt(token)
         .map_err(|_| ApiError::from(AuthError::InvalidToken))?
         .claims;
 

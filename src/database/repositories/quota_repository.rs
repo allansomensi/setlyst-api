@@ -1,7 +1,7 @@
 use crate::{
     errors::api_error::ApiError,
     models::{
-        billing::AccessTier,
+        billing::{AccessTier, BILLING_SETTINGS_KEY, BillingSettings},
         quota::{
             QuotaLimits, QuotaOverrides, QuotaReport, QuotaResource, QuotaUsageItem,
             UserQuotaSettings,
@@ -11,7 +11,7 @@ use crate::{
 };
 use chrono::NaiveDateTime;
 use serde_json::Value;
-use sqlx::{PgConnection, PgPool, Postgres};
+use sqlx::{PgConnection, PgPool, Postgres, Row};
 use uuid::Uuid;
 
 const QUOTA_DEFAULTS_KEY: &str = "quota_defaults";
@@ -36,6 +36,12 @@ pub struct QuotaGuard {
 }
 
 impl QuotaGuard {
+    /// The limits the guard enforces (`None` = exempt), so a caller that
+    /// needs them for something else doesn't resolve them a second time.
+    pub fn limits(&self) -> Option<QuotaLimits> {
+        self.limits
+    }
+
     /// A guard that never refuses (for callers exempt from quotas).
     pub fn unlimited(resource: QuotaResource, scope_id: Uuid) -> Self {
         Self {
@@ -106,8 +112,17 @@ async fn count_in<'e, E>(
 where
     E: sqlx::Executor<'e, Database = Postgres>,
 {
-    // Each arm is a literal so sqlx accepts it (no runtime-built SQL).
-    let query = match resource {
+    let count: i64 = sqlx::query_scalar(count_sql(resource))
+        .bind(scope_id)
+        .fetch_one(executor)
+        .await?;
+    Ok(count)
+}
+
+/// The statement counting `resource` in scope `$1`. Each arm is a literal
+/// so sqlx accepts it (no runtime-built SQL).
+const fn count_sql(resource: QuotaResource) -> &'static str {
+    match resource {
         QuotaResource::Songs => {
             "SELECT COUNT(*) FROM songs WHERE user_id = $1 AND band_id IS NULL AND deleted_at IS NULL"
         }
@@ -151,13 +166,7 @@ where
         QuotaResource::BandTours => {
             "SELECT COUNT(*) FROM tours WHERE band_id = $1 AND deleted_at IS NULL"
         }
-    };
-
-    let count: i64 = sqlx::query_scalar(query)
-        .bind(scope_id)
-        .fetch_one(executor)
-        .await?;
-    Ok(count)
+    }
 }
 
 #[async_trait::async_trait]
@@ -227,6 +236,15 @@ pub trait QuotaRepository: Send + Sync {
         setlist_id: Uuid,
         adding: i64,
     ) -> Result<QuotaGuard, ApiError>;
+    /// [`setlist_items_guard`](Self::setlist_items_guard) for a setlist
+    /// that may be a band's repertoire, whose songs are bounded by the
+    /// band's song quota instead: `None` then, the guard otherwise.
+    /// `NotFound` for an unknown setlist.
+    async fn setlist_item_room(
+        &self,
+        setlist_id: Uuid,
+        adding: i64,
+    ) -> Result<Option<QuotaGuard>, ApiError>;
 }
 
 pub struct QuotaRepositoryImpl {
@@ -274,6 +292,110 @@ impl QuotaRepositoryImpl {
         .fetch_optional(&self.db)
         .await?;
         Ok(owner)
+    }
+
+    /// The limits of `user_id` together with their overrides (see
+    /// [`QuotaRepository::effective_limits`]). One round trip reads the
+    /// account, its quota settings and both platform settings rows; only
+    /// while plans are enforced is the plan in effect read as well.
+    async fn resolve_limits(
+        &self,
+        user_id: Uuid,
+    ) -> Result<(Option<QuotaLimits>, QuotaOverrides), ApiError> {
+        let row = sqlx::query(
+            "SELECT u.role, (u.email_verified_at IS NOT NULL AND u.email IS NOT NULL) AS email_verified,
+                    q.unlimited, q.overrides,
+                    (SELECT value FROM platform_settings WHERE key = $2) AS billing,
+                    (SELECT value FROM platform_settings WHERE key = $3) AS defaults
+             FROM users u
+             LEFT JOIN user_quotas q ON q.user_id = u.id
+             WHERE u.id = $1",
+        )
+        .bind(user_id)
+        .bind(BILLING_SETTINGS_KEY)
+        .bind(QUOTA_DEFAULTS_KEY)
+        .fetch_optional(&self.db)
+        .await?;
+        let Some(row) = row else {
+            // An unknown account: nothing is exempt, the beta defaults
+            // apply (as before, so callers keep failing on the insert's
+            // foreign key rather than here).
+            let defaults = self.get_defaults().await?;
+            return Ok((Some(defaults), QuotaOverrides::default()));
+        };
+        let role: Role = row.try_get("role")?;
+        let email_verified: bool = row.try_get("email_verified")?;
+        let unlimited: Option<bool> = row.try_get("unlimited")?;
+        let overrides: QuotaOverrides = row
+            .try_get::<Option<Value>, _>("overrides")?
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        let billing: BillingSettings = row
+            .try_get::<Option<Value>, _>("billing")?
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        let defaults: QuotaLimits = row
+            .try_get::<Option<Value>, _>("defaults")?
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+
+        // Staff already have access to everything.
+        if role.is_staff() || unlimited.unwrap_or(false) {
+            return Ok((None, overrides));
+        }
+
+        // See `AccessTier`: the plan's limits while plans are enforced,
+        // the platform defaults in the beta, and the small built-in tiers
+        // for unverified accounts and accounts without a plan. Per-user
+        // overrides apply on top either way.
+        let plan = if billing.enforced {
+            super::billing_repository::load_effective_plan(&self.db, user_id).await?
+        } else {
+            None
+        };
+        let tier = AccessTier::resolve(false, billing.enforced, plan.is_some(), email_verified);
+        let base = match (tier, plan) {
+            (AccessTier::Plan, Some(plan)) => plan.limits,
+            (AccessTier::Unverified, _) => QuotaLimits::UNVERIFIED,
+            (AccessTier::Free, _) => QuotaLimits::FREE,
+            _ => defaults,
+        };
+        Ok((Some(base.with_overrides(&overrides)), overrides))
+    }
+
+    /// The setlist's owner, band and repertoire flag, and the band's
+    /// owner when it has one — whoever's limits its items count against.
+    async fn setlist_scope(
+        &self,
+        setlist_id: Uuid,
+    ) -> Result<(Uuid, Option<Uuid>, bool, Option<Uuid>), ApiError> {
+        sqlx::query_as(
+            "SELECT s.user_id, s.band_id, s.is_repertoire,
+                    (SELECT bm.user_id FROM band_members bm
+                     WHERE bm.band_id = s.band_id AND bm.role = 'owner' LIMIT 1)
+             FROM setlists s WHERE s.id = $1",
+        )
+        .bind(setlist_id)
+        .fetch_optional(&self.db)
+        .await?
+        .ok_or(ApiError::NotFound)
+    }
+
+    async fn setlist_items_guard_for(
+        &self,
+        setlist_id: Uuid,
+        responsible: Uuid,
+        adding: i64,
+    ) -> Result<QuotaGuard, ApiError> {
+        let limits = self.effective_limits(responsible).await?;
+        self.check(limits, QuotaResource::SetlistItems, setlist_id, adding)
+            .await?;
+        Ok(QuotaGuard {
+            limits,
+            resource: QuotaResource::SetlistItems,
+            scope_id: setlist_id,
+            adding,
+        })
     }
 }
 
@@ -356,58 +478,39 @@ impl QuotaRepository for QuotaRepositoryImpl {
     }
 
     async fn effective_limits(&self, user_id: Uuid) -> Result<Option<QuotaLimits>, ApiError> {
-        let row: Option<(Role, bool)> = sqlx::query_as(
-            "SELECT role, (email_verified_at IS NOT NULL AND email IS NOT NULL) FROM users WHERE id = $1",
-        )
-        .bind(user_id)
-        .fetch_optional(&self.db)
-        .await?;
-        let (is_staff, email_verified) = row
-            .map(|(role, verified)| (role.is_staff(), verified))
-            .unwrap_or((false, true));
-
-        // Staff already have access to everything.
-        if is_staff {
-            return Ok(None);
-        }
-
-        let settings = self.get_user_settings(user_id).await?;
-        if settings.unlimited {
-            return Ok(None);
-        }
-
-        // See `AccessTier`: the plan's limits while plans are enforced,
-        // the platform defaults in the beta, and the small built-in tiers
-        // for unverified accounts and accounts without a plan. Per-user
-        // overrides apply on top either way.
-        let billing = super::billing_repository::load_settings(&self.db).await?;
-        let plan = if billing.enforced {
-            super::billing_repository::load_effective_plan(&self.db, user_id).await?
-        } else {
-            None
-        };
-        let tier = AccessTier::resolve(false, billing.enforced, plan.is_some(), email_verified);
-        let base = match (tier, plan) {
-            (AccessTier::Plan, Some(plan)) => plan.limits,
-            (AccessTier::Unverified, _) => QuotaLimits::UNVERIFIED,
-            (AccessTier::Free, _) => QuotaLimits::FREE,
-            _ => self.get_defaults().await?,
-        };
-        Ok(Some(base.with_overrides(&settings.overrides)))
+        Ok(self.resolve_limits(user_id).await?.0)
     }
 
     async fn report(&self, user_id: Uuid) -> Result<QuotaReport, ApiError> {
-        let limits = self.effective_limits(user_id).await?;
-        let settings = self.get_user_settings(user_id).await?;
-        let overrides = serde_json::to_value(&settings.overrides).unwrap_or_default();
+        // The limits (with the overrides they were built from) and every
+        // per-user count, in one statement each.
+        let limits_and_overrides = self.resolve_limits(user_id);
+        let counts = async {
+            let selects: Vec<String> = QuotaResource::PER_USER
+                .iter()
+                .map(|resource| format!("({})", count_sql(*resource)))
+                .collect();
+            // Every fragment is a literal of this file; only `$1` is bound.
+            let sql = format!("SELECT {}", selects.join(", "));
+            let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(user_id)
+                .fetch_one(&self.db)
+                .await?;
+            let mut used = Vec::with_capacity(QuotaResource::PER_USER.len());
+            for index in 0..QuotaResource::PER_USER.len() {
+                used.push(row.try_get::<i64, _>(index)?);
+            }
+            Ok::<_, ApiError>(used)
+        };
+        let ((limits, overrides), used) = tokio::try_join!(limits_and_overrides, counts)?;
+        let overrides = serde_json::to_value(&overrides).unwrap_or_default();
 
         let mut items = Vec::with_capacity(QuotaResource::ALL.len());
         for resource in QuotaResource::ALL {
-            let used = if QuotaResource::PER_USER.contains(&resource) {
-                Some(self.count(resource, user_id).await?)
-            } else {
-                None
-            };
+            let used = QuotaResource::PER_USER
+                .iter()
+                .position(|r| *r == resource)
+                .map(|index| used[index]);
 
             items.push(QuotaUsageItem {
                 resource,
@@ -489,30 +592,23 @@ impl QuotaRepository for QuotaRepositoryImpl {
         setlist_id: Uuid,
         adding: i64,
     ) -> Result<QuotaGuard, ApiError> {
-        let row: Option<(Uuid, Option<Uuid>)> =
-            sqlx::query_as("SELECT user_id, band_id FROM setlists WHERE id = $1")
-                .bind(setlist_id)
-                .fetch_optional(&self.db)
-                .await?;
+        let (owner_id, _, _, band_owner) = self.setlist_scope(setlist_id).await?;
+        self.setlist_items_guard_for(setlist_id, band_owner.unwrap_or(owner_id), adding)
+            .await
+    }
 
-        let Some((owner_id, band_id)) = row else {
-            return Err(ApiError::NotFound);
-        };
-
-        let responsible = match band_id {
-            Some(band_id) => self.band_owner(band_id).await?.unwrap_or(owner_id),
-            None => owner_id,
-        };
-
-        let limits = self.effective_limits(responsible).await?;
-        self.check(limits, QuotaResource::SetlistItems, setlist_id, adding)
-            .await?;
-        Ok(QuotaGuard {
-            limits,
-            resource: QuotaResource::SetlistItems,
-            scope_id: setlist_id,
-            adding,
-        })
+    async fn setlist_item_room(
+        &self,
+        setlist_id: Uuid,
+        adding: i64,
+    ) -> Result<Option<QuotaGuard>, ApiError> {
+        let (owner_id, _, is_repertoire, band_owner) = self.setlist_scope(setlist_id).await?;
+        if is_repertoire {
+            return Ok(None);
+        }
+        self.setlist_items_guard_for(setlist_id, band_owner.unwrap_or(owner_id), adding)
+            .await
+            .map(Some)
     }
 
     async fn ensure_tags(&self, user_id: Uuid, tags: &[String]) -> Result<(), ApiError> {

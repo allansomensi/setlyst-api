@@ -274,46 +274,53 @@ impl TrashRepository for TrashRepositoryImpl {
         .bind(item_type.key())
         .fetch_all(&mut *tx)
         .await?;
-        for song in &songs {
-            let artist_deleted: bool =
-                sqlx::query_scalar("SELECT deleted_at IS NOT NULL FROM artists WHERE id = $1")
-                    .bind(song.5)
-                    .fetch_one(&mut *tx)
-                    .await?;
-            if artist_deleted && !artist_ids.contains(&song.5) {
-                artist_ids.push(song.5);
+        // One statement for the whole batch rather than one per song: the
+        // artists of the songs that are themselves still in the trash.
+        let song_artist_ids: Vec<Uuid> = songs.iter().map(|song| song.5).collect();
+        if !song_artist_ids.is_empty() {
+            let trashed_artists: Vec<Uuid> = sqlx::query_scalar(
+                "SELECT DISTINCT id FROM artists WHERE id = ANY($1) AND deleted_at IS NOT NULL",
+            )
+            .bind(&song_artist_ids)
+            .fetch_all(&mut *tx)
+            .await?;
+            for artist_id in trashed_artists {
+                if !artist_ids.contains(&artist_id) {
+                    artist_ids.push(artist_id);
+                }
             }
         }
 
-        // Uniqueness against live rows.
-        for artist_id in &artist_ids {
+        // Uniqueness against live rows, checked for the batch at once.
+        if !artist_ids.is_empty() {
             let conflict: bool = sqlx::query_scalar(
                 "SELECT EXISTS (
                     SELECT 1 FROM artists a, artists t
-                    WHERE t.id = $1 AND a.deleted_at IS NULL AND a.id <> t.id
+                    WHERE t.id = ANY($1) AND a.deleted_at IS NULL AND a.id <> t.id
                       AND LOWER(a.name) = LOWER(t.name)
                       AND ((t.band_id IS NULL AND a.band_id IS NULL AND a.user_id = t.user_id)
                            OR a.band_id = t.band_id))",
             )
-            .bind(artist_id)
+            .bind(&artist_ids)
             .fetch_one(&mut *tx)
             .await?;
             if conflict {
                 return Err(restore_conflict(TrashType::Artist));
             }
         }
-        for (song_id, ..) in &songs {
+        if !songs.is_empty() {
+            let song_ids: Vec<Uuid> = songs.iter().map(|song| song.0).collect();
             let conflict: bool = sqlx::query_scalar(
                 "SELECT EXISTS (
                     SELECT 1 FROM songs s, songs t
-                    WHERE t.id = $1 AND s.deleted_at IS NULL AND s.id <> t.id
+                    WHERE t.id = ANY($1) AND s.deleted_at IS NULL AND s.id <> t.id
                       AND ((t.band_id IS NULL AND s.band_id IS NULL AND s.user_id = t.user_id
                             AND s.artist_id = t.artist_id
                             AND LOWER(TRIM(s.title)) = LOWER(TRIM(t.title)))
                            OR (t.band_id IS NOT NULL AND t.forked_from IS NOT NULL
                                AND s.band_id = t.band_id AND s.forked_from = t.forked_from)))",
             )
-            .bind(song_id)
+            .bind(&song_ids)
             .fetch_one(&mut *tx)
             .await?;
             if conflict {
@@ -475,23 +482,41 @@ impl TrashRepository for TrashRepositoryImpl {
     }
 
     async fn purge_before(&self, cutoff: NaiveDateTime) -> Result<u64, ApiError> {
+        /// Rows one statement deletes at a time: a purge that fell behind
+        /// (or the first one after a long retention change) is worked
+        /// off in short statements, none of which can hit the statement
+        /// timeout and roll the whole purge back.
+        const BATCH: i64 = 1_000;
         let mut total = 0u64;
         // Songs before artists (an artist is only purged once no live
         // song refers to it); each statement commits on its own so a huge
         // backlog doesn't hold one long transaction.
         for query in [
-            "DELETE FROM songs WHERE deleted_at < $1",
-            "DELETE FROM artists a WHERE a.deleted_at < $1
-               AND NOT EXISTS (SELECT 1 FROM songs s WHERE s.artist_id = a.id AND s.deleted_at IS NULL)",
-            "DELETE FROM setlists WHERE deleted_at < $1 AND NOT is_repertoire",
-            "DELETE FROM gigs WHERE deleted_at < $1",
-            "DELETE FROM tours WHERE deleted_at < $1",
+            "DELETE FROM songs WHERE id IN (
+                 SELECT id FROM songs WHERE deleted_at < $1 LIMIT $2)",
+            "DELETE FROM artists WHERE id IN (
+                 SELECT a.id FROM artists a WHERE a.deleted_at < $1
+                   AND NOT EXISTS (SELECT 1 FROM songs s WHERE s.artist_id = a.id AND s.deleted_at IS NULL)
+                 LIMIT $2)",
+            "DELETE FROM setlists WHERE id IN (
+                 SELECT id FROM setlists WHERE deleted_at < $1 AND NOT is_repertoire LIMIT $2)",
+            "DELETE FROM gigs WHERE id IN (
+                 SELECT id FROM gigs WHERE deleted_at < $1 LIMIT $2)",
+            "DELETE FROM tours WHERE id IN (
+                 SELECT id FROM tours WHERE deleted_at < $1 LIMIT $2)",
         ] {
-            total += sqlx::query(query)
-                .bind(cutoff)
-                .execute(&self.db)
-                .await?
-                .rows_affected();
+            loop {
+                let deleted = sqlx::query(query)
+                    .bind(cutoff)
+                    .bind(BATCH)
+                    .execute(&self.db)
+                    .await?
+                    .rows_affected();
+                total += deleted;
+                if deleted < BATCH as u64 {
+                    break;
+                }
+            }
         }
         Ok(total)
     }

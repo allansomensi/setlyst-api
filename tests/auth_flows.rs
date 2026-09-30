@@ -1107,7 +1107,7 @@ impl setlyst_api::email::worker::MailTransport for FlakyTransport {
         &self,
         to: &str,
         email: &setlyst_api::email::templates::RenderedEmail,
-    ) -> Result<(), String> {
+    ) -> Result<(), setlyst_api::email::worker::SendFailure> {
         use std::sync::atomic::Ordering;
         if self
             .failures_left

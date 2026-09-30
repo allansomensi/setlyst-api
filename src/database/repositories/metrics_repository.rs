@@ -252,22 +252,35 @@ impl MetricsRepositoryImpl {
         extra_where: Option<&str>,
         days: i64,
     ) -> Result<Vec<TimeseriesPoint>, ApiError> {
-        let join_condition = match extra_where {
-            Some(extra) => format!("t.created_at::date = gs.day::date AND {extra}"),
-            None => "t.created_at::date = gs.day::date".to_string(),
+        let extra_filter = match extra_where {
+            Some(extra) => format!("AND {extra}"),
+            None => String::new(),
         };
 
+        // The rows of the window are counted per day first (a range scan
+        // on `created_at`), then joined to the series of days to fill the
+        // gaps: joining the raw table on `created_at::date` would scan it
+        // once per day of the window.
         let sql = format!(
             r#"
-            SELECT gs.day::date AS date, COUNT(t.id) AS count
-            FROM generate_series(
-                (CURRENT_DATE - ($1::int - 1))::timestamp,
-                CURRENT_DATE::timestamp,
-                interval '1 day'
-            ) AS gs(day)
-            LEFT JOIN {table} t ON {join_condition}
-            GROUP BY gs.day
-            ORDER BY gs.day
+            WITH days AS (
+                SELECT day::date AS date
+                FROM generate_series(
+                    (CURRENT_DATE - ($1::int - 1))::timestamp,
+                    CURRENT_DATE::timestamp,
+                    interval '1 day'
+                ) AS gs(day)
+            ), counted AS (
+                SELECT t.created_at::date AS date, COUNT(*) AS count
+                FROM {table} t
+                WHERE t.created_at >= (CURRENT_DATE - ($1::int - 1))::timestamp
+                  {extra_filter}
+                GROUP BY t.created_at::date
+            )
+            SELECT days.date, COALESCE(counted.count, 0)::bigint AS count
+            FROM days
+            LEFT JOIN counted ON counted.date = days.date
+            ORDER BY days.date
             "#
         );
 
@@ -291,15 +304,24 @@ impl MetricsRepositoryImpl {
     ) -> Result<Vec<TimeseriesPoint>, ApiError> {
         let sql = format!(
             r#"
-            SELECT gs.day::date AS date, COUNT(t.id) AS count
-            FROM generate_series(
-                (CURRENT_DATE - ($1::int - 1))::timestamp,
-                CURRENT_DATE::timestamp,
-                interval '1 day'
-            ) AS gs(day)
-            LEFT JOIN {table} t ON t.created_at::date = gs.day::date AND {extra_where}
-            GROUP BY gs.day
-            ORDER BY gs.day
+            WITH days AS (
+                SELECT day::date AS date
+                FROM generate_series(
+                    (CURRENT_DATE - ($1::int - 1))::timestamp,
+                    CURRENT_DATE::timestamp,
+                    interval '1 day'
+                ) AS gs(day)
+            ), counted AS (
+                SELECT t.created_at::date AS date, COUNT(*) AS count
+                FROM {table} t
+                WHERE t.created_at >= (CURRENT_DATE - ($1::int - 1))::timestamp
+                  AND {extra_where}
+                GROUP BY t.created_at::date
+            )
+            SELECT days.date, COALESCE(counted.count, 0)::bigint AS count
+            FROM days
+            LEFT JOIN counted ON counted.date = days.date
+            ORDER BY days.date
             "#
         );
 

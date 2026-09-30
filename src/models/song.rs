@@ -934,6 +934,48 @@ pub struct PublicSong {
     pub links: Links,
 }
 
+impl SongWithArtist {
+    /// A song read through [`Song`] (whose `artist_name` is resolved with
+    /// a join) in the shape exports and setlists use. `None` when the
+    /// artist's name wasn't part of the read.
+    pub fn from_song(song: Song) -> Option<Self> {
+        Some(Self {
+            id: song.id,
+            title: song.title,
+            artist_id: song.artist_id,
+            artist_name: song.artist_name?,
+            user_id: song.user_id,
+            band_id: song.band_id,
+            forked_from: song.forked_from,
+            version_label: song.version_label,
+            version_of: song.version_of,
+            tempo: song.tempo,
+            lyrics: song.lyrics,
+            tonality: song.tonality,
+            genre: song.genre,
+            duration: song.duration,
+            energy: song.energy,
+            time_signature: song.time_signature,
+            capo: song.capo,
+            tuning: song.tuning,
+            performance_notes: song.performance_notes,
+            links: song.links,
+            tags: song.tags,
+            updated_by: song.updated_by,
+            updated_by_username: song.updated_by_username,
+            source_synced_at: song.source_synced_at,
+            transpose: None,
+            added_by: None,
+            added_by_username: None,
+            added_by_avatar_url: None,
+            added_at: None,
+            held: false,
+            created_at: song.created_at,
+            updated_at: song.updated_at,
+        })
+    }
+}
+
 impl PublicSong {
     /// Whoever holds a share link gets the running order, never the
     /// lyrics (they may be someone's copyrighted or unpublished work, and

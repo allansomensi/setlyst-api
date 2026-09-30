@@ -137,6 +137,13 @@ pub trait AnnouncementRepository: Send + Sync {
         per_page: i64,
     ) -> Result<(Vec<Announcement>, i64), ApiError>;
     async fn stats(&self, announcement: &Announcement) -> Result<AnnouncementStats, ApiError>;
+    /// [`stats`](Self::stats) of every announcement of a page, in order,
+    /// with the receipts counted in one statement and each distinct
+    /// audience counted once.
+    async fn stats_for(
+        &self,
+        announcements: &[Announcement],
+    ) -> Result<Vec<AnnouncementStats>, ApiError>;
     /// Accounts an audience currently matches.
     async fn count_audience(
         &self,
@@ -193,6 +200,30 @@ pub struct AnnouncementRepositoryImpl {
 impl AnnouncementRepositoryImpl {
     pub fn new(db: PgPool) -> Self {
         Self { db }
+    }
+
+    /// How many receipts of each of `ids` were seen, dismissed and
+    /// acknowledged, in one statement.
+    async fn receipt_counts(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, (i64, i64, i64)>, ApiError> {
+        let rows: Vec<(Uuid, i64, i64, i64)> = sqlx::query_as(
+            "SELECT announcement_id,
+                    COUNT(*) FILTER (WHERE seen_at IS NOT NULL),
+                    COUNT(*) FILTER (WHERE dismissed_at IS NOT NULL),
+                    COUNT(*) FILTER (WHERE acknowledged_at IS NOT NULL)
+             FROM announcement_receipts
+             WHERE announcement_id = ANY($1)
+             GROUP BY announcement_id",
+        )
+        .bind(ids)
+        .fetch_all(&self.db)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, seen, dismissed, acknowledged)| (id, (seen, dismissed, acknowledged)))
+            .collect())
     }
 }
 
@@ -312,27 +343,26 @@ impl AnnouncementRepository for AnnouncementRepositoryImpl {
             AnnouncementStatus::Archived => "archived",
         });
         let timestamp = now();
-        let total: i64 = sqlx::query_scalar(concat!(
+        let total = sqlx::query_scalar::<_, i64>(concat!(
             "SELECT COUNT(*) FROM announcements a WHERE ",
             status_filter!()
         ))
         .bind(status_key)
         .bind(timestamp)
-        .fetch_one(&self.db)
-        .await?;
+        .fetch_one(&self.db);
         let rows = sqlx::query_as::<_, Announcement>(concat!(
             "SELECT ",
             announcement_columns!(),
             " FROM announcements a WHERE ",
             status_filter!(),
-            " ORDER BY a.created_at DESC LIMIT $3 OFFSET $4"
+            " ORDER BY a.created_at DESC, a.id DESC LIMIT $3 OFFSET $4"
         ))
         .bind(status_key)
         .bind(timestamp)
         .bind(per_page)
         .bind((page - 1) * per_page)
-        .fetch_all(&self.db)
-        .await?;
+        .fetch_all(&self.db);
+        let (total, rows) = tokio::try_join!(total, rows)?;
         Ok((
             rows.into_iter().map(|a| a.with_status(timestamp)).collect(),
             total,
@@ -340,28 +370,72 @@ impl AnnouncementRepository for AnnouncementRepositoryImpl {
     }
 
     async fn stats(&self, announcement: &Announcement) -> Result<AnnouncementStats, ApiError> {
-        let targeted = self
-            .count_audience(
-                announcement.audience_roles.as_deref(),
-                announcement.audience_plans.as_deref(),
-                announcement.audience_locales.as_deref(),
-            )
-            .await?;
-        let (seen, dismissed, acknowledged): (i64, i64, i64) = sqlx::query_as(
-            "SELECT COUNT(*) FILTER (WHERE seen_at IS NOT NULL),
-                    COUNT(*) FILTER (WHERE dismissed_at IS NOT NULL),
-                    COUNT(*) FILTER (WHERE acknowledged_at IS NOT NULL)
-             FROM announcement_receipts WHERE announcement_id = $1",
-        )
-        .bind(announcement.id)
-        .fetch_one(&self.db)
-        .await?;
+        let targeted = self.count_audience(
+            announcement.audience_roles.as_deref(),
+            announcement.audience_plans.as_deref(),
+            announcement.audience_locales.as_deref(),
+        );
+        let receipts = self.receipt_counts(std::slice::from_ref(&announcement.id));
+        let (targeted, receipts) = tokio::try_join!(targeted, receipts)?;
+        let (seen, dismissed, acknowledged) =
+            receipts.get(&announcement.id).copied().unwrap_or_default();
         Ok(AnnouncementStats {
             targeted,
             seen,
             dismissed,
             acknowledged,
         })
+    }
+
+    async fn stats_for(
+        &self,
+        announcements: &[Announcement],
+    ) -> Result<Vec<AnnouncementStats>, ApiError> {
+        // The receipt counts of the whole page in one statement, and the
+        // audience size once per distinct audience (most announcements
+        // target everybody, which is one count of the users table rather
+        // than one per row).
+        let ids: Vec<Uuid> = announcements.iter().map(|a| a.id).collect();
+        let receipts = self.receipt_counts(&ids).await?;
+        let mut audiences: std::collections::HashMap<
+            (
+                Option<Vec<String>>,
+                Option<Vec<String>>,
+                Option<Vec<String>>,
+            ),
+            i64,
+        > = std::collections::HashMap::new();
+        let mut stats = Vec::with_capacity(announcements.len());
+        for announcement in announcements {
+            let audience = (
+                announcement.audience_roles.clone(),
+                announcement.audience_plans.clone(),
+                announcement.audience_locales.clone(),
+            );
+            let targeted = match audiences.get(&audience) {
+                Some(count) => *count,
+                None => {
+                    let count = self
+                        .count_audience(
+                            audience.0.as_deref(),
+                            audience.1.as_deref(),
+                            audience.2.as_deref(),
+                        )
+                        .await?;
+                    audiences.insert(audience, count);
+                    count
+                }
+            };
+            let (seen, dismissed, acknowledged) =
+                receipts.get(&announcement.id).copied().unwrap_or_default();
+            stats.push(AnnouncementStats {
+                targeted,
+                seen,
+                dismissed,
+                acknowledged,
+            });
+        }
+        Ok(stats)
     }
 
     async fn count_audience(
@@ -429,7 +503,7 @@ impl AnnouncementRepository for AnnouncementRepositoryImpl {
         per_page: i64,
     ) -> Result<(Vec<(Announcement, AnnouncementReceipt)>, i64), ApiError> {
         let timestamp = now();
-        let total: i64 = sqlx::query_scalar(concat!(
+        let total = sqlx::query_scalar::<_, i64>(concat!(
             "SELECT COUNT(*) FROM announcements a
              WHERE a.published_at IS NOT NULL AND a.archived_at IS NULL
                AND (a.starts_at IS NULL OR a.starts_at <= $2) AND ",
@@ -437,8 +511,7 @@ impl AnnouncementRepository for AnnouncementRepositoryImpl {
         ))
         .bind(user_id)
         .bind(timestamp)
-        .fetch_one(&self.db)
-        .await?;
+        .fetch_one(&self.db);
         let rows = sqlx::query_as::<_, AnnouncementWithReceipt>(concat!(
             "SELECT ",
             announcement_columns!(),
@@ -448,14 +521,14 @@ impl AnnouncementRepository for AnnouncementRepositoryImpl {
              WHERE a.published_at IS NOT NULL AND a.archived_at IS NULL
                AND (a.starts_at IS NULL OR a.starts_at <= $2) AND ",
             caller_targeted!(),
-            " ORDER BY COALESCE(a.starts_at, a.published_at) DESC LIMIT $3 OFFSET $4"
+            " ORDER BY COALESCE(a.starts_at, a.published_at) DESC, a.id DESC LIMIT $3 OFFSET $4"
         ))
         .bind(user_id)
         .bind(timestamp)
         .bind(per_page)
         .bind((page - 1) * per_page)
-        .fetch_all(&self.db)
-        .await?;
+        .fetch_all(&self.db);
+        let (total, rows) = tokio::try_join!(total, rows)?;
         Ok((
             rows.into_iter().map(|r| split(r, timestamp)).collect(),
             total,

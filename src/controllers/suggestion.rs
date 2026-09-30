@@ -17,7 +17,7 @@ use crate::{
     },
     services::{
         entitlements::{Feature, ensure_feature},
-        notifier::notify,
+        notifier::{notify, notify_all},
     },
 };
 use axum::{
@@ -307,26 +307,27 @@ pub async fn create_suggestion(
     info!(%user_id, %band_id, suggestion_id = %id, "Song suggested");
 
     let name = band_name(&state, band_id).await?;
-    let username: String = sqlx::query_scalar("SELECT username FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_one(&state.db)
-        .await?;
-    for member in state.band_member_repo.list(band_id).await? {
-        if member.user_id != user_id {
-            notify(
-                &state,
-                Notification::band_suggestion_created(
-                    member.user_id,
-                    band_id,
-                    &name,
-                    id,
-                    &song.title,
-                    &username,
-                ),
+    // The caller's username is on the claims (refreshed from the account
+    // on every request by the authentication middleware).
+    let username = &access.0.username;
+    let notifications: Vec<Notification> = state
+        .band_member_repo
+        .list(band_id)
+        .await?
+        .into_iter()
+        .filter(|member| member.user_id != user_id)
+        .map(|member| {
+            Notification::band_suggestion_created(
+                member.user_id,
+                band_id,
+                &name,
+                id,
+                &song.title,
+                username,
             )
-            .await;
-        }
-    }
+        })
+        .collect();
+    notify_all(&state, notifications).await;
 
     // Never accepted on creation: the suggester's own up-vote doesn't
     // count towards automatic acceptance (see `vote_suggestion`).

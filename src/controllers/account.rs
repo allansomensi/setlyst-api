@@ -186,13 +186,18 @@ pub async fn get_security(
     access: AccessControl,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = current_account(&state, &access).await?;
-    let public = public_user(&state, user.id).await?;
-    let identities = state.security_repo.list_identities(user.id).await?;
-    let remaining = if user.two_factor_enabled() {
-        state.security_repo.count_recovery_codes(user.id).await?
-    } else {
-        0
+    let remaining = async {
+        if user.two_factor_enabled() {
+            state.security_repo.count_recovery_codes(user.id).await
+        } else {
+            Ok(0)
+        }
     };
+    let (public, identities, remaining) = tokio::try_join!(
+        public_user(&state, user.id),
+        state.security_repo.list_identities(user.id),
+        remaining
+    )?;
     Ok(Json(SecurityOverview {
         two_factor_enabled: user.two_factor_enabled(),
         two_factor_enabled_at: user.totp_enabled_at,

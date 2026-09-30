@@ -351,6 +351,7 @@ impl ApiError {
     pub fn code(&self) -> &str {
         match self {
             ApiError::DatabaseError(e) if is_unique_violation(e) => "ALREADY_EXISTS",
+            ApiError::DatabaseError(e) if is_database_busy(e) => codes::SERVICE_BUSY,
             ApiError::DatabaseError(_) => "DATABASE_ERROR",
             ApiError::ValidationError(_) => "VALIDATION_ERROR",
             ApiError::EncryptionError(_) => "ENCRYPT_ERROR",
@@ -372,6 +373,27 @@ impl ApiError {
 
 fn is_unique_violation(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
+}
+
+/// Seconds a client is asked to wait after a [`is_database_busy`] answer.
+const DATABASE_BUSY_RETRY_SECONDS: u64 = 2;
+
+/// A database error that means "not now" rather than "broken": no pooled
+/// connection became free in time, a statement or lock wait hit its
+/// timeout, or a transaction lost a serialization/deadlock race. Answered
+/// as `SERVICE_BUSY` (503, `Retry-After`) so clients back off and the
+/// spike is visible as such instead of as a run of server bugs.
+pub fn is_database_busy(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Database(db) => matches!(
+            db.code().as_deref(),
+            // query_canceled (statement_timeout), lock_not_available
+            // (lock_timeout), serialization_failure, deadlock_detected.
+            Some("57014" | "55P03" | "40001" | "40P01")
+        ),
+        _ => false,
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -441,6 +463,16 @@ impl IntoResponse for ApiError {
                     Some("Please choose a different name."),
                 ),
             ),
+            ApiError::DatabaseError(e) if is_database_busy(e) => {
+                tracing::warn!(error = %e, "Database busy; answering SERVICE_BUSY");
+                let mut response = ErrorResponse::new(
+                    &code,
+                    "The service is busy. Please try again in a few seconds.",
+                    None,
+                );
+                response.meta = Some(json!({ "retry_after_seconds": DATABASE_BUSY_RETRY_SECONDS }));
+                (StatusCode::SERVICE_UNAVAILABLE, response)
+            }
             ApiError::DatabaseError(e) => {
                 error!(error = %e, "Unhandled database error");
                 (
@@ -675,6 +707,16 @@ mod tests {
                 .get(RETRY_AFTER)
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn a_saturated_pool_answers_service_busy_with_retry_after() {
+        let response = ApiError::DatabaseError(sqlx::Error::PoolTimedOut).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[RETRY_AFTER], "2");
+        let (_, body) = body_json(ApiError::DatabaseError(sqlx::Error::PoolTimedOut)).await;
+        assert_eq!(body["code"], codes::SERVICE_BUSY);
+        assert!(!is_database_busy(&sqlx::Error::RowNotFound));
     }
 
     #[tokio::test]

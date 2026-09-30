@@ -618,7 +618,13 @@ pub async fn get_setlist(
         .find_setlist(id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let items = state.setlist_repo.get_items(id).await?;
+    // Bounded like the owner's own view of it: a repertoire can hold
+    // thousands of songs with their lyrics.
+    let mut items = state
+        .setlist_repo
+        .get_items_capped(id, crate::controllers::setlist::MAX_LISTED_ITEMS)
+        .await?;
+    items.truncate(crate::controllers::setlist::MAX_LISTED_ITEMS);
     AuditEvent::by(&access, actions::STAFF_CONTENT_VIEWED)
         .target("setlist", id, &setlist.title)
         .ip(&ip.0)

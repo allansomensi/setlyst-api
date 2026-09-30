@@ -7,9 +7,9 @@ use crate::{
     errors::api_error::ApiError,
     routes,
 };
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 use tokio::signal;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Settings that are only defaults for local development. A release build
 /// refuses to start with a broken e-mail setup (sign-up, password reset and
@@ -101,7 +101,12 @@ pub fn insecure_smtp_problem(config: &Config) -> Option<&'static str> {
 }
 
 /// How long the startup check of the Stripe key's scopes may take.
-const PAYMENT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const PAYMENT_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a shutdown waits for background work (audit entries being
+/// written, an e-mail batch in flight, a purge batch) before closing the
+/// pool anyway.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 
 /// Checks that the Stripe key can read what the webhook and the finance
 /// report need (see [`crate::services::payments::probe_permissions`]).
@@ -196,10 +201,8 @@ pub async fn run() -> Result<(), ApiError> {
 
     check_production_config(config);
 
-    let state = AppState::new(pool);
-    check_payment_permissions(&state, config).await;
-    crate::jobs::spawn_all(state.clone());
-    let app = routes::create_routes(state);
+    let state = AppState::new(pool.clone());
+    let app = routes::create_routes(state.clone());
 
     let listener = match tokio::net::TcpListener::bind(&config.host).await {
         Ok(listener) => {
@@ -212,6 +215,17 @@ pub async fn run() -> Result<(), ApiError> {
         }
     };
 
+    // The socket is bound first: a slow or unreachable Stripe must not
+    // keep the instance from answering health checks for up to a minute.
+    // A live key that Stripe refuses a scope still stops the process.
+    {
+        let state = state.clone();
+        crate::utils::tasks::spawn(async move {
+            check_payment_permissions(&state, config).await;
+        });
+    }
+    crate::jobs::spawn_all(state);
+
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -219,6 +233,20 @@ pub async fn run() -> Result<(), ApiError> {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .expect("Error starting the server");
+
+    // No new connections are accepted and the ones in flight have been
+    // answered. Let the background work finish (jobs stop at their next
+    // tick, spawned writes complete) before the pool goes away, so nothing
+    // is left half done: an e-mail stuck in `sending`, an audit entry lost.
+    info!("Waiting for background work to finish...");
+    if !crate::utils::tasks::shutdown(SHUTDOWN_GRACE).await {
+        warn!(
+            "Some background work did not finish within {}s; closing anyway",
+            SHUTDOWN_GRACE.as_secs()
+        );
+    }
+    pool.close().await;
+    info!("Shutdown complete");
 
     Ok(())
 }

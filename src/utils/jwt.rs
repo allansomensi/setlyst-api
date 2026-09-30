@@ -8,6 +8,7 @@ use chrono::{Duration, NaiveDateTime, Utc};
 use jsonwebtoken::{
     Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation, decode, encode,
 };
+use std::sync::OnceLock;
 use uuid::Uuid;
 
 /// Clock skew tolerated on `exp` between this server and whoever checks
@@ -17,12 +18,35 @@ const LEEWAY_SECONDS: u64 = 30;
 /// rejected: it can only come from a forged or badly clocked issuer.
 const MAX_FUTURE_IAT_SECONDS: i64 = 60;
 
+/// The signing and verification material, derived from the secret once:
+/// every authenticated request verifies a token, and rebuilding the key
+/// and the validation rules (two sets and a copy of the secret) each time
+/// is pure waste on that path.
+struct Keys {
+    encoding: EncodingKey,
+    decoding: DecodingKey,
+    validation: Validation,
+}
+
+fn keys() -> &'static Keys {
+    static KEYS: OnceLock<Keys> = OnceLock::new();
+    KEYS.get_or_init(|| {
+        let secret = Config::get().jwt_secret.as_bytes();
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.leeway = LEEWAY_SECONDS;
+        Keys {
+            encoding: EncodingKey::from_secret(secret),
+            decoding: DecodingKey::from_secret(secret),
+            validation,
+        }
+    })
+}
+
 fn sign(claims: &Claims) -> Result<String, ApiError> {
-    let config = Config::get();
     Ok(encode(
         &Header::new(Algorithm::HS256),
         claims,
-        &EncodingKey::from_secret(config.jwt_secret.as_bytes()),
+        &keys().encoding,
     )?)
 }
 
@@ -92,21 +116,15 @@ pub fn generate_impersonation_jwt(
 }
 
 pub fn validate_jwt(token: &str) -> Result<(), ApiError> {
-    decode_jwt(token.to_string()).map(|_| ())
+    decode_jwt(token).map(|_| ())
 }
 
 /// Decodes and validates a session token: HS256 only (the algorithm is
 /// pinned, never taken from the token header), `exp` with a small
 /// leeway, and an `iat` that is not in the future.
-pub fn decode_jwt(token: String) -> Result<TokenData<Claims>, ApiError> {
-    let config = Config::get();
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.leeway = LEEWAY_SECONDS;
-    let data = decode::<Claims>(
-        &token,
-        &DecodingKey::from_secret(config.jwt_secret.as_bytes()),
-        &validation,
-    )?;
+pub fn decode_jwt(token: &str) -> Result<TokenData<Claims>, ApiError> {
+    let keys = keys();
+    let data = decode::<Claims>(token, &keys.decoding, &keys.validation)?;
 
     if data.claims.iat as i64 > Utc::now().timestamp() + MAX_FUTURE_IAT_SECONDS {
         return Err(ApiError::from(AuthError::InvalidToken));

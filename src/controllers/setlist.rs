@@ -28,7 +28,9 @@ use crate::{
         song::{PublicSong, SongWithArtist},
     },
     music::transpose::apply_setlist_key,
-    services::entitlements::{Feature, ensure_feature, has_feature, shared_content_visible},
+    services::entitlements::{
+        Feature, ensure_feature, entitlements, has_feature, shared_content_visible,
+    },
     utils::share_token::token_fingerprint,
 };
 use axum::{
@@ -874,6 +876,7 @@ pub async fn reorder_setlist_songs(
     );
 
     payload.validate()?;
+    ensure_distinct(payload.song_ids.iter().copied())?;
 
     state
         .setlist_repo
@@ -918,15 +921,16 @@ pub async fn get_setlist_items(
 
     debug!(%user_id, setlist_id = %id, "Processing request to retrieve setlist items");
 
-    state.setlist_repo.exists(id, user_id).await?;
     // The largest ordinary answer of the API (a repertoire's every song
     // with its lyrics): bounded in size and in how often one account can
     // ask for it, so a filled-up band can't be turned into a way to keep
-    // the server busy serialising and compressing tens of megabytes.
+    // the server busy serialising and compressing tens of megabytes. The
+    // limit comes first: a caller past it doesn't cost a query either.
     crate::utils::rate_limit::presets::limit(
         &crate::utils::rate_limit::presets::SETLIST_ITEMS,
         user_id,
     )?;
+    state.setlist_repo.exists(id, user_id).await?;
 
     let mut items = state
         .setlist_repo
@@ -963,6 +967,7 @@ pub async fn reorder_setlist_items(
     debug!(%user_id, %setlist_id, "Processing request to reorder setlist items");
 
     payload.validate()?;
+    ensure_distinct(payload.items.iter().map(|item| item.id))?;
 
     state
         .setlist_repo
@@ -1010,7 +1015,7 @@ pub async fn create_setlist_block(
         .can_edit_items(setlist_id, user_id)
         .await?;
 
-    let quota = item_room(&state, setlist_id, user_id).await?;
+    let quota = item_room(&state, setlist_id).await?;
 
     let marker = state
         .setlist_repo
@@ -1098,7 +1103,7 @@ pub async fn create_setlist_break(
         .can_edit_items(setlist_id, user_id)
         .await?;
 
-    let quota = item_room(&state, setlist_id, user_id).await?;
+    let quota = item_room(&state, setlist_id).await?;
 
     let marker = state
         .setlist_repo
@@ -1256,19 +1261,54 @@ pub async fn export_setlist_pdf(
     let mut options = PdfExportOptions::from(query);
     // Without a plan that includes PDF export (the free tier), setlists
     // still export, always with the watermark.
-    if !has_feature(&state, user_id, Feature::PdfExport).await? {
+    let entitlements = entitlements(&state, user_id).await?;
+    if !entitlements.has(Feature::PdfExport) {
         options.watermark = true;
     }
     if options.is_advanced() {
-        ensure_feature(&state, user_id, Feature::AdvancedPdf).await?;
+        entitlements.require(&state, Feature::AdvancedPdf).await?;
     }
-    let items = state
-        .setlist_repo
-        .get_items_capped(id, MAX_PDF_ITEMS)
-        .await?;
+    let items = setlist_items_for_pdf(&state, id, options.include_lyrics).await?;
     ensure_pdf_fits(&items, options.include_lyrics)?;
 
     render_setlist_pdf(&state, &setlist, items, options).await
+}
+
+/// The items a setlist PDF prints: with the songs' lyrics only when the
+/// songbook is part of it (a running order alone never needs the charts,
+/// which are by far the heaviest part of a filled-up setlist).
+async fn setlist_items_for_pdf(
+    state: &AppState,
+    setlist_id: Uuid,
+    include_lyrics: bool,
+) -> Result<Vec<SetlistItem>, ApiError> {
+    if include_lyrics {
+        state
+            .setlist_repo
+            .get_items_capped(setlist_id, MAX_PDF_ITEMS)
+            .await
+    } else {
+        state
+            .setlist_repo
+            .get_items_capped_summary(setlist_id, MAX_PDF_ITEMS)
+            .await
+    }
+}
+
+/// `BAD_REQUEST` when `ids` names the same item twice: a running order
+/// with a repeated entry would give two rows the same position, and the
+/// order shown afterwards would depend on which row the database happened
+/// to return first.
+fn ensure_distinct(ids: impl Iterator<Item = Uuid>) -> Result<(), ApiError> {
+    let mut seen = std::collections::HashSet::new();
+    for id in ids {
+        if !seen.insert(id) {
+            return Err(ApiError::BadRequest(
+                "The list contains the same item twice.".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A PDF download (`Cache-Control: no-store`, RFC 5987 file name).
@@ -1293,22 +1333,10 @@ pub(crate) fn pdf_response(bytes: Vec<u8>, filename: &str) -> axum::response::Re
 /// transaction. A repertoire's songs are bounded by the band's song quota
 /// instead, and its blocks and breaks by `MAX_REPERTOIRE_MARKERS` (checked
 /// in the insert).
-async fn item_room(
-    state: &AppState,
-    setlist_id: Uuid,
-    user_id: Uuid,
-) -> Result<Option<QuotaGuard>, ApiError> {
-    let setlist = state
-        .setlist_repo
-        .find_by_id(setlist_id, user_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    if setlist.is_repertoire {
-        return Ok(None);
-    }
-    Ok(Some(
-        state.quota_repo.setlist_items_guard(setlist_id, 1).await?,
-    ))
+async fn item_room(state: &AppState, setlist_id: Uuid) -> Result<Option<QuotaGuard>, ApiError> {
+    // The caller's access was checked by the permission lookup before;
+    // the guard reads the setlist's scope itself.
+    state.quota_repo.setlist_item_room(setlist_id, 1).await
 }
 
 /// A band's song, resolved by [`band_song_for`].
@@ -1444,12 +1472,6 @@ async fn render_setlist_pdf(
     mut items: Vec<SetlistItem>,
     options: PdfExportOptions,
 ) -> Result<axum::response::Response, ApiError> {
-    // Printed in the key each song is played in in this setlist.
-    for item in &mut items {
-        if let SetlistItem::Song { song, .. } = item {
-            apply_setlist_key(song);
-        }
-    }
     let band_name = match setlist.band_id {
         Some(band_id) => state.band_repo.find_any(band_id).await?.map(|b| b.name),
         None => None,
@@ -1460,6 +1482,14 @@ async fn render_setlist_pdf(
     let total_duration_secs = setlist.total_duration;
 
     let bytes = render_pdf(move || {
+        // Printed in the key each song is played in in this setlist.
+        // Rewriting every chord of a songbook is CPU work like the
+        // layout itself, so it happens here, off the async runtime.
+        for item in &mut items {
+            if let SetlistItem::Song { song, .. } = item {
+                apply_setlist_key(song);
+            }
+        }
         let data = SetlistPdfData {
             title: &title,
             description: description.as_deref(),
@@ -1792,10 +1822,7 @@ pub async fn export_public_setlist_pdf(
     if options.is_advanced() && !has_feature(&state, setlist.user_id, Feature::AdvancedPdf).await? {
         options = options.to_basic();
     }
-    let items = state
-        .setlist_repo
-        .get_items_capped(setlist.id, MAX_PDF_ITEMS)
-        .await?;
+    let items = setlist_items_for_pdf(&state, setlist.id, options.include_lyrics).await?;
     ensure_pdf_fits(&items, options.include_lyrics)?;
 
     render_setlist_pdf(&state, &setlist, items, options).await

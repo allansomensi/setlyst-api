@@ -148,7 +148,7 @@ impl ModerationRepository for ModerationRepositoryImpl {
         };
         let offset = (page - 1) * per_page;
 
-        let total: i64 = sqlx::query_scalar(
+        let total = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM moderation_flags f
              WHERE ($1::moderation_status IS NULL OR f.status = $1)
                AND ($2::moderation_target IS NULL OR f.target_type = $2)
@@ -157,8 +157,7 @@ impl ModerationRepository for ModerationRepositoryImpl {
         .bind(status)
         .bind(query.target_type)
         .bind(query.user_id)
-        .fetch_one(&self.db)
-        .await?;
+        .fetch_one(&self.db);
 
         let rows = sqlx::query_as::<_, ModerationFlagRow>(concat!(
             "SELECT ",
@@ -166,7 +165,7 @@ impl ModerationRepository for ModerationRepositoryImpl {
             " WHERE ($1::moderation_status IS NULL OR f.status = $1)
                 AND ($2::moderation_target IS NULL OR f.target_type = $2)
                 AND ($3::uuid IS NULL OR f.user_id = $3)
-              ORDER BY f.created_at DESC
+              ORDER BY f.created_at DESC, f.id DESC
               LIMIT $4 OFFSET $5"
         ))
         .bind(status)
@@ -174,9 +173,9 @@ impl ModerationRepository for ModerationRepositoryImpl {
         .bind(query.user_id)
         .bind(per_page)
         .bind(offset)
-        .fetch_all(&self.db)
-        .await?;
+        .fetch_all(&self.db);
 
+        let (total, rows) = tokio::try_join!(total, rows)?;
         Ok((rows.into_iter().map(ModerationFlag::from).collect(), total))
     }
 

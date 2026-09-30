@@ -33,7 +33,9 @@ use crate::{
         hashing::{dummy_verify_async, hash_password, verify_password_upgrading_async},
         jwt::{decode_jwt, renew_jwt},
     },
-    validations::password::{is_password_compliant, password_issues_checked},
+    validations::password::{
+        is_breached, is_password_compliant, password_issues, password_issues_checked,
+    },
 };
 use axum::{
     Json,
@@ -202,7 +204,7 @@ pub async fn login(
 /// when it locks the network (or the whole account) out, the lock's audit
 /// entry and the owner's notice.
 fn spawn_password_failure(state: AppState, user: User, bucket: String, ip: Option<String>) {
-    tokio::spawn(async move {
+    crate::utils::tasks::spawn(async move {
         let failure = match state
             .user_repo
             .record_password_failure(user.id, &bucket)
@@ -447,7 +449,9 @@ pub async fn register(
 ) -> Result<impl IntoResponse, ApiError> {
     debug!("Received registration request");
 
-    let issues = password_issues_checked(&payload.password, Some(&payload.username)).await;
+    // The local password rules first; the breach check (an outbound
+    // call) only once everything else about the request checked out.
+    let issues = password_issues(&payload.password, Some(&payload.username));
     if !issues.is_empty() {
         return Err(ApiError::weak_password(&issues));
     }
@@ -486,6 +490,11 @@ pub async fn register(
             codes::EMAIL_TAKEN,
             "This e-mail address is already in use.",
         ));
+    }
+    if is_breached(&payload.password).await {
+        return Err(ApiError::weak_password(&[
+            crate::validations::password::ISSUE_BREACHED,
+        ]));
     }
 
     let locale = account::supported_locale(payload.locale.as_deref());
@@ -582,7 +591,7 @@ pub async fn verify(
     State(state): State<AppState>,
     Json(payload): Json<VerifyTokenPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let claims = decode_jwt(payload.token)
+    let claims = decode_jwt(&payload.token)
         .map_err(|_| ApiError::session_revoked())?
         .claims;
 
@@ -614,7 +623,7 @@ pub async fn refresh(
     State(state): State<AppState>,
     Json(payload): Json<VerifyTokenPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let claims = decode_jwt(payload.token)
+    let claims = decode_jwt(&payload.token)
         .map_err(|_| ApiError::session_revoked())?
         .claims;
 

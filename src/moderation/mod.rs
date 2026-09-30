@@ -301,7 +301,7 @@ pub async fn review_band_logo(
 pub fn spawn_username_review(state: &AppState, user_id: Uuid, username: &str) {
     let state = state.clone();
     let username = username.to_string();
-    tokio::spawn(async move {
+    crate::utils::tasks::spawn(async move {
         if let Err(e) = review_username(&state, user_id, &username).await {
             error!(%user_id, error = %e, "Username moderation failed");
         }
@@ -312,7 +312,7 @@ pub fn spawn_username_review(state: &AppState, user_id: Uuid, username: &str) {
 pub fn spawn_avatar_review(state: &AppState, user_id: Uuid, url: &str) {
     let state = state.clone();
     let url = url.to_string();
-    tokio::spawn(async move {
+    crate::utils::tasks::spawn(async move {
         if let Err(e) = review_avatar(&state, user_id, &url).await {
             error!(%user_id, error = %e, "Avatar moderation failed");
         }
@@ -324,7 +324,7 @@ pub fn spawn_avatar_review(state: &AppState, user_id: Uuid, url: &str) {
 pub fn spawn_band_logo_review(state: &AppState, band_id: Uuid, url: &str) {
     let state = state.clone();
     let url = url.to_string();
-    tokio::spawn(async move {
+    crate::utils::tasks::spawn(async move {
         if let Err(e) = review_band_logo(&state, band_id, &url).await {
             error!(%band_id, error = %e, "Band logo moderation failed");
         }
@@ -459,7 +459,7 @@ pub fn spawn_image_rescan(state: &AppState) -> bool {
         return false;
     }
     let state = state.clone();
-    tokio::spawn(async move {
+    crate::utils::tasks::spawn(async move {
         match rescan_images(&state).await {
             Ok(flagged) => info!(flagged, "Image rescan finished"),
             Err(e) => error!(error = %e, "Image rescan failed"),

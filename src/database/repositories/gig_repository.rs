@@ -49,6 +49,9 @@ pub trait GigRepository: Send + Sync {
     /// A gig the caller may view: their own personal gig, or any gig of a
     /// band they belong to.
     async fn find_by_id(&self, id: Uuid, user_id: Uuid) -> Result<Option<Gig>, ApiError>;
+    /// [`find_by_id`](Self::find_by_id) for several gigs at once (the
+    /// ones the caller may see, in no particular order).
+    async fn find_many(&self, ids: &[Uuid], user_id: Uuid) -> Result<Vec<Gig>, ApiError>;
     /// Any gig by ID, without an access filter (staff tooling).
     async fn find_any(&self, id: Uuid) -> Result<Option<Gig>, ApiError>;
     /// Creates a gig. `quota` is enforced inside the insert's transaction
@@ -194,6 +197,25 @@ impl GigRepository for GigRepositoryImpl {
         .fetch_optional(&self.db)
         .await?;
         Ok(gig)
+    }
+
+    async fn find_many(&self, ids: &[Uuid], user_id: Uuid) -> Result<Vec<Gig>, ApiError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let gigs = sqlx::query_as::<_, Gig>(concat!(
+            "SELECT ",
+            gig_columns!(),
+            " FROM gigs g
+             LEFT JOIN band_members bm ON bm.band_id = g.band_id AND bm.user_id = $2
+             WHERE g.id = ANY($1) AND g.deleted_at IS NULL
+               AND ((g.band_id IS NULL AND g.user_id = $2) OR bm.user_id IS NOT NULL)"
+        ))
+        .bind(ids)
+        .bind(user_id)
+        .fetch_all(&self.db)
+        .await?;
+        Ok(gigs)
     }
 
     async fn find_any(&self, id: Uuid) -> Result<Option<Gig>, ApiError> {

@@ -229,6 +229,22 @@ pub struct SecurityRepositoryImpl {
     pub db: PgPool,
 }
 
+/// Takes the transaction-scoped advisory lock `<scope>:<user>` that
+/// serializes one kind of security bookkeeping per account, without
+/// locking the account's row itself.
+async fn lock_account(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope: &str,
+    user_id: Uuid,
+) -> Result<(), ApiError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1 || ':' || $2::text, 0))")
+        .bind(scope)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 impl SecurityRepositoryImpl {
     pub fn new(db: PgPool) -> Self {
         Self { db }
@@ -253,11 +269,11 @@ impl SecurityRepository for SecurityRepositoryImpl {
         let mut tx = self.db.begin().await?;
         let timestamp = now();
         // Serializes issuance per account: concurrent requests all see
-        // the code the first one inserted.
-        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?;
+        // the code the first one inserted. An advisory lock rather than
+        // the account's row: locking the row would queue every other
+        // write to it (a sign-in being recorded, a failed attempt) behind
+        // these six statements.
+        lock_account(&mut tx, "code", user_id).await?;
         let window_start = timestamp - chrono::Duration::seconds(limits.window_seconds);
         // The resend interval is per account (one e-mail a minute, from
         // anyone); the allowance is per requester, so one stranger can't
@@ -467,11 +483,9 @@ impl SecurityRepository for SecurityRepositoryImpl {
         let timestamp = now();
         let mut tx = self.db.begin().await?;
         // Serializes concurrent sign-ins of the same account, so two
-        // parallel password checks can't both leave a live challenge.
-        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?;
+        // parallel password checks can't both leave a live challenge
+        // (without locking the account's row, see `lock_account`).
+        lock_account(&mut tx, "challenge", user_id).await?;
         sqlx::query(
             "UPDATE login_challenges SET consumed_at = $2
              WHERE user_id = $1 AND consumed_at IS NULL",

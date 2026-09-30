@@ -116,7 +116,7 @@ impl AuditEvent {
     /// (used where the time taken must not depend on the outcome, such as
     /// failed sign-ins).
     pub fn spawn(self, repo: std::sync::Arc<dyn AuditRepository>) {
-        tokio::spawn(async move {
+        crate::utils::tasks::spawn(async move {
             self.record(&*repo).await;
         });
     }

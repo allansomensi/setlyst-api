@@ -8,8 +8,9 @@
 //! the outcome:
 //!
 //! - sent → `sent`;
-//! - failed → retried with exponential back-off, up to [`MAX_ATTEMPTS`],
-//!   then `failed`;
+//! - failed → retried with exponential back-off (capped at an hour), up
+//!   to [`MAX_ATTEMPTS`], then `failed`; a failure the server calls
+//!   permanent (an address that doesn't exist) is not retried at all;
 //! - no SMTP server configured (development) → the rendered text is logged
 //!   and the message is marked `skipped`;
 //! - the recipient switched that category of e-mail off after the message
@@ -46,11 +47,20 @@ use lettre::{
 use serde_json::Value;
 use sqlx::{FromRow, PgPool};
 use std::sync::atomic::{AtomicI64, Ordering};
+use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-/// Delivery attempts before a message is given up on.
-pub const MAX_ATTEMPTS: i32 = 6;
+/// Delivery attempts before a message is given up on. With the capped
+/// back-off this spans about three hours, so a provider incident of an
+/// afternoon doesn't lose every code and reset queued meanwhile.
+pub const MAX_ATTEMPTS: i32 = 10;
+/// The longest wait between two attempts.
+pub const MAX_BACKOFF_SECS: i64 = 3600;
+/// How long one SMTP delivery may take (the connection, TLS and the
+/// dialogue): lettre's own timeout only covers the TCP connect, and one
+/// stalled connection would otherwise hold its worker slot forever.
+pub const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Messages claimed per run.
 pub const BATCH_SIZE: i64 = 25;
 /// Messages of one batch in flight at once (each on its own pooled SMTP
@@ -61,16 +71,60 @@ pub const DEFAULT_HOURLY_CAP: i64 = 500;
 /// A message stuck in `sending` this long (a crashed worker) is retried.
 const STALE_LOCK_MINUTES: i64 = 10;
 
+/// Why a delivery failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendFailure {
+    pub message: String,
+    /// The server said the message can never be delivered as it is (a
+    /// mailbox that doesn't exist, a rejected sender): retrying can't help.
+    pub permanent: bool,
+}
+
+impl SendFailure {
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            permanent: false,
+        }
+    }
+
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            permanent: true,
+        }
+    }
+}
+
+impl From<String> for SendFailure {
+    fn from(message: String) -> Self {
+        Self::transient(message)
+    }
+}
+
+impl From<&str> for SendFailure {
+    fn from(message: &str) -> Self {
+        Self::transient(message)
+    }
+}
+
 /// Something that can deliver a rendered message.
 #[async_trait::async_trait]
 pub trait MailTransport: Send + Sync {
-    async fn send(&self, to: &str, email: &RenderedEmail) -> Result<(), String>;
+    async fn send(&self, to: &str, email: &RenderedEmail) -> Result<(), SendFailure>;
 }
 
 /// SMTP delivery through `lettre`, over a small pool of reused
 /// connections (no TCP + TLS + AUTH handshake per message).
+///
+/// A send is bounded by [`SEND_TIMEOUT`]. When it fires the whole
+/// connection pool is replaced: the stalled connection can't be told
+/// apart from a healthy one by lettre (it would hand it out again, and a
+/// connection dropped mid-`DATA` swallows the next command), and dropping
+/// the pool closes every socket it holds.
 pub struct SmtpMailer {
-    transport: AsyncSmtpTransport<Tokio1Executor>,
+    transport: RwLock<AsyncSmtpTransport<Tokio1Executor>>,
+    config: SmtpConfig,
     from: Mailbox,
     reply_to: Option<Mailbox>,
     /// Public API origin for the RFC 8058 one-click unsubscribe link.
@@ -79,6 +133,25 @@ pub struct SmtpMailer {
 
 impl SmtpMailer {
     pub fn from_config(config: &SmtpConfig) -> Result<Self, String> {
+        Ok(Self {
+            transport: RwLock::new(Self::build_transport(config)?),
+            config: config.clone(),
+            from: config
+                .from
+                .parse()
+                .map_err(|e| format!("invalid SMTP_FROM: {e}"))?,
+            reply_to: match &config.reply_to {
+                Some(r) => Some(
+                    r.parse()
+                        .map_err(|e| format!("invalid SMTP_REPLY_TO: {e}"))?,
+                ),
+                None => None,
+            },
+            api_public_url: Config::try_get().and_then(|c| c.api_public_url.clone()),
+        })
+    }
+
+    fn build_transport(config: &SmtpConfig) -> Result<AsyncSmtpTransport<Tokio1Executor>, String> {
         let builder = match config.tls {
             SmtpTls::StartTls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.host)
                 .map_err(|e| e.to_string())?,
@@ -97,21 +170,15 @@ impl SmtpMailer {
         if let (Some(user), Some(password)) = (&config.username, &config.password) {
             builder = builder.credentials(Credentials::new(user.clone(), password.clone()));
         }
-        Ok(Self {
-            transport: builder.build(),
-            from: config
-                .from
-                .parse()
-                .map_err(|e| format!("invalid SMTP_FROM: {e}"))?,
-            reply_to: match &config.reply_to {
-                Some(r) => Some(
-                    r.parse()
-                        .map_err(|e| format!("invalid SMTP_REPLY_TO: {e}"))?,
-                ),
-                None => None,
-            },
-            api_public_url: Config::try_get().and_then(|c| c.api_public_url.clone()),
-        })
+        Ok(builder.build())
+    }
+
+    /// Replaces the connection pool after a stalled send.
+    async fn reset_transport(&self) {
+        match Self::build_transport(&self.config) {
+            Ok(fresh) => *self.transport.write().await = fresh,
+            Err(e) => error!(error = %e, "Could not rebuild the SMTP transport"),
+        }
     }
 }
 
@@ -138,8 +205,10 @@ pub fn list_unsubscribe(web_url: &str, api_public_url: Option<&str>) -> (String,
 
 #[async_trait::async_trait]
 impl MailTransport for SmtpMailer {
-    async fn send(&self, to: &str, email: &RenderedEmail) -> Result<(), String> {
-        let to: Mailbox = to.parse().map_err(|e| format!("invalid recipient: {e}"))?;
+    async fn send(&self, to: &str, email: &RenderedEmail) -> Result<(), SendFailure> {
+        let to: Mailbox = to
+            .parse()
+            .map_err(|e| SendFailure::permanent(format!("invalid recipient: {e}")))?;
         let mut builder = Message::builder()
             .from(self.from.clone())
             .to(to)
@@ -167,12 +236,29 @@ impl MailTransport for SmtpMailer {
                 email.text.clone(),
                 email.html.clone(),
             ))
-            .map_err(|e| e.to_string())?;
-        self.transport
-            .send(message)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| SendFailure::permanent(e.to_string()))?;
+        let sent = {
+            let transport = self.transport.read().await;
+            tokio::time::timeout(SEND_TIMEOUT, transport.send(message)).await
+        };
+        match sent {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(SendFailure {
+                message: e.to_string(),
+                permanent: e.is_permanent(),
+            }),
+            Err(_) => {
+                warn!(
+                    timeout_secs = SEND_TIMEOUT.as_secs(),
+                    "SMTP delivery timed out; replacing the connection pool"
+                );
+                self.reset_transport().await;
+                Err(SendFailure::transient(format!(
+                    "SMTP delivery timed out after {}s",
+                    SEND_TIMEOUT.as_secs()
+                )))
+            }
+        }
     }
 }
 
@@ -189,9 +275,10 @@ struct ClaimedEmail {
 }
 
 /// Delay before retry number `attempts` (1-based): 30 s, 1 min, 2 min...
+/// up to [`MAX_BACKOFF_SECS`].
 pub fn backoff(attempts: i32) -> Duration {
     let exponent = (attempts - 1).clamp(0, 10) as u32;
-    Duration::seconds(30 * 2i64.pow(exponent))
+    Duration::seconds((30 * 2i64.pow(exponent)).min(MAX_BACKOFF_SECS))
 }
 
 /// What happened to one claimed message.
@@ -231,12 +318,16 @@ pub fn render_for(
 /// Non-security messages sent in the last hour (what the hourly cap is
 /// compared with).
 async fn sent_last_hour(pool: &PgPool, now: NaiveDateTime) -> Result<i64, ApiError> {
+    // `priority > 0` is spelled out (rather than bound) so the planner can
+    // always match the partial index `idx_email_outbox_sent_bulk`, which
+    // carries the same predicate; a bound parameter can't be proven to
+    // imply it under a generic plan.
+    const _: () = assert!(priority::SECURITY == 0);
     Ok(sqlx::query_scalar(
         "SELECT COUNT(*) FROM email_outbox
-         WHERE status = 'sent' AND priority > $2 AND sent_at > $1",
+         WHERE status = 'sent' AND priority > 0 AND sent_at > $1",
     )
     .bind(now - Duration::hours(1))
-    .bind(priority::SECURITY)
     .fetch_one(pool)
     .await?)
 }
@@ -312,7 +403,25 @@ pub async fn process_batch(
         .buffered(SEND_CONCURRENCY)
         .collect()
         .await;
-    outcomes.into_iter().collect()
+    // One message's bookkeeping failing (a database hiccup right after
+    // its send) must not fail the batch: the others were delivered and
+    // recorded. Its row stays `sending` and is picked up again by the
+    // stale-lock sweep. Only when every message failed the same way is
+    // the batch itself reported as failed (the database is unreachable).
+    let failed = outcomes.iter().filter(|o| o.is_err()).count();
+    if failed > 0 && failed == outcomes.len() {
+        return outcomes.into_iter().collect();
+    }
+    Ok(outcomes
+        .into_iter()
+        .map(|outcome| match outcome {
+            Ok(delivery) => delivery,
+            Err(e) => {
+                error!(error = %e, "Could not record an e-mail's outcome; it will be retried");
+                Delivery::Retrying
+            }
+        })
+        .collect())
 }
 
 /// Whether the recipient still wants this kind of e-mail: a message that
@@ -394,14 +503,14 @@ async fn deliver(
             finish(pool, email.id, "sent", None, sensitive).await?;
             Ok(Delivery::Sent)
         }
-        Err(e) if email.attempts >= MAX_ATTEMPTS => {
-            let e = mask_emails_in(&e);
-            error!(id = %email.id, error = %e, "E-mail delivery failed for good");
+        Err(failure) if failure.permanent || email.attempts >= MAX_ATTEMPTS => {
+            let e = mask_emails_in(&failure.message);
+            error!(id = %email.id, attempts = email.attempts, permanent = failure.permanent, error = %e, "E-mail delivery failed for good");
             finish(pool, email.id, "failed", Some(&e), sensitive).await?;
             Ok(Delivery::Failed)
         }
-        Err(e) => {
-            let e = mask_emails_in(&e);
+        Err(failure) => {
+            let e = mask_emails_in(&failure.message);
             warn!(id = %email.id, attempts = email.attempts, error = %e, "E-mail delivery failed; will retry");
             let retry_at: NaiveDateTime = Utc::now().naive_utc() + backoff(email.attempts);
             sqlx::query(
@@ -419,6 +528,9 @@ async fn deliver(
     }
 }
 
+/// Records a message's final state. Retried a couple of times on a
+/// database error: the message may already have left (a `sent` that isn't
+/// recorded is delivered again after the stale-lock sweep).
 async fn finish(
     pool: &PgPool,
     id: Uuid,
@@ -426,22 +538,36 @@ async fn finish(
     error: Option<&str>,
     clear_payload: bool,
 ) -> Result<(), ApiError> {
-    sqlx::query(
-        "UPDATE email_outbox
-         SET status = $2::email_status, locked_at = NULL,
-             sent_at = CASE WHEN $2 = 'sent' THEN $3 ELSE sent_at END,
-             last_error = COALESCE($4, last_error),
-             payload = CASE WHEN $5 THEN '{}'::jsonb ELSE payload END
-         WHERE id = $1",
-    )
-    .bind(id)
-    .bind(status)
-    .bind(Utc::now().naive_utc())
-    .bind(error.map(|e| e.chars().take(1000).collect::<String>()))
-    .bind(clear_payload)
-    .execute(pool)
-    .await?;
-    Ok(())
+    const ATTEMPTS: u32 = 3;
+    let error = error.map(|e| e.chars().take(1000).collect::<String>());
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let written = sqlx::query(
+            "UPDATE email_outbox
+             SET status = $2::email_status, locked_at = NULL,
+                 sent_at = CASE WHEN $2 = 'sent' THEN $3 ELSE sent_at END,
+                 last_error = COALESCE($4, last_error),
+                 payload = CASE WHEN $5 THEN '{}'::jsonb ELSE payload END
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(Utc::now().naive_utc())
+        .bind(&error)
+        .bind(clear_payload)
+        .execute(pool)
+        .await;
+        match written {
+            Ok(_) => return Ok(()),
+            Err(e) if attempt < ATTEMPTS => {
+                warn!(%id, status, attempt, error = %e, "Could not record the e-mail's outcome; retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(200 * u64::from(attempt)))
+                    .await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// Checks the SMTP configuration without connecting: `Ok(false)` when there
@@ -485,10 +611,22 @@ mod tests {
     }
 
     #[test]
-    fn backoff_grows_exponentially() {
+    fn backoff_grows_exponentially_up_to_an_hour() {
         assert_eq!(backoff(1), Duration::seconds(30));
         assert_eq!(backoff(2), Duration::seconds(60));
         assert_eq!(backoff(5), Duration::seconds(480));
         assert_eq!(backoff(0), Duration::seconds(30));
+        assert_eq!(backoff(8), Duration::seconds(MAX_BACKOFF_SECS));
+        assert_eq!(backoff(MAX_ATTEMPTS), Duration::seconds(MAX_BACKOFF_SECS));
+        // The whole retry horizon is a few hours, not a few minutes.
+        let horizon: i64 = (1..MAX_ATTEMPTS).map(|n| backoff(n).num_seconds()).sum();
+        assert!(horizon > 2 * 3600, "{horizon}");
+    }
+
+    #[test]
+    fn failures_default_to_transient() {
+        let failure: SendFailure = "421 try again later".into();
+        assert!(!failure.permanent);
+        assert!(SendFailure::permanent("550 no such user").permanent);
     }
 }

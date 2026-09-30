@@ -31,7 +31,7 @@ Built with Rust for reliability and performance, using Axum, SQLx, and PostgreSQ
 - **Setlists** — Create and manage ordered song lists, reorder tracks, and compute total duration automatically
 - **Per-setlist keys** — Each setlist remembers the key it plays every song in (`PATCH /setlists/{id}/songs/{song_id}`, `transpose` in semitones); band setlists start from the repertoire's key, and the setlist PDF and public share print the chords in that key
 - **PDF Export** — Generate printable setlist PDFs with optional title, duration, key, and BPM display; supports `en`, `pt-BR`, and `es` locales
-- **ChordPro Export** — Export all songs as a single `.cho` file compatible with ChordPro readers
+- **ChordPro Export** — Export all songs as a single `.cho` file compatible with ChordPro readers (at most 5 000 songs per file, `CHORDPRO_TOO_LARGE`)
 - **Backup & Restore** — Export/import a full portable JSON snapshot of all user data; atomic import with smart merge rules
 - **Account security** — Sign-in by username or e-mail, per-account lockout after repeated failures, two-factor authentication (TOTP, RFC 6238) with single-use recovery codes, e-mail verification and change by code, password recovery by e-mail, Google sign-in, self-service account deletion and consent tracking
 - **Transactional e-mail** — Localized (`en`, `pt-BR`, `es`) templates delivered through an outbox and a background worker (SMTP via `lettre`), with per-category communication preferences and one-click unsubscribe links
@@ -247,7 +247,7 @@ Every option is optional. Content: `show_title`, `subtitle`, `show_description`,
 
 Supported locales: `en`, `pt-BR`, `es`. The file name is sent RFC 5987-encoded, so non-ASCII titles survive.
 
-Size limits: at most 200 items, and a songbook of at most 250 000 characters of lyrics and notes (`PDF_TOO_LARGE`, 413). At most 3 PDFs render at once (`SERVICE_BUSY`, 503) and a signed-in account may export 30 per minute. The public share export (`/public/setlists/{token}/export/pdf`) never includes the songbook.
+Size limits: at most 200 items, and a songbook of at most 250 000 characters of lyrics (`PDF_TOO_LARGE`, 413). At most 3 PDFs render at once (`SERVICE_BUSY`, 503) and a signed-in account may export 30 per minute. The public share export (`/public/setlists/{token}/export/pdf`) never includes the songbook.
 
 ---
 
@@ -336,7 +336,7 @@ Per-client limits are keyed by the resolved client address (see `TRUSTED_PROXIES
 | Band logo changes | 10 per band per day |
 | Song suggestions | 20 per member per band per day |
 
-Request bodies are limited to 256 KB, except songs (1 MB) and the backup import (10 MB). Requests time out after 30 s (503).
+Request bodies are limited to 256 KB, except songs (1 MB) and the backup import (10 MB). Requests time out after 30 s (503). When the database can't take more work for the moment (no pooled connection free in time, a statement or lock timeout, a serialization failure), the answer is `SERVICE_BUSY` (503, `Retry-After`) rather than a generic 500.
 
 ## Contributing
 

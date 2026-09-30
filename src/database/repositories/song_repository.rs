@@ -33,6 +33,23 @@ macro_rules! song_columns {
 }
 pub(crate) use song_columns;
 
+/// [`song_columns!`] for views that don't show the chart: the lyrics and
+/// the performance notes (up to 50 000 and 2 000 characters each) come
+/// back `NULL` instead of being read, moved and dropped.
+macro_rules! song_summary_columns {
+    () => {
+        "s.id, s.title, s.artist_id, s.user_id, s.band_id, s.forked_from, s.version_label,
+         s.version_of, s.tempo, NULL::text AS lyrics,
+         s.tonality, s.genre, s.duration, s.energy, s.time_signature, s.capo, s.tuning,
+         NULL::text AS performance_notes, s.links,
+         COALESCE((SELECT array_agg(st.tag ORDER BY st.tag) FROM song_tags st WHERE st.song_id = s.id), '{}') AS tags,
+         s.updated_by,
+         (SELECT u.username FROM users u WHERE u.id = s.updated_by) AS updated_by_username,
+         s.source_synced_at, s.created_at, s.updated_at"
+    };
+}
+pub(crate) use song_summary_columns;
+
 /// Which band copies [`SongRepository::band_copies`] looks at.
 #[derive(Debug, Clone, Copy)]
 pub enum BandCopyScope {
@@ -42,6 +59,9 @@ pub enum BandCopyScope {
     Source(Uuid),
     /// Every copy one band holds.
     Band(Uuid),
+    /// The copies one band holds whose original changed since they were
+    /// last brought up to date (`has_updates`).
+    BandOutdated(Uuid),
 }
 
 /// Filters for listing a user's personal songs.
@@ -111,7 +131,13 @@ pub trait SongRepository: Send + Sync {
     /// — for a band-owned copy — a band member whose role satisfies the
     /// band's `manage_songs` permission.
     async fn can_manage(&self, id: Uuid, user_id: Uuid) -> Result<(), ApiError>;
-    async fn export_all_chordpro(&self, user_id: Uuid) -> Result<Vec<SongExport>, ApiError>;
+    /// The caller's live personal songs as ChordPro exports, at most
+    /// `limit` of them (by artist and title).
+    async fn export_all_chordpro(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<SongExport>, ApiError>;
     /// Fetches any song by ID (no ownership filter) with its artist name
     /// resolved. The caller must already have authorized access to `id`.
     async fn find_with_artist_name(&self, id: Uuid) -> Result<Option<SongWithArtist>, ApiError>;
@@ -734,7 +760,11 @@ impl SongRepository for SongRepositoryImpl {
         }
     }
 
-    async fn export_all_chordpro(&self, user_id: Uuid) -> Result<Vec<SongExport>, ApiError> {
+    async fn export_all_chordpro(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<SongExport>, ApiError> {
         let songs = sqlx::query_as::<_, SongExport>(
             r#"
             SELECT
@@ -751,9 +781,11 @@ impl SongRepository for SongRepositoryImpl {
             LEFT JOIN artists a ON s.artist_id = a.id
             WHERE s.user_id = $1 AND s.band_id IS NULL AND s.deleted_at IS NULL
             ORDER BY a.name ASC, s.title ASC
+            LIMIT $2
             "#,
         )
         .bind(user_id)
+        .bind(limit)
         .fetch_all(&self.db)
         .await?;
 
@@ -884,10 +916,11 @@ impl SongRepository for SongRepositoryImpl {
         user_id: Uuid,
         scope: BandCopyScope,
     ) -> Result<Vec<BandCopyStatus>, ApiError> {
-        let (copy_id, source_id, band_id) = match scope {
-            BandCopyScope::Copy(id) => (Some(id), None, None),
-            BandCopyScope::Source(id) => (None, Some(id), None),
-            BandCopyScope::Band(id) => (None, None, Some(id)),
+        let (copy_id, source_id, band_id, outdated_only) = match scope {
+            BandCopyScope::Copy(id) => (Some(id), None, None, false),
+            BandCopyScope::Source(id) => (None, Some(id), None, false),
+            BandCopyScope::Band(id) => (None, None, Some(id), false),
+            BandCopyScope::BandOutdated(id) => (None, None, Some(id), true),
         };
         // Admins and owners always manage songs; other roles as the band
         // configured (as in `can_manage`).
@@ -908,12 +941,14 @@ impl SongRepository for SongRepositoryImpl {
                AND ($2::uuid IS NULL OR c.id = $2)
                AND ($3::uuid IS NULL OR c.forked_from = $3)
                AND ($4::uuid IS NULL OR c.band_id = $4)
+               AND (NOT $5 OR src.updated_at > COALESCE(c.source_synced_at, c.created_at))
              ORDER BY LOWER(b.name), b.id",
         )
         .bind(user_id)
         .bind(copy_id)
         .bind(source_id)
         .bind(band_id)
+        .bind(outdated_only)
         .fetch_all(&self.db)
         .await?;
         Ok(copies)

@@ -329,12 +329,8 @@ pub async fn invite_setlist_collaborator(
         .invite(setlist_id, user_id, invitee.id, role)
         .await?;
 
-    let actor_username = state
-        .user_repo
-        .find_by_id(user_id)
-        .await?
-        .map(|u| u.username)
-        .unwrap_or_default();
+    // The caller's username is on the claims (refreshed from the account
+    // on every request by the authentication middleware).
     notify(
         &state,
         Notification::setlist_invitation(
@@ -343,7 +339,7 @@ pub async fn invite_setlist_collaborator(
             &setlist.title,
             role,
             user_id,
-            &actor_username,
+            &access.0.username,
         ),
     )
     .await;

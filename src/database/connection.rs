@@ -1,5 +1,5 @@
 use crate::{config::Config, errors::api_error::ApiError};
-use sqlx::{Executor, PgPool, postgres::PgPoolOptions};
+use sqlx::{Connection, Executor, PgPool, postgres::PgPoolOptions};
 use std::time::Duration;
 
 /// Per-session limits set on every new connection (unless
@@ -54,9 +54,27 @@ pub async fn create_pool() -> Result<PgPool, ApiError> {
 /// Applies every pending migration. Runs at startup (unless disabled with
 /// `RUN_MIGRATIONS=false`), so a deploy can never serve a binary whose
 /// queries expect columns the database doesn't have yet.
+///
+/// Migrations run on a connection of their own, detached from the pool
+/// and without its per-session limits: a migration that builds an index
+/// on a big table may legitimately take longer than the request-sized
+/// `statement_timeout`, and a second replica starting at the same time
+/// must wait for sqlx's migration lock rather than fail on `lock_timeout`
+/// (either failure exits the process, and a rolled-back migration fails
+/// again on every restart). The relaxed connection is closed afterwards,
+/// so it never serves a request.
 pub async fn run_migrations(pool: &PgPool) -> Result<(), ApiError> {
-    sqlx::migrate!("./src/database/migrations")
-        .run(pool)
+    let mut conn = pool.acquire().await?.detach();
+    conn.execute(
+        "SET statement_timeout = 0;
+         SET lock_timeout = 0;
+         SET idle_in_transaction_session_timeout = 0",
+    )
+    .await?;
+    let result = sqlx::migrate!("./src/database/migrations")
+        .run(&mut conn)
         .await
-        .map_err(|e| ApiError::DatabaseError(e.into()))
+        .map_err(|e| ApiError::DatabaseError(e.into()));
+    let _ = conn.close().await;
+    result
 }

@@ -13,10 +13,22 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Idle keys are swept at most this often once the map is large: a sweep
+/// walks the whole map under the lock, so doing it on every call past the
+/// threshold would turn each check into a full scan.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+/// Below this many keys the map isn't worth sweeping at all.
+const PRUNE_THRESHOLD: usize = 10_000;
+
+struct Hits<K> {
+    map: HashMap<K, VecDeque<Instant>>,
+    last_prune: Option<Instant>,
+}
+
 pub struct SlidingWindowLimiter<K> {
     window: Duration,
     max: usize,
-    hits: Mutex<HashMap<K, VecDeque<Instant>>>,
+    hits: Mutex<Hits<K>>,
 }
 
 impl<K: Eq + Hash + Clone> SlidingWindowLimiter<K> {
@@ -24,7 +36,10 @@ impl<K: Eq + Hash + Clone> SlidingWindowLimiter<K> {
         Self {
             window,
             max,
-            hits: Mutex::new(HashMap::new()),
+            hits: Mutex::new(Hits {
+                map: HashMap::new(),
+                last_prune: None,
+            }),
         }
     }
 
@@ -41,11 +56,17 @@ impl<K: Eq + Hash + Clone> SlidingWindowLimiter<K> {
             return Ok(());
         };
         // Occasional cleanup keeps the map from growing with idle keys.
-        if hits.len() > 10_000 {
+        if hits.map.len() > PRUNE_THRESHOLD
+            && hits
+                .last_prune
+                .is_none_or(|at| now.duration_since(at) >= PRUNE_INTERVAL)
+        {
             let window = self.window;
-            hits.retain(|_, q| q.back().is_some_and(|t| now.duration_since(*t) < window));
+            hits.map
+                .retain(|_, q| q.back().is_some_and(|t| now.duration_since(*t) < window));
+            hits.last_prune = Some(now);
         }
-        let queue = hits.entry(key.clone()).or_default();
+        let queue = hits.map.entry(key.clone()).or_default();
         while queue
             .front()
             .is_some_and(|t| now.duration_since(*t) >= self.window)
@@ -153,5 +174,35 @@ mod tests {
                 .check_at(&1, start + Duration::from_secs(61))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn idle_keys_are_swept_at_most_once_per_interval() {
+        let limiter = SlidingWindowLimiter::new(1, Duration::from_secs(10));
+        let start = Instant::now();
+        for key in 0..(PRUNE_THRESHOLD + 5) {
+            assert!(limiter.check_at(&key, start).is_ok());
+        }
+        // Filling the map past the threshold swept it once (finding
+        // nothing idle). Past the window and the interval everything is
+        // idle, and a sweep only happens once per interval: the first
+        // call sweeps, the next ones don't.
+        let later = start + PRUNE_INTERVAL + Duration::from_secs(1);
+        assert!(limiter.check_at(&0, later).is_ok());
+        assert_eq!(limiter.hits.lock().unwrap().map.len(), 1);
+        for key in 1..(PRUNE_THRESHOLD + 5) {
+            assert!(limiter.check_at(&key, later).is_ok());
+        }
+        assert_eq!(limiter.hits.lock().unwrap().map.len(), PRUNE_THRESHOLD + 5);
+        assert!(
+            limiter
+                .check_at(&0, later + Duration::from_secs(1))
+                .is_err()
+        );
+        assert_eq!(limiter.hits.lock().unwrap().map.len(), PRUNE_THRESHOLD + 5);
+        // The next interval sweeps again.
+        let much_later = later + PRUNE_INTERVAL;
+        assert!(limiter.check_at(&0, much_later).is_ok());
+        assert_eq!(limiter.hits.lock().unwrap().map.len(), 1);
     }
 }

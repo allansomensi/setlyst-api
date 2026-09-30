@@ -34,6 +34,7 @@ sqlx = { version = "0.9", features = [
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 thiserror = "2"
 tokio = { version = "1.52", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 tower-http = { version = "0.7", features = [
     "catch-panic",
     "cors",
@@ -76,6 +77,17 @@ sha1 = "0.10"
 sha2 = "0.10"
 subtle = "2.6"
 unicode-normalization = "0.1"
+
+# Production binaries: whole-program optimisation and a single codegen
+# unit cost build time once and make the hot paths (JSON, SQL decoding,
+# compression, PDF layout) measurably faster. Panics keep unwinding so
+# `CatchPanicLayer` can turn a panicking handler into a 500 instead of
+# taking the process down.
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "unwind"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

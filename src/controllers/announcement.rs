@@ -125,10 +125,15 @@ pub async fn admin_list(
     };
     let (page, per_page) = resolve_page(query.page, query.per_page, 20);
     let (items, total) = state.announcement_repo.list(status, page, per_page).await?;
-    let mut data = Vec::with_capacity(items.len());
-    for item in items {
-        data.push(with_stats(&state, item).await?);
-    }
+    let stats = state.announcement_repo.stats_for(&items).await?;
+    let data: Vec<AdminAnnouncement> = items
+        .into_iter()
+        .zip(stats)
+        .map(|(announcement, stats)| AdminAnnouncement {
+            announcement,
+            stats,
+        })
+        .collect();
     Ok(Json(PaginatedResponse::new(data, total, page, per_page)))
 }
 
