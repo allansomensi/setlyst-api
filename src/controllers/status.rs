@@ -1,5 +1,4 @@
 use crate::{
-    config::Config,
     database::AppState,
     errors::api_error::ApiError,
     models::{
@@ -47,12 +46,15 @@ async fn probe_database(state: &AppState) -> Database {
         .ok()
         .and_then(|v| v.parse().ok());
 
-    let opened_connections: Option<i64> =
-        sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = $1;")
-            .bind(&Config::get().postgres_db)
-            .fetch_one(&state.db)
-            .await
-            .ok();
+    // Every client connection on the server, like `max_connections` counts
+    // them (not only this database's, and not matched against POSTGRES_DB,
+    // which may name a different database than DATABASE_URL does).
+    let opened_connections: Option<i64> = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .ok();
 
     let under_pressure = match (opened_connections, max_connections) {
         (Some(open), Some(max)) if max > 0 => open as f64 / max as f64 >= CONNECTION_PRESSURE,

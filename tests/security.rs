@@ -822,3 +822,136 @@ async fn public_links_are_only_shown_to_members_who_may_manage_the_item() {
         gig_token.as_str()
     );
 }
+
+#[tokio::test]
+async fn session_tokens_are_renewed_until_they_are_revoked() {
+    let app = app!();
+    let (user_id, token) = app.user("renew.user", Role::User).await;
+
+    let renewed = app
+        .post_public("/auth/refresh", json!({ "token": token }))
+        .await;
+    assert_eq!(renewed.status, StatusCode::OK, "{}", renewed.body);
+    let fresh = renewed.body["token"].as_str().unwrap().to_string();
+    assert!(renewed.body["expires_at"].is_string());
+    assert_eq!(app.get("/users/me", &fresh).await.status, StatusCode::OK);
+
+    // Garbage and "view as" tokens are never renewed.
+    let garbage = app
+        .post_public("/auth/refresh", json!({ "token": "not-a-token" }))
+        .await;
+    assert_eq!(garbage.code(), "SESSION_REVOKED");
+    let (_, admin) = app.user("renew.admin", Role::Admin).await;
+    let issued = app
+        .post(&format!("/users/{user_id}/impersonate"), &admin, json!({}))
+        .await;
+    assert_eq!(issued.status, StatusCode::OK, "{}", issued.body);
+    let viewing = issued.body["token"].as_str().unwrap();
+    let refused = app
+        .post_public("/auth/refresh", json!({ "token": viewing }))
+        .await;
+    assert_eq!(refused.code(), "SESSION_REVOKED");
+
+    // "Sign out everywhere" ends the renewed session too, and it can no
+    // longer be renewed.
+    app.state.user_repo.revoke_sessions(user_id).await.unwrap();
+    assert_eq!(app.get("/users/me", &fresh).await.code(), "SESSION_REVOKED");
+    let revoked = app
+        .post_public("/auth/refresh", json!({ "token": fresh }))
+        .await;
+    assert_eq!(revoked.code(), "SESSION_REVOKED");
+}
+
+#[tokio::test]
+async fn audit_log_pages_are_stable_and_repeated_staff_reads_are_logged_once() {
+    let app = app!();
+    let (admin_id, admin) = app.user("audit.admin", Role::Admin).await;
+    let (target_id, _) = app.user("audit.target", Role::User).await;
+
+    // Thirty entries logged in the very same instant.
+    sqlx::query(
+        "INSERT INTO audit_logs (id, actor_id, action, metadata, created_at)
+         SELECT gen_random_uuid(), $1, 'user.updated', '{}'::jsonb, '2030-01-01 00:00:00'
+         FROM generate_series(1, 30)",
+    )
+    .bind(admin_id)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    let ids = |body: &serde_json::Value| -> Vec<String> {
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let path = "/admin/audit-logs?action=user.updated&per_page=10";
+    let first = app.get(&format!("{path}&page=1"), &admin).await;
+    let second = app.get(&format!("{path}&page=2"), &admin).await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    assert_eq!(first.body["meta"]["total_items"], 30, "{}", first.body);
+    let (first, second) = (ids(&first.body), ids(&second.body));
+    assert_eq!(first.len(), 10);
+    assert!(first.iter().all(|id| !second.contains(id)));
+    for _ in 0..3 {
+        let again = app.get(&format!("{path}&page=1"), &admin).await;
+        assert_eq!(ids(&again.body), first);
+    }
+
+    // Opening the same account three times is one access, not three.
+    for _ in 0..3 {
+        let overview = app
+            .get(&format!("/users/{target_id}/overview"), &admin)
+            .await;
+        assert_eq!(overview.status, StatusCode::OK, "{}", overview.body);
+    }
+    let viewed = app
+        .wait_for_count(
+            "SELECT COUNT(*) FROM audit_logs WHERE action = 'staff.content_viewed' AND target_id = $1",
+            target_id,
+            1,
+        )
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let viewed_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_logs WHERE action = 'staff.content_viewed' AND target_id = $1",
+    )
+    .bind(target_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!((viewed, viewed_after), (1, 1));
+
+    // "View as" reads name the staff member behind them.
+    let issued = app
+        .post(
+            &format!("/users/{target_id}/impersonate"),
+            &admin,
+            json!({}),
+        )
+        .await;
+    let viewing = issued.body["token"].as_str().unwrap().to_string();
+    for _ in 0..3 {
+        app.get("/notifications/unread-count", &viewing).await;
+    }
+    let reads = app
+        .wait_for_count(
+            "SELECT COUNT(*) FROM audit_logs WHERE action = 'user.impersonated_read'
+             AND target_id = $1 AND actor_username = 'audit.admin'",
+            target_id,
+            1,
+        )
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let reads_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_logs WHERE action = 'user.impersonated_read'
+         AND target_id = $1 AND metadata->>'path' LIKE '%unread-count'",
+    )
+    .bind(target_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!((reads, reads_after), (1, 1));
+}

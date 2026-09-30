@@ -5,10 +5,15 @@ use crate::{
         auth::access::AccessControl,
     },
 };
+use chrono::NaiveDateTime;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tracing::error;
 use uuid::Uuid;
+
+/// How long a repeated passive staff read (the same page, the same "view
+/// as" request) is folded into the entry already recorded for it.
+pub const STAFF_VIEW_DEDUPE_SECONDS: i32 = 600;
 
 /// A pending audit log entry, built fluently at the call site:
 ///
@@ -31,6 +36,12 @@ pub struct AuditEvent {
     pub target_label: Option<String>,
     pub metadata: Value,
     pub ip_address: Option<String>,
+    /// When the event happened: taken when it is built, not when a
+    /// background task gets round to writing it, so spawned entries keep
+    /// their place among the actions around them.
+    pub created_at: NaiveDateTime,
+    /// See [`AuditEvent::once_within`].
+    pub dedupe_seconds: Option<i32>,
 }
 
 impl AuditEvent {
@@ -45,6 +56,8 @@ impl AuditEvent {
             target_label: None,
             metadata: json!({}),
             ip_address: None,
+            created_at: chrono::Utc::now().naive_utc(),
+            dedupe_seconds: None,
         }
     }
 
@@ -89,6 +102,16 @@ impl AuditEvent {
         self
     }
 
+    /// Skips the entry when an identical one (same actor, impersonator,
+    /// action, target and metadata) was recorded in the last `seconds`.
+    /// For passive reads (staff opening a page, a "view as" session
+    /// polling), so reloading a page or a background poll doesn't flood
+    /// the log with copies of the same access.
+    pub fn once_within(mut self, seconds: i32) -> Self {
+        self.dedupe_seconds = Some(seconds);
+        self
+    }
+
     /// Records the entry in the background, off the request's hot path
     /// (used where the time taken must not depend on the outcome, such as
     /// failed sign-ins).
@@ -130,6 +153,14 @@ pub async fn record_legal_acceptances(repo: &dyn AuditRepository, rows: &[LegalA
     }
 }
 
+/// A page row together with the total of matching entries.
+#[derive(sqlx::FromRow)]
+struct CountedEntry {
+    total: i64,
+    #[sqlx(flatten)]
+    entry: AuditLogEntry,
+}
+
 pub struct AuditRepositoryImpl {
     pub db: PgPool,
 }
@@ -143,14 +174,27 @@ impl AuditRepositoryImpl {
 #[async_trait::async_trait]
 impl AuditRepository for AuditRepositoryImpl {
     async fn record(&self, event: AuditEvent) -> Result<(), ApiError> {
+        // The actor's name is looked up when the caller only knew the id
+        // (e.g. the staff member behind a "view as" session), so the entry
+        // never reads as done by "the system".
         sqlx::query(
             "INSERT INTO audit_logs (id, actor_id, actor_username, impersonator_id, action, target_type,
                                      target_id, target_label, metadata, ip_address, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+             SELECT $1, $2, COALESCE($3, (SELECT username FROM users WHERE id = $2)), $4, $5, $6,
+                    $7, $8, $9, $10, $11
+             WHERE $12::int IS NULL OR NOT EXISTS (
+                 SELECT 1 FROM audit_logs d
+                 WHERE d.action = $5
+                   AND d.actor_id IS NOT DISTINCT FROM $2
+                   AND d.impersonator_id IS NOT DISTINCT FROM $4
+                   AND d.target_type IS NOT DISTINCT FROM $6
+                   AND d.target_id IS NOT DISTINCT FROM $7
+                   AND d.metadata = $9
+                   AND d.created_at > $11 - make_interval(secs => $12::int))",
         )
         .bind(Uuid::now_v7())
         .bind(event.actor_id)
-        .bind(event.actor_username)
+        .bind(event.actor_username.filter(|name| !name.is_empty()))
         .bind(event.impersonator_id)
         .bind(event.action)
         .bind(event.target_type)
@@ -158,7 +202,8 @@ impl AuditRepository for AuditRepositoryImpl {
         .bind(event.target_label)
         .bind(event.metadata)
         .bind(event.ip_address)
-        .bind(chrono::Utc::now().naive_utc())
+        .bind(event.created_at)
+        .bind(event.dedupe_seconds)
         .execute(&self.db)
         .await?;
         Ok(())
@@ -199,31 +244,20 @@ impl AuditRepository for AuditRepositoryImpl {
                 )
             });
 
-        // The WHERE clause is repeated verbatim in both queries: sqlx only
-        // accepts literal query strings. Keep them in sync.
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM audit_logs a
-             WHERE ($1::uuid IS NULL OR a.actor_id = $1)
-               AND ($2::uuid IS NULL OR a.target_id = $2)
-               AND ($3::text IS NULL OR a.action LIKE $3)
-               AND ($4::text IS NULL OR a.actor_username ILIKE $4 OR a.target_label ILIKE $4)",
-        )
-        .bind(query.actor_id)
-        .bind(query.target_id)
-        .bind(&action_pattern)
-        .bind(&search)
-        .fetch_one(&self.db)
-        .await?;
-
-        let entries = sqlx::query_as::<_, AuditLogEntry>(
-            "SELECT a.id, a.actor_id, a.actor_username, a.impersonator_id, a.action, a.target_type,
+        // The total comes with the rows (`COUNT(*) OVER ()`), so both are
+        // read from the same snapshot. Entries logged in the same instant
+        // are ordered by their id (UUIDv7, time-ordered), so a page always
+        // holds the same rows in the same order.
+        let rows = sqlx::query_as::<_, CountedEntry>(
+            "SELECT COUNT(*) OVER () AS total,
+                    a.id, a.actor_id, a.actor_username, a.impersonator_id, a.action, a.target_type,
                     a.target_id, a.target_label, a.metadata, a.ip_address, a.created_at
              FROM audit_logs a
              WHERE ($1::uuid IS NULL OR a.actor_id = $1)
                AND ($2::uuid IS NULL OR a.target_id = $2)
                AND ($3::text IS NULL OR a.action LIKE $3)
                AND ($4::text IS NULL OR a.actor_username ILIKE $4 OR a.target_label ILIKE $4)
-             ORDER BY a.created_at DESC
+             ORDER BY a.created_at DESC, a.id DESC
              LIMIT $5 OFFSET $6",
         )
         .bind(query.actor_id)
@@ -234,6 +268,30 @@ impl AuditRepository for AuditRepositoryImpl {
         .bind(offset)
         .fetch_all(&self.db)
         .await?;
+
+        // Past the last page there is no row to carry the total: count it
+        // separately (the WHERE clause is repeated verbatim, sqlx only
+        // accepts literal query strings; keep them in sync).
+        let count = match rows.first() {
+            Some(row) => row.total,
+            None if offset > 0 => {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM audit_logs a
+                     WHERE ($1::uuid IS NULL OR a.actor_id = $1)
+                       AND ($2::uuid IS NULL OR a.target_id = $2)
+                       AND ($3::text IS NULL OR a.action LIKE $3)
+                       AND ($4::text IS NULL OR a.actor_username ILIKE $4 OR a.target_label ILIKE $4)",
+                )
+                .bind(query.actor_id)
+                .bind(query.target_id)
+                .bind(&action_pattern)
+                .bind(&search)
+                .fetch_one(&self.db)
+                .await?
+            }
+            None => 0,
+        };
+        let entries = rows.into_iter().map(|row| row.entry).collect();
 
         Ok((entries, count))
     }

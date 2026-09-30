@@ -1,7 +1,10 @@
 use crate::{
     database::{
         AppState,
-        repositories::{audit_repository::AuditEvent, user_repository::AuthState},
+        repositories::{
+            audit_repository::{AuditEvent, STAFF_VIEW_DEDUPE_SECONDS},
+            user_repository::AuthState,
+        },
     },
     errors::{api_error::ApiError, auth_error::AuthError},
     models::{
@@ -241,7 +244,9 @@ pub async fn authenticate(
 
     // Every request of a "view as" session is recorded (LGPD
     // accountability for staff access to personal data), bulk exports are
-    // refused, and secrets are withheld from the answers.
+    // refused, and secrets are withheld from the answers. The same read
+    // repeated within a few minutes (a reload, the notification bell's
+    // polling) is recorded once; refused requests always are.
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let blocked = is_bulk_export(&method, &path);
@@ -256,6 +261,9 @@ pub async fn authenticate(
         .ip(&ip.0);
     event.actor_id = Some(impersonation.impersonator_id);
     event.impersonator_id = Some(impersonation.impersonator_id);
+    if !blocked {
+        event = event.once_within(STAFF_VIEW_DEDUPE_SECONDS);
+    }
     event.spawn(state.audit_repo.clone());
     if blocked {
         return Err(ApiError::impersonation_read_only());

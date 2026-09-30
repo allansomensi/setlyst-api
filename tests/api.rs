@@ -763,6 +763,8 @@ async fn status_reports_health_version_and_database() {
     let details = app.get("/status/details", &staff).await;
     assert_eq!(details.body["version"], env!("CARGO_PKG_VERSION"));
     assert!(details.body["dependencies"]["database"]["latency_ms"].is_number());
+    let opened = &details.body["dependencies"]["database"]["opened_connections"];
+    assert!(opened.as_i64().is_some_and(|n| n >= 1), "{}", details.body);
 }
 
 #[tokio::test]

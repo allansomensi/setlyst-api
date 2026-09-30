@@ -7,7 +7,10 @@
 //! platform limits are admin-only.
 
 use crate::{
-    database::{AppState, repositories::audit_repository::AuditEvent},
+    database::{
+        AppState,
+        repositories::audit_repository::{AuditEvent, STAFF_VIEW_DEDUPE_SECONDS},
+    },
     errors::api_error::{ApiError, codes},
     models::{
         PaginatedResponse,
@@ -472,6 +475,7 @@ pub async fn get_song(
             AuditEvent::by(&access, actions::STAFF_CONTENT_VIEWED)
                 .target("song", id, &song.title)
                 .ip(&ip.0)
+                .once_within(STAFF_VIEW_DEDUPE_SECONDS)
                 .spawn(state.audit_repo.clone());
             Ok(Json(AdminSongDetail { song, summary }))
         }
@@ -618,6 +622,7 @@ pub async fn get_setlist(
     AuditEvent::by(&access, actions::STAFF_CONTENT_VIEWED)
         .target("setlist", id, &setlist.title)
         .ip(&ip.0)
+        .once_within(STAFF_VIEW_DEDUPE_SECONDS)
         .spawn(state.audit_repo.clone());
     Ok(Json(AdminSetlistDetail { setlist, items }))
 }

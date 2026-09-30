@@ -1,5 +1,8 @@
 use crate::{
-    database::{AppState, repositories::audit_repository::AuditEvent},
+    database::{
+        AppState,
+        repositories::audit_repository::{AuditEvent, STAFF_VIEW_DEDUPE_SECONDS},
+    },
     errors::api_error::{ApiError, codes},
     models::{
         PaginatedResponse, PaginationQuery,
@@ -164,7 +167,8 @@ pub async fn find_all_users(
     if let Some(q) = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
         let mut event = AuditEvent::by(&access, actions::STAFF_CONTENT_VIEWED)
             .meta(json!({ "view": "user_search", "q": account::mask_identifier_for_staff(q) }))
-            .ip(&ip.0);
+            .ip(&ip.0)
+            .once_within(STAFF_VIEW_DEDUPE_SECONDS);
         event.target_type = Some("user");
         event.spawn(state.audit_repo.clone());
     }
@@ -242,6 +246,7 @@ pub async fn get_user_overview(
         .target("user", id, &user.username)
         .meta(json!({ "view": "overview" }))
         .ip(&ip.0)
+        .once_within(STAFF_VIEW_DEDUPE_SECONDS)
         .spawn(state.audit_repo.clone());
 
     let (usage, quota_settings, bands) = tokio::try_join!(
