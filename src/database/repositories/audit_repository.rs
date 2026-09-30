@@ -287,6 +287,8 @@ impl AuditRepository for AuditRepositoryImpl {
                AND ($2::uuid IS NULL OR a.target_id = $2)
                AND ($3::text IS NULL OR a.action LIKE $3)
                AND ($4::text IS NULL OR a.actor_username ILIKE $4 OR a.target_label ILIKE $4)
+               AND ($7::timestamp IS NULL OR a.created_at >= $7)
+               AND ($8::timestamp IS NULL OR a.created_at < $8)
              ORDER BY a.created_at DESC, a.id DESC
              LIMIT $5 OFFSET $6",
         )
@@ -296,6 +298,8 @@ impl AuditRepository for AuditRepositoryImpl {
         .bind(&search)
         .bind(per_page)
         .bind(offset)
+        .bind(query.from)
+        .bind(query.to)
         .fetch_all(&self.db)
         .await?;
 
@@ -310,12 +314,16 @@ impl AuditRepository for AuditRepositoryImpl {
                      WHERE ($1::uuid IS NULL OR a.actor_id = $1)
                        AND ($2::uuid IS NULL OR a.target_id = $2)
                        AND ($3::text IS NULL OR a.action LIKE $3)
-                       AND ($4::text IS NULL OR a.actor_username ILIKE $4 OR a.target_label ILIKE $4)",
+                       AND ($4::text IS NULL OR a.actor_username ILIKE $4 OR a.target_label ILIKE $4)
+                       AND ($5::timestamp IS NULL OR a.created_at >= $5)
+                       AND ($6::timestamp IS NULL OR a.created_at < $6)",
                 )
                 .bind(query.actor_id)
                 .bind(query.target_id)
                 .bind(&action_pattern)
                 .bind(&search)
+                .bind(query.from)
+                .bind(query.to)
                 .fetch_one(&self.db)
                 .await?
             }

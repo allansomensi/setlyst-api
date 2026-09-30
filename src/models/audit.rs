@@ -162,4 +162,8 @@ pub struct AuditLogQuery {
     pub action: Option<String>,
     /// Free-text search over actor/target labels.
     pub q: Option<String>,
+    /// Only entries logged at or after this instant (UTC).
+    pub from: Option<NaiveDateTime>,
+    /// Only entries logged before this instant (UTC, exclusive).
+    pub to: Option<NaiveDateTime>,
 }
