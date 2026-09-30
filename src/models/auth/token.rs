@@ -36,3 +36,11 @@ pub struct Claims {
 pub struct VerifyTokenPayload {
     pub token: String,
 }
+
+/// A renewed session token (`POST /auth/refresh`).
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RefreshTokenResponse {
+    pub token: String,
+    #[schema(value_type = String, format = DateTime)]
+    pub expires_at: chrono::NaiveDateTime,
+}

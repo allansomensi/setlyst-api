@@ -11,7 +11,9 @@ use crate::{
         auth::{
             ForgotPasswordPayload, GoogleSignInPayload, LoginOutcome, LoginPayload, LoginResponse,
             LoginTwoFactorPayload, ReauthRequiredResponse, ResetPasswordPayload,
-            TwoFactorChallengeResponse, access::ClientIp, token::VerifyTokenPayload,
+            TwoFactorChallengeResponse,
+            access::ClientIp,
+            token::{RefreshTokenResponse, VerifyTokenPayload},
         },
         notification::Notification,
         security::{VerificationCode, VerificationPurpose},
@@ -29,7 +31,7 @@ use crate::{
     utils::{
         crypto::{random_token, sha256_hex},
         hashing::{dummy_verify_async, hash_password, verify_password_upgrading_async},
-        jwt::decode_jwt,
+        jwt::{decode_jwt, renew_jwt},
     },
     validations::password::{is_password_compliant, password_issues_checked},
 };
@@ -593,6 +595,47 @@ pub async fn verify(
     }
 
     Ok((StatusCode::OK, Json(json!({ "valid": true }))))
+}
+
+/// Renews a session token.
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/refresh",
+    tags = ["Auth"],
+    summary = "Renew a session token.",
+    description = "Exchanges a regular session token that is still valid (signature, expiry, not revoked, account usable) for a new one with a full lifetime (`JWT_EXPIRATION_TIME`). Clients call it while the person is active, so a session only ends after that long without any use, or when it is revoked (password change, suspension, deactivation, sign-out everywhere). The new token carries the account's current role and `token_version`. Impersonation (\"view as\") tokens are never renewed: `SESSION_REVOKED`.",
+    request_body = VerifyTokenPayload,
+    responses(
+        (status = 200, description = "A fresh token.", body = RefreshTokenResponse),
+        (status = 401, description = "Token is invalid, expired, revoked or an impersonation token.")
+    )
+)]
+pub async fn refresh(
+    State(state): State<AppState>,
+    Json(payload): Json<VerifyTokenPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    let claims = decode_jwt(payload.token)
+        .map_err(|_| ApiError::session_revoked())?
+        .claims;
+
+    if claims.imp.is_some() {
+        return Err(ApiError::session_revoked());
+    }
+
+    let account = match check_claims(&state, &claims, None).await {
+        Ok(account) => account,
+        Err(ApiError::DatabaseError(e)) => return Err(ApiError::DatabaseError(e)),
+        Err(_) => {
+            warn!(user_id = %claims.sub, "Refused to renew a revoked token");
+            return Err(ApiError::session_revoked());
+        }
+    };
+
+    let (token, expires_at) = renew_jwt(claims.sub, &account)?;
+    Ok((
+        StatusCode::OK,
+        Json(RefreshTokenResponse { token, expires_at }),
+    ))
 }
 
 /// Starts a password recovery.

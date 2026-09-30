@@ -68,5 +68,6 @@ pub fn create_routes(state: AppState) -> Router {
         .merge(recovery_routes)
         .merge(oauth_routes)
         .route("/verify", post(auth::verify))
+        .route("/refresh", post(auth::refresh))
         .with_state(state)
 }

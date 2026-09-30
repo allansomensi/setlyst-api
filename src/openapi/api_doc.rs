@@ -158,6 +158,7 @@ use utoipa::{
         auth::login_two_factor,
         auth::register,
         auth::verify,
+        auth::refresh,
         auth::forgot_password,
         auth::reset_password,
         auth::google_sign_in,

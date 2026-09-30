@@ -1,5 +1,6 @@
 use crate::{
     config::Config,
+    database::repositories::user_repository::AuthState,
     errors::{api_error::ApiError, auth_error::AuthError},
     models::{auth::token::Claims, user::User},
 };
@@ -44,6 +45,30 @@ fn build_claims(user: &User, ttl_seconds: i64, impersonator: Option<(Uuid, i32)>
 pub fn generate_jwt(user: &User) -> Result<String, ApiError> {
     let config = Config::get();
     sign(&build_claims(user, config.jwt_expiration_time, None))
+}
+
+/// A fresh session token for the account a still-valid token belongs to,
+/// with the account's *current* username, role, status and
+/// `token_version` (the caller has already checked it isn't revoked).
+/// Returns the token and its expiry.
+pub fn renew_jwt(user_id: Uuid, account: &AuthState) -> Result<(String, NaiveDateTime), ApiError> {
+    let config = Config::get();
+    let now = Utc::now();
+    let claims = Claims {
+        sub: user_id,
+        username: account.username.clone(),
+        role: account.role.clone(),
+        status: account.status.clone(),
+        exp: (now + Duration::seconds(config.jwt_expiration_time)).timestamp() as usize,
+        iat: now.timestamp() as usize,
+        ver: account.token_version,
+        imp: None,
+        iver: None,
+    };
+    let expires_at = chrono::DateTime::from_timestamp(claims.exp as i64, 0)
+        .map(|dt| dt.naive_utc())
+        .unwrap_or_else(|| now.naive_utc());
+    Ok((sign(&claims)?, expires_at))
 }
 
 /// A short-lived, read-only token that lets `impersonator_id` see the

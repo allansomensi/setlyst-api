@@ -19,6 +19,9 @@ pub struct Config {
     /// Apply pending migrations at startup (default `true`).
     pub run_migrations: bool,
     pub jwt_secret: String,
+    /// Lifetime of a session token, in seconds (default 30 days). Clients
+    /// renew it through `POST /auth/refresh` while it is in use, so this is
+    /// how long a session survives *without any use*.
     pub jwt_expiration_time: i64,
     /// Lifetime of read-only impersonation tokens, in seconds.
     pub impersonation_expiration_time: i64,
@@ -509,7 +512,7 @@ impl Config {
             database_max_connections: env_or("DATABASE_MAX_CONNECTIONS", 10u32)?,
             run_migrations,
             jwt_secret,
-            jwt_expiration_time: env_or("JWT_EXPIRATION_TIME", 86_400i64)?,
+            jwt_expiration_time: env_or("JWT_EXPIRATION_TIME", 2_592_000i64)?,
             impersonation_expiration_time: env_or("IMPERSONATION_EXPIRATION_TIME", 3_600i64)?,
             cors_allowed_origins,
             app_base_url,

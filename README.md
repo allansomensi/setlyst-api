@@ -122,7 +122,7 @@ Swagger UI: `http://127.0.0.1:8000/swagger-ui`
 | Variable | Description | Default |
 |---|---|---|
 | `JWT_SECRET` | Secret key for JWT signing (min. 32 chars) | — |
-| `JWT_EXPIRATION_TIME` | Token expiration in seconds | `86400` |
+| `JWT_EXPIRATION_TIME` | Session token lifetime in seconds; renewed via `POST /auth/refresh` while in use, so it is the longest a session survives unused | `2592000` (30 days) |
 | `IMPERSONATION_EXPIRATION_TIME` | Lifetime of a staff "view as" session, in seconds | `3600` |
 | `DISABLE_BREACHED_PASSWORD_CHECK` | Skip the Have I Been Pwned check of new passwords (it fails open after 2 s; never runs in tests) | `false` |
 | `ANNOUNCEMENT_CTA_HOSTS` | Comma-separated hosts announcement buttons may link to over `https`, besides app paths | empty (app paths only) |
