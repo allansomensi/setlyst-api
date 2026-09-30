@@ -8,7 +8,7 @@
 [![Axum](https://img.shields.io/badge/axum-0.8-blue?style=flat-square)](https://github.com/tokio-rs/axum)
 [![PostgreSQL](https://img.shields.io/badge/postgresql-18-336791?style=flat-square&logo=postgresql)](https://www.postgresql.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](./LICENSE)
-[![Version](https://img.shields.io/badge/version-0.8.0-purple?style=flat-square)](./Cargo.toml)
+[![Version](https://img.shields.io/github/v/tag/allansomensi/setlyst-api?label=version&color=purple&style=flat-square)](./Cargo.toml)
 
 </div>
 
