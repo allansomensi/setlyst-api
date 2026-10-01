@@ -33,6 +33,7 @@ async fn validate_setlist_scope(
     user_id: Uuid,
     setlist_id: Uuid,
     gig_band_id: Option<Uuid>,
+    gig_owner: Uuid,
 ) -> Result<(), ApiError> {
     let setlist = state
         .setlist_repo
@@ -40,7 +41,10 @@ async fn validate_setlist_scope(
         .await?
         .ok_or(ApiError::NotFound)?;
 
-    if setlist.band_id != gig_band_id {
+    // A personal setlist the caller only collaborates on is visible to
+    // them but isn't theirs to attach: the gig's public link would
+    // publish it without its owner knowing.
+    if setlist.band_id != gig_band_id || (gig_band_id.is_none() && setlist.user_id != gig_owner) {
         error!(%setlist_id, ?gig_band_id, "Setlist does not belong to the same band as the gig.");
         return Err(ApiError::BadRequest(
             "The linked setlist must belong to the same band as the gig (or be a personal setlist for a personal gig).".to_string(),
@@ -233,7 +237,7 @@ pub async fn create_gig(
     };
 
     if let Some(setlist_id) = payload.setlist_id {
-        validate_setlist_scope(&state, user_id, setlist_id, payload.band_id).await?;
+        validate_setlist_scope(&state, user_id, setlist_id, payload.band_id, user_id).await?;
     }
     if let Some(tour_id) = payload.tour_id {
         validate_tour_scope(&state, tour_id, payload.band_id, user_id).await?;
@@ -294,7 +298,7 @@ pub async fn update_gig(
             .ok_or(ApiError::NotFound)?;
 
         if let Some(Some(setlist_id)) = payload.setlist_id {
-            validate_setlist_scope(&state, user_id, setlist_id, gig.band_id).await?;
+            validate_setlist_scope(&state, user_id, setlist_id, gig.band_id, gig.user_id).await?;
         }
         if let Some(Some(tour_id)) = payload.tour_id {
             validate_tour_scope(&state, tour_id, gig.band_id, gig.user_id).await?;
@@ -379,6 +383,15 @@ pub async fn find_band_gigs(
         .find_all_for_band(band_id, query.tour_id, current_page, per_page)
         .await?;
     mark_pinned(&state, user_id, &mut gigs).await?;
+    // Same rule as for one gig: only members who may manage it see its
+    // public link.
+    for gig in gigs.iter_mut().filter(|gig| gig.share_token.is_some()) {
+        match state.gig_repo.can_manage(gig.id, user_id).await {
+            Ok(()) => {}
+            Err(ApiError::DatabaseError(e)) => return Err(ApiError::DatabaseError(e)),
+            Err(_) => gig.share_token = None,
+        }
+    }
 
     let total_pages = (total_items as f64 / per_page as f64).ceil() as i64;
 
@@ -494,9 +507,16 @@ pub async fn get_public_gig(
     // (which would otherwise hide the band's setlist). A setlist that is
     // in the trash or whose public link staff took down is never exposed
     // through the gig.
+    // Only a setlist of the gig's own scope (its band's, or the gig
+    // owner's personal one): never someone else's setlist that a
+    // collaborator linked.
     let setlist = match gig.setlist_id {
         Some(setlist_id) => match state.setlist_repo.find_any(setlist_id).await? {
-            Some(setlist) if setlist.share_locked_at.is_none() => {
+            Some(setlist)
+                if setlist.share_locked_at.is_none()
+                    && setlist.band_id == gig.band_id
+                    && (gig.band_id.is_some() || setlist.user_id == gig.user_id) =>
+            {
                 Some(crate::controllers::setlist::public_setlist(&state, setlist).await?)
             }
             _ => None,

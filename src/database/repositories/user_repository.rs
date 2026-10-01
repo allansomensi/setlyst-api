@@ -1682,6 +1682,9 @@ impl UserRepository for UserRepositoryImpl {
              WHERE u.id IN (
                  SELECT c.id FROM users c
                  WHERE c.email_verified_at IS NULL
+                   -- Never proven at all: an account whose address staff
+                   -- changed (which needs verifying again) is a real one.
+                   AND c.email_first_verified_at IS NULL
                    AND c.email IS NOT NULL
                    AND c.created_at < $1
                    AND (c.last_login_at IS NULL OR c.last_login_at < $1)
@@ -1691,6 +1694,10 @@ impl UserRepository for UserRepositoryImpl {
                    AND NOT EXISTS (SELECT 1 FROM setlists s WHERE s.user_id = c.id)
                    AND NOT EXISTS (SELECT 1 FROM gigs g WHERE g.user_id = c.id)
                    AND NOT EXISTS (SELECT 1 FROM band_members m WHERE m.user_id = c.id)
+                   AND NOT EXISTS (SELECT 1 FROM artists a WHERE a.user_id = c.id)
+                   AND NOT EXISTS (SELECT 1 FROM tours t WHERE t.user_id = c.id)
+                   AND NOT EXISTS (SELECT 1 FROM setlist_collaborators sc WHERE sc.user_id = c.id)
+                   AND NOT EXISTS (SELECT 1 FROM oauth_identities o WHERE o.user_id = c.id)
                    AND NOT EXISTS (SELECT 1 FROM subscriptions p WHERE p.user_id = c.id
                                    AND p.source <> 'trial')
                  ORDER BY c.created_at

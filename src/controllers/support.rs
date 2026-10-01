@@ -6,7 +6,7 @@ use crate::{
     database::{
         AppState,
         repositories::{
-            audit_repository::AuditEvent,
+            audit_repository::{AuditEvent, STAFF_VIEW_DEDUPE_SECONDS},
             support_repository::{NewMessage, accepts_replies},
         },
     },
@@ -18,12 +18,14 @@ use crate::{
         auth::access::{AccessControl, ClientIp},
         notification::Notification,
         support::{
-            AdminSupportTicket, AdminSupportTicketDetail, AdminTicketQuery, CreateTicketPayload,
-            RateTicketPayload, ReplyTicketPayload, StaffReplyPayload, SupportMessage,
-            SupportSummary, SupportTicket, SupportTicketDetail, TicketStatus, UpdateTicketPayload,
+            ADMIN_TICKET_STATUS_FILTERS, AdminSupportTicket, AdminSupportTicketDetail,
+            AdminTicketQuery, CreateTicketPayload, RateTicketPayload, ReplyTicketPayload,
+            StaffReplyPayload, SupportMessage, SupportSummary, SupportTicket, SupportTicketDetail,
+            TicketStatus, UpdateTicketPayload,
         },
+        user::Status,
     },
-    services::notifier::notify,
+    services::{account, notifier::notify},
 };
 use axum::{
     Json,
@@ -66,14 +68,6 @@ fn ticket_limit(reason: &str, limit: i64) -> ApiError {
             _ => format!("You can open at most {limit} requests a day."),
         },
         json!({ "reason": reason, "limit": limit }),
-    )
-}
-
-fn ticket_closed() -> ApiError {
-    ApiError::rule(
-        StatusCode::CONFLICT,
-        codes::TICKET_CLOSED,
-        "This request is closed. Open a new one if you still need help.",
     )
 }
 
@@ -227,7 +221,7 @@ pub async fn reply_my_ticket(
     payload.validate()?;
     let ticket = own_ticket(&state, &access, id).await?;
     if !accepts_replies(ticket.status) {
-        return Err(ticket_closed());
+        return Err(ApiError::ticket_closed());
     }
     let message = state
         .support_repo
@@ -311,6 +305,20 @@ pub async fn rate_my_ticket(
 // Staff
 // ---------------------------------------------------------------------
 
+/// Staff don't answer, resolve or reassign their own requests (nor rate
+/// their own work through them): a colleague does.
+fn ensure_not_own_ticket(
+    access: &AccessControl,
+    ticket: &AdminSupportTicket,
+) -> Result<(), ApiError> {
+    if ticket.user_id == access.user_id() {
+        return Err(ApiError::cannot_target_self(
+            "Your own request is handled by another staff member.",
+        ));
+    }
+    Ok(())
+}
+
 async fn staff_ticket(state: &AppState, id: Uuid) -> Result<AdminSupportTicket, ApiError> {
     state
         .support_repo
@@ -345,9 +353,28 @@ async fn staff_detail(state: &AppState, id: Uuid) -> Result<AdminSupportTicketDe
 pub async fn admin_list(
     State(state): State<AppState>,
     access: AccessControl,
+    ip: ClientIp,
     Query(query): Query<AdminTicketQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_staff()?;
+    if let Some(status) = query.status.as_deref()
+        && !ADMIN_TICKET_STATUS_FILTERS.contains(&status)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "`status` must be one of: {}.",
+            ADMIN_TICKET_STATUS_FILTERS.join(", ")
+        )));
+    }
+    // Searching requests (by username, e-mail) is staff access to
+    // personal data: recorded like an account search.
+    if let Some(q) = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        let mut event = AuditEvent::by(&access, actions::STAFF_CONTENT_VIEWED)
+            .meta(json!({ "view": "support_search", "q": account::mask_identifier_for_staff(q) }))
+            .ip(&ip.0)
+            .once_within(STAFF_VIEW_DEDUPE_SECONDS);
+        event.target_type = Some("support_ticket");
+        event.spawn(state.audit_repo.clone());
+    }
     let (page, per_page) = crate::models::resolve_page(query.page, query.per_page, 25);
     let search = AdminListQuery {
         q: query.q.clone(),
@@ -389,10 +416,20 @@ pub async fn admin_summary(
 pub async fn admin_get(
     State(state): State<AppState>,
     access: AccessControl,
+    ip: ClientIp,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_staff()?;
-    Ok(Json(staff_detail(&state, id).await?))
+    let detail = staff_detail(&state, id).await?;
+    // Reading someone's conversation is staff access to their data
+    // (LGPD accountability).
+    AuditEvent::by(&access, actions::STAFF_CONTENT_VIEWED)
+        .target("support_ticket", id, &format!("#{}", detail.ticket.number))
+        .meta(json!({ "view": "support_ticket", "user_id": detail.ticket.user_id }))
+        .ip(&ip.0)
+        .once_within(STAFF_VIEW_DEDUPE_SECONDS)
+        .spawn(state.audit_repo.clone());
+    Ok(Json(detail))
 }
 
 #[utoipa::path(
@@ -415,27 +452,45 @@ pub async fn admin_update(
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_staff()?;
     let ticket = staff_ticket(&state, id).await?;
+    ensure_not_own_ticket(&access, &ticket)?;
     if let Some(Some(assignee)) = payload.assignee_id {
         let staff = state
             .user_repo
             .find_by_id(assignee)
             .await?
-            .is_some_and(|user| user.role.is_staff());
+            .is_some_and(|user| {
+                user.role.is_staff() && user.status == Status::Active && !user.is_banned
+            });
         if !staff {
             return Err(ApiError::BadRequest(
-                "Requests can only be assigned to staff.".into(),
+                "Requests can only be assigned to active staff.".into(),
+            ));
+        }
+        if assignee == ticket.user_id {
+            return Err(ApiError::cannot_target_self(
+                "A request can't be assigned to its requester.",
             ));
         }
     }
     state.support_repo.admin_update(id, &payload).await?;
+    // Only what was sent: `assignee_id: null` (unassigned) must not read
+    // like "unchanged".
+    let mut changes = serde_json::Map::new();
+    if let Some(status) = payload.status {
+        changes.insert("status".into(), json!(status));
+    }
+    if let Some(priority) = payload.priority {
+        changes.insert("priority".into(), json!(priority));
+    }
+    if let Some(category) = payload.category {
+        changes.insert("category".into(), json!(category));
+    }
+    if let Some(assignee) = payload.assignee_id {
+        changes.insert("assignee_id".into(), json!(assignee));
+    }
     AuditEvent::by(&access, actions::SUPPORT_TICKET_UPDATED)
         .target("support_ticket", id, &format!("#{}", ticket.number))
-        .meta(json!({
-            "status": payload.status,
-            "priority": payload.priority,
-            "category": payload.category,
-            "assignee_id": payload.assignee_id,
-        }))
+        .meta(serde_json::Value::Object(changes))
         .ip(&ip.0)
         .record(&*state.audit_repo)
         .await;
@@ -463,8 +518,9 @@ pub async fn admin_reply(
     access.require_staff()?;
     payload.validate()?;
     let ticket = staff_ticket(&state, id).await?;
+    ensure_not_own_ticket(&access, &ticket)?;
     if !payload.internal && !accepts_replies(ticket.status) {
-        return Err(ticket_closed());
+        return Err(ApiError::ticket_closed());
     }
     let status = match (payload.internal, payload.status) {
         (_, Some(status)) => Some(status),

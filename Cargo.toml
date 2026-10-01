@@ -58,6 +58,8 @@ aes-gcm = "0.11"
 base64 = "0.23"
 hkdf = "0.13"
 hmac = "0.13"
+# IDNA (UTS 46) mapping of e-mail domains, the same crate `validator` uses.
+idna = "1"
 ipnet = "2"
 lettre = { version = "0.11", default-features = false, features = [
     "builder",

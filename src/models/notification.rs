@@ -307,8 +307,7 @@ impl Notification {
         )
     }
 
-    /// `event` is `two_factor_enabled`, `two_factor_disabled`,
-    /// `email_changed`, `password_changed` or `recovery_codes_regenerated`.
+    /// A staff reply on support ticket `number`.
     pub fn support_reply(user_id: Uuid, ticket_id: Uuid, number: i64, subject: &str) -> Self {
         Self::new(
             user_id,
@@ -321,6 +320,8 @@ impl Notification {
         )
     }
 
+    /// `event` is `two_factor_enabled`, `two_factor_disabled`,
+    /// `email_changed`, `password_changed` or `recovery_codes_regenerated`.
     pub fn security_alert(user_id: Uuid, event: &str) -> Self {
         Self::new(
             user_id,

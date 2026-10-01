@@ -104,7 +104,11 @@ async fn apply_status(
     sqlx::query(
         "UPDATE status_incidents
          SET status = $2,
-             started_at = CASE WHEN $2 = 'scheduled' THEN started_at ELSE COALESCE(started_at, $3) END,
+             -- A maintenance resolved before it ever began (cancelled)
+             -- never started.
+             started_at = CASE WHEN $2 = 'scheduled' THEN started_at
+                               WHEN $2 = 'resolved' AND status = 'scheduled' THEN started_at
+                               ELSE COALESCE(started_at, $3) END,
              resolved_at = CASE WHEN $2 = 'resolved' THEN COALESCE(resolved_at, $3) ELSE NULL END,
              updated_at = $3
          WHERE id = $1",
@@ -226,7 +230,7 @@ impl IncidentRepository for IncidentRepositoryImpl {
             incident_columns!(),
             " FROM status_incidents
               WHERE status <> 'resolved' OR resolved_at >= $1
-              ORDER BY created_at DESC LIMIT 50"
+              ORDER BY (status <> 'resolved') DESC, created_at DESC LIMIT 50"
         ))
         .bind(since)
         .fetch_all(&self.db)
@@ -265,7 +269,15 @@ impl IncidentRepository for IncidentRepositoryImpl {
         .bind(payload.scheduled_until.flatten())
         .bind(now())
         .execute(&self.db)
-        .await?;
+        .await
+        .map_err(|e| match &e {
+            // The window check lost a race with another edit of the other
+            // end of the window: the database's constraint caught it.
+            sqlx::Error::Database(db) if db.code().as_deref() == Some("23514") => {
+                ApiError::BadRequest("The window must end after it starts.".into())
+            }
+            _ => ApiError::from(e),
+        })?;
         Ok(())
     }
 

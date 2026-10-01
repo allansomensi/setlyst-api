@@ -8,7 +8,9 @@ use crate::{
     models::{
         audit::actions,
         auth::access::{AccessControl, ClientIp},
-        platform::{MaintenanceMode, PlatformSettings, PublicPlatformStatus},
+        platform::{
+            MaintenanceMode, PlatformSettings, PublicPlatformStatus, UpdatePlatformSettings,
+        },
     },
 };
 use axum::{Json, extract::State, response::IntoResponse};
@@ -50,8 +52,8 @@ pub async fn get_settings(
     path = "/api/v1/admin/settings/platform",
     tags = ["Admin"],
     summary = "Change the platform switches (admin).",
-    description = "Maintenance `mode`: `off`, `read_only` (everyone can read, changes answer `MAINTENANCE_MODE`) or `full` (only staff can sign in or use the API). `started_at` is set by the API when the mode changes. `registrations_open: false` closes sign-ups (`REGISTRATION_CLOSED`); staff can still create accounts. `blocked_email_domains` (at most 500; subdomains included) can't be used by new addresses (`EMAIL_DOMAIN_BLOCKED`). Applies at once on this server and within 5 seconds on the others.",
-    request_body = PlatformSettings,
+    description = "Maintenance `mode`: `off`, `read_only` (everyone can read, changes answer `MAINTENANCE_MODE`) or `full` (only staff can sign in or use the API). `started_at` is set by the API when the mode changes. `registrations_open: false` closes sign-ups (`REGISTRATION_CLOSED`); staff can still create accounts. `blocked_email_domains` (at most 500; subdomains included) can't be used by new addresses (`EMAIL_DOMAIN_BLOCKED`). Every switch must be sent (unknown fields are refused): a partial body would reset the others. Applies at once on this server and within 5 seconds on the others.",
+    request_body = UpdatePlatformSettings,
     security(("jwt_token" = [])),
     responses((status = 200, description = "Saved.", body = PlatformSettings))
 )]
@@ -59,12 +61,12 @@ pub async fn update_settings(
     State(state): State<AppState>,
     access: AccessControl,
     ip: ClientIp,
-    Json(payload): Json<PlatformSettings>,
+    Json(payload): Json<UpdatePlatformSettings>,
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_admin()?;
     payload.validate()?;
     let previous = state.platform_repo.load().await?;
-    let mut settings = payload.normalized();
+    let mut settings = payload.into_settings().normalized();
     settings.maintenance.started_at = match settings.maintenance.mode {
         MaintenanceMode::Off => None,
         mode if mode == previous.maintenance.mode => previous.maintenance.started_at,

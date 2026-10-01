@@ -61,11 +61,13 @@ macro_rules! admin_ticket_filter {
 }
 
 /// Sets `status` and the timestamps that go with it (`$2` the status,
-/// `$3` now).
+/// `$3` now). `resolved_at` restarts whenever the ticket becomes resolved
+/// again: the automatic close counts from it.
 macro_rules! status_assignments {
     () => {
         "status = $2,
-         resolved_at = CASE WHEN $2 = 'resolved' THEN COALESCE(resolved_at, $3)
+         resolved_at = CASE WHEN $2 = 'resolved' AND status = 'resolved' THEN COALESCE(resolved_at, $3)
+                            WHEN $2 = 'resolved' THEN $3
                             WHEN $2 IN ('open', 'pending') THEN NULL
                             ELSE resolved_at END,
          closed_at = CASE WHEN $2 = 'closed' THEN COALESCE(closed_at, $3) ELSE NULL END,
@@ -315,6 +317,21 @@ impl SupportRepository for SupportRepositoryImpl {
     async fn add_message(&self, message: NewMessage<'_>) -> Result<SupportMessage, ApiError> {
         let now = now();
         let mut tx = self.db.begin().await?;
+        // The caller checked the status already; checked again under the
+        // row lock so a reply racing a close (by the other side or the
+        // daily job) can't slip in and reopen a closed ticket.
+        let current: Option<TicketStatus> =
+            sqlx::query_scalar("SELECT status FROM support_tickets WHERE id = $1 FOR UPDATE")
+                .bind(message.ticket_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        match current {
+            None => return Err(ApiError::NotFound),
+            Some(status) if !message.internal && !accepts_replies(status) => {
+                return Err(ApiError::ticket_closed());
+            }
+            Some(_) => {}
+        }
         let row = sqlx::query_as::<_, SupportMessage>(
             "INSERT INTO support_messages (id, ticket_id, author_id, author_username, from_staff,
                                            internal, body, created_at)
@@ -436,12 +453,14 @@ impl SupportRepository for SupportRepositoryImpl {
         .bind(search)
         .bind(number)
         .fetch_one(&self.db);
-        // Most urgent first, then the ones waiting longest.
+        // Active first; those waiting for the staff before those waiting
+        // for the requester; then most urgent and waiting longest.
         let rows = sqlx::query_as::<_, AdminSupportTicket>(concat!(
             "SELECT ",
             admin_ticket_columns!(),
             admin_ticket_filter!(),
             " ORDER BY (t.status IN ('open', 'pending')) DESC,
+                       (t.status = 'open') DESC,
                        CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
                                        WHEN 'normal' THEN 2 ELSE 3 END,
                        CASE WHEN t.status IN ('open', 'pending') THEN t.last_message_at END ASC,
@@ -537,8 +556,11 @@ impl SupportRepository for SupportRepositoryImpl {
                 COUNT(*) FILTER (WHERE status = 'open' AND assignee_id IS NULL) AS unassigned,
                 COUNT(*) FILTER (WHERE status IN ('open', 'pending') AND priority = 'urgent') AS urgent,
                 COUNT(*) FILTER (WHERE status IN ('open', 'pending') AND assignee_id = $1) AS mine,
-                AVG(rating) FILTER (WHERE rating IS NOT NULL AND updated_at >= $2)::float8 AS average_rating,
-                COUNT(*) FILTER (WHERE rating IS NOT NULL AND updated_at >= $2) AS ratings,
+                AVG(rating) FILTER (WHERE rating IS NOT NULL
+                                      AND COALESCE(resolved_at, closed_at, created_at) >= $2)::float8
+                    AS average_rating,
+                COUNT(*) FILTER (WHERE rating IS NOT NULL
+                                   AND COALESCE(resolved_at, closed_at, created_at) >= $2) AS ratings,
                 (PERCENTILE_CONT(0.5) WITHIN GROUP (
                     ORDER BY EXTRACT(EPOCH FROM (first_response_at - created_at)) / 60.0
                  ) FILTER (WHERE first_response_at IS NOT NULL AND created_at >= $3))::float8
@@ -557,7 +579,8 @@ impl SupportRepository for SupportRepositoryImpl {
         let closed = sqlx::query(
             "UPDATE support_tickets
              SET status = 'closed', closed_at = $1, updated_at = $1
-             WHERE status = 'resolved' AND last_message_at < $2",
+             WHERE status = 'resolved'
+               AND GREATEST(COALESCE(resolved_at, last_message_at), last_message_at) < $2",
         )
         .bind(now)
         .bind(now - chrono::Duration::days(days))
@@ -570,8 +593,10 @@ impl SupportRepository for SupportRepositoryImpl {
         let tickets: Option<Value> = sqlx::query_scalar(
             "SELECT COALESCE(jsonb_agg(jsonb_build_object(
                     'number', t.number, 'subject', t.subject, 'category', t.category,
-                    'status', t.status, 'rating', t.rating, 'rating_comment', t.rating_comment,
-                    'created_at', t.created_at,
+                    'status', t.status, 'priority', t.priority, 'context', t.context,
+                    'rating', t.rating, 'rating_comment', t.rating_comment,
+                    'created_at', t.created_at, 'resolved_at', t.resolved_at,
+                    'closed_at', t.closed_at,
                     'messages', (SELECT COALESCE(jsonb_agg(jsonb_build_object(
                                      'from_staff', m.from_staff, 'body', m.body,
                                      'created_at', m.created_at) ORDER BY m.created_at), '[]'::jsonb)

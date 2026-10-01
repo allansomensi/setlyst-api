@@ -396,6 +396,15 @@ impl ApiError {
         )
     }
 
+    /// A closed support ticket takes no more replies (`TICKET_CLOSED`).
+    pub fn ticket_closed() -> Self {
+        Self::rule(
+            StatusCode::CONFLICT,
+            codes::TICKET_CLOSED,
+            "This request is closed. Open a new one if you still need help.",
+        )
+    }
+
     pub fn email_domain_blocked() -> Self {
         Self::rule(
             StatusCode::BAD_REQUEST,
@@ -409,6 +418,7 @@ impl ApiError {
         match self {
             ApiError::DatabaseError(e) if is_unique_violation(e) => "ALREADY_EXISTS",
             ApiError::DatabaseError(e) if is_database_busy(e) => codes::SERVICE_BUSY,
+            ApiError::DatabaseError(e) if is_unstorable_input(e) => "BAD_REQUEST",
             ApiError::DatabaseError(_) => "DATABASE_ERROR",
             ApiError::ValidationError(_) => "VALIDATION_ERROR",
             ApiError::EncryptionError(_) => "ENCRYPT_ERROR",
@@ -430,6 +440,18 @@ impl ApiError {
 
 fn is_unique_violation(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
+}
+
+/// A value the client sent that Postgres can't store, whatever the field:
+/// a NUL character in text (`22021`) or in JSON (`22P05`), or a date out
+/// of the supported range (`22008`). The client's input, so a 400 rather
+/// than a server error, without listing NUL checks on every text field.
+fn is_unstorable_input(e: &sqlx::Error) -> bool {
+    matches!(
+        e,
+        sqlx::Error::Database(db)
+            if matches!(db.code().as_deref(), Some("22021" | "22P05" | "22008"))
+    )
 }
 
 /// Seconds a client is asked to wait after a [`is_database_busy`] answer.
@@ -529,6 +551,17 @@ impl IntoResponse for ApiError {
                 );
                 response.meta = Some(json!({ "retry_after_seconds": DATABASE_BUSY_RETRY_SECONDS }));
                 (StatusCode::SERVICE_UNAVAILABLE, response)
+            }
+            ApiError::DatabaseError(e) if is_unstorable_input(e) => {
+                tracing::info!(error = %e, "Refused input the database can't store");
+                (
+                    StatusCode::BAD_REQUEST,
+                    ErrorResponse::new(
+                        &code,
+                        "The request contains characters or values that can't be stored.",
+                        None,
+                    ),
+                )
             }
             ApiError::DatabaseError(e) => {
                 error!(error = %e, "Unhandled database error");

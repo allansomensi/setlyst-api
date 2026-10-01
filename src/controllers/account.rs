@@ -5,7 +5,9 @@
 use crate::{
     database::{
         AppState,
-        repositories::audit_repository::{AuditEvent, record_legal_acceptances},
+        repositories::audit_repository::{
+            AuditEvent, STAFF_VIEW_DEDUPE_SECONDS, record_legal_acceptances,
+        },
     },
     email::{EmailTemplate, OutgoingEmail, enqueue, outbox::mask_email},
     errors::api_error::{ApiError, codes},
@@ -512,6 +514,8 @@ pub async fn confirm_email_change(
         &payload.code,
     )
     .await?;
+    // The domain may have been blocked while the code was on its way.
+    account::ensure_email_domain_allowed(&state, &code.target_email).await?;
     if state
         .user_repo
         .is_email_taken(&code.target_email, Some(user.id))
@@ -1363,13 +1367,30 @@ pub async fn list_my_sign_ins(
     description = "Like `GET /users/me/sign-ins` for another account. Admin only (it shows network addresses).",
     params(("id" = Uuid, Path, description = "User UUID")),
     security(("jwt_token" = [])),
-    responses((status = 200, description = "Sign-in activity.", body = [crate::models::console::SignInEvent]))
+    responses(
+        (status = 200, description = "Sign-in activity.", body = [crate::models::console::SignInEvent]),
+        (status = 404, description = "No such account."),
+    )
 )]
 pub async fn list_user_sign_ins(
     State(state): State<AppState>,
     access: AccessControl,
+    ip: ClientIp,
     Path(id): Path<uuid::Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     access.require_admin()?;
+    let user = state
+        .user_repo
+        .find_by_id(id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    // Someone's network addresses are personal data: staff access is
+    // recorded (LGPD accountability), like the account overview.
+    AuditEvent::by(&access, actions::STAFF_CONTENT_VIEWED)
+        .target("user", id, &user.username)
+        .meta(json!({ "view": "sign_ins" }))
+        .ip(&ip.0)
+        .once_within(STAFF_VIEW_DEDUPE_SECONDS)
+        .spawn(state.audit_repo.clone());
     Ok(Json(state.console_repo.sign_ins(id, 100).await?))
 }

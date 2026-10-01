@@ -776,3 +776,269 @@ async fn overview_search_exports_bulk_actions_and_sign_ins() {
         StatusCode::OK
     );
 }
+
+#[tokio::test]
+async fn a_platform_update_must_name_every_switch() {
+    let app = app!();
+    let (_, admin) = app.user("partial.admin", Role::Admin).await;
+    app.put(
+        "/admin/settings/platform",
+        &admin,
+        platform("off", false, &["mailinator.com"]),
+    )
+    .await;
+
+    // Leaving switches out (or misspelling one) must not reset them.
+    for body in [
+        json!({ "maintenance": { "mode": "read_only" } }),
+        json!({
+            "maintenance": { "mode": "off" },
+            "registration_open": true,
+            "blocked_email_domains": [],
+        }),
+    ] {
+        let refused = app.put("/admin/settings/platform", &admin, body).await;
+        assert!(refused.status.is_client_error(), "{}", refused.body);
+    }
+    let current = app.get("/admin/settings/platform", &admin).await;
+    assert_eq!(current.body["maintenance"]["mode"], "off");
+    assert_eq!(current.body["registrations_open"], false);
+    assert_eq!(
+        current.body["blocked_email_domains"],
+        json!(["mailinator.com"])
+    );
+}
+
+#[tokio::test]
+async fn blocked_domains_match_every_spelling_of_the_domain() {
+    let app = app!();
+    let (_, admin) = app.user("idn.admin", Role::Admin).await;
+    let saved = app
+        .put(
+            "/admin/settings/platform",
+            &admin,
+            platform("off", true, &["mailinator.com", "bücher.de"]),
+        )
+        .await;
+    assert_eq!(saved.status, StatusCode::OK, "{}", saved.body);
+    assert_eq!(
+        saved.body["blocked_email_domains"],
+        json!(["mailinator.com", "xn--bcher-kva.de"])
+    );
+    for (username, email) in [
+        ("idn.fullwidth", "x@ｍａｉｌｉｎａｔｏｒ.com"),
+        ("idn.dot", "x@mailinator\u{3002}com"),
+        ("idn.unicode", "x@bücher.de"),
+    ] {
+        let refused = app.register(username, email, json!({})).await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{email}");
+        assert_eq!(
+            refused.code(),
+            "EMAIL_DOMAIN_BLOCKED",
+            "{email}: {}",
+            refused.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn support_tickets_close_counting_from_their_resolution() {
+    let app = app!();
+    let (_, user) = app.user("stale.user", Role::User).await;
+    let (_, moderator) = app.user("stale.mod", Role::Moderator).await;
+    let created = app
+        .post(
+            "/support/tickets",
+            &user,
+            json!({ "subject": "Old question", "category": "other", "body": "Hello?" }),
+        )
+        .await;
+    let ticket_id = created.body["ticket"]["id"].as_str().unwrap().to_string();
+    // The last message is weeks old when staff resolve it.
+    sqlx::query(
+        "UPDATE support_tickets SET last_message_at = last_message_at - INTERVAL '20 days'
+         WHERE id = $1::uuid",
+    )
+    .bind(&ticket_id)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    app.patch(
+        &format!("/admin/support/tickets/{ticket_id}"),
+        &moderator,
+        json!({ "status": "resolved" }),
+    )
+    .await;
+    // The requester still has their 14 days to come back.
+    let closed = app
+        .state
+        .support_repo
+        .close_stale_resolved(setlyst_api::controllers::support::RESOLVED_TICKET_CLOSE_DAYS)
+        .await
+        .unwrap();
+    assert_eq!(closed, 0);
+    sqlx::query(
+        "UPDATE support_tickets SET resolved_at = resolved_at - INTERVAL '15 days'
+         WHERE id = $1::uuid",
+    )
+    .bind(&ticket_id)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    // A fresh staff message that keeps it resolved restarts the wait too.
+    let reply = app
+        .post(
+            &format!("/admin/support/tickets/{ticket_id}/messages"),
+            &moderator,
+            json!({ "body": "Still resolved, just checking in.", "status": "resolved" }),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.body);
+    let closed = app
+        .state
+        .support_repo
+        .close_stale_resolved(setlyst_api::controllers::support::RESOLVED_TICKET_CLOSE_DAYS)
+        .await
+        .unwrap();
+    assert_eq!(closed, 0);
+    sqlx::query(
+        "UPDATE support_tickets SET last_message_at = last_message_at - INTERVAL '15 days'
+         WHERE id = $1::uuid",
+    )
+    .bind(&ticket_id)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    let closed = app
+        .state
+        .support_repo
+        .close_stale_resolved(setlyst_api::controllers::support::RESOLVED_TICKET_CLOSE_DAYS)
+        .await
+        .unwrap();
+    assert_eq!(closed, 1);
+}
+
+#[tokio::test]
+async fn support_input_and_staff_rules() {
+    let app = app!();
+    let (_, user) = app.user("rules.user", Role::User).await;
+    let (moderator_id, moderator) = app.user("rules.mod", Role::Moderator).await;
+    let (inactive_id, _) = app.user("rules.gone", Role::Moderator).await;
+
+    // NUL can't be stored: a 400, not a 500.
+    for body in [
+        json!({ "subject": "Nul\u{0}", "category": "bug", "body": "x" }),
+        json!({ "subject": "Fine subject", "category": "bug", "body": "a\u{0}b" }),
+        json!({ "subject": "Fine subject", "category": "bug", "body": "x",
+                "context": { "page": "a\u{0}" } }),
+    ] {
+        let refused = app.post("/support/tickets", &user, body).await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+    }
+
+    // Anywhere else too (incidents have no NUL check of their own).
+    let incident = app
+        .post(
+            "/admin/incidents",
+            &moderator,
+            json!({ "kind": "incident", "title": "API \u{0} down", "impact": "minor",
+                    "components": ["api"], "message": "Looking into it." }),
+        )
+        .await;
+    assert_eq!(
+        incident.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        incident.body
+    );
+
+    // Staff don't handle their own requests.
+    let own = app
+        .post(
+            "/support/tickets",
+            &moderator,
+            json!({ "subject": "My own question", "category": "other", "body": "?" }),
+        )
+        .await;
+    let own_id = own.body["ticket"]["id"].as_str().unwrap().to_string();
+    let reply = app
+        .post(
+            &format!("/admin/support/tickets/{own_id}/messages"),
+            &moderator,
+            json!({ "body": "Solved it myself", "status": "resolved" }),
+        )
+        .await;
+    assert_eq!(reply.code(), "CANNOT_TARGET_SELF", "{}", reply.body);
+    let update = app
+        .patch(
+            &format!("/admin/support/tickets/{own_id}"),
+            &moderator,
+            json!({ "status": "resolved" }),
+        )
+        .await;
+    assert_eq!(update.code(), "CANNOT_TARGET_SELF", "{}", update.body);
+
+    // Assignees are active staff.
+    let created = app
+        .post(
+            "/support/tickets",
+            &user,
+            json!({ "subject": "Help please", "category": "other", "body": "?" }),
+        )
+        .await;
+    let ticket_id = created.body["ticket"]["id"].as_str().unwrap().to_string();
+    sqlx::query("UPDATE users SET status = 'inactive' WHERE id = $1")
+        .bind(inactive_id)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let inactive = app
+        .patch(
+            &format!("/admin/support/tickets/{ticket_id}"),
+            &moderator,
+            json!({ "assignee_id": inactive_id }),
+        )
+        .await;
+    assert_eq!(inactive.status, StatusCode::BAD_REQUEST);
+    let assigned = app
+        .patch(
+            &format!("/admin/support/tickets/{ticket_id}"),
+            &moderator,
+            json!({ "assignee_id": moderator_id }),
+        )
+        .await;
+    assert_eq!(assigned.status, StatusCode::OK, "{}", assigned.body);
+
+    // Unknown inbox filters are refused rather than matching nothing.
+    let typo = app
+        .get("/admin/support/tickets?status=Open", &moderator)
+        .await;
+    assert_eq!(typo.status, StatusCode::BAD_REQUEST);
+    let open = app
+        .get("/admin/support/tickets?status=open", &moderator)
+        .await;
+    assert_eq!(open.status, StatusCode::OK);
+    // Same for the account list (and its export): a misspelt filter
+    // would list every account.
+    let users = app.get("/users?state=suspended", &moderator).await;
+    assert_eq!(users.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        app.get("/users?state=active&sort=newest", &moderator)
+            .await
+            .status,
+        StatusCode::OK
+    );
+
+    // Reading a conversation is recorded.
+    app.get(&format!("/admin/support/tickets/{ticket_id}"), &moderator)
+        .await;
+    let viewed = app
+        .wait_for_count(
+            "SELECT COUNT(*) FROM audit_logs WHERE actor_id = $1
+               AND action = 'staff.content_viewed' AND target_type = 'support_ticket'",
+            moderator_id,
+            1,
+        )
+        .await;
+    assert_eq!(viewed, 1);
+}

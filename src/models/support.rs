@@ -153,6 +153,17 @@ fn validate_body(body: &str) -> Result<(), ValidationError> {
             Some(format!("Must be between 1 and {MAX_SUPPORT_MESSAGE_LENGTH} characters.").into());
         return Err(error);
     }
+    // Postgres text can't hold NUL: refused here instead of failing the
+    // insert.
+    validate_no_nul(body)
+}
+
+fn validate_no_nul(value: &str) -> Result<(), ValidationError> {
+    if value.contains('\0') {
+        let mut error = ValidationError::new("characters");
+        error.message = Some("Contains characters that aren't allowed.".into());
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -163,11 +174,29 @@ fn validate_subject(subject: &str) -> Result<(), ValidationError> {
         error.message = Some("Must be between 3 and 150 characters.".into());
         return Err(error);
     }
+    if subject.chars().any(char::is_control) {
+        let mut error = ValidationError::new("characters");
+        error.message = Some("Contains characters that aren't allowed.".into());
+        return Err(error);
+    }
     Ok(())
 }
 
+/// Whether a NUL hides anywhere in `value` (keys included): Postgres'
+/// jsonb refuses `\u0000`.
+fn contains_nul(value: &Value) -> bool {
+    match value {
+        Value::String(s) => s.contains('\0'),
+        Value::Array(items) => items.iter().any(contains_nul),
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, value)| key.contains('\0') || contains_nul(value)),
+        _ => false,
+    }
+}
+
 fn validate_context(context: &Value) -> Result<(), ValidationError> {
-    let fits = context.is_object() && context.to_string().len() <= 2_000;
+    let fits = context.is_object() && context.to_string().len() <= 2_000 && !contains_nul(context);
     if !fits {
         let mut error = ValidationError::new("context");
         error.message = Some("Must be a JSON object of at most 2 000 bytes.".into());
@@ -200,7 +229,7 @@ pub struct ReplyTicketPayload {
 pub struct RateTicketPayload {
     #[validate(range(min = 1, max = 5))]
     pub rating: i16,
-    #[validate(length(max = 500))]
+    #[validate(length(max = 500), custom(function = "validate_no_nul"))]
     pub comment: Option<String>,
 }
 
@@ -227,6 +256,10 @@ pub struct UpdateTicketPayload {
     #[schema(value_type = Option<Uuid>)]
     pub assignee_id: Option<Option<Uuid>>,
 }
+
+/// What `status` takes in the staff inbox ([`AdminTicketQuery`]).
+pub const ADMIN_TICKET_STATUS_FILTERS: &[&str] =
+    &["active", "all", "open", "pending", "resolved", "closed"];
 
 /// Filters of the staff inbox.
 #[derive(Debug, Default, Deserialize, IntoParams)]
@@ -261,7 +294,8 @@ pub struct SupportSummary {
     pub urgent: i64,
     /// Open or pending tickets assigned to the caller.
     pub mine: i64,
-    /// Average rating over the last 90 days (1 to 5).
+    /// Average rating of the requests resolved (or closed) in the last 90
+    /// days (1 to 5).
     pub average_rating: Option<f64>,
     pub ratings: i64,
     /// Median time to the first staff reply over the last 30 days, in

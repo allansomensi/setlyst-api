@@ -520,3 +520,129 @@ async fn public_pdf_exports_are_rate_limited_per_client() {
         .await;
     assert_eq!(other.status, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn a_personal_gig_only_links_its_owner_setlists() {
+    let app = app!();
+    let (_, owner) = app.user("scope.owner", Role::User).await;
+    let (viewer_id, viewer) = app.user("scope.viewer", Role::User).await;
+    let setlist = app.setlist(&owner, "Owner's set", None).await;
+    // The viewer collaborates on it (so can see it)...
+    sqlx::query(
+        "INSERT INTO setlist_collaborators (setlist_id, user_id, role, created_at, accepted_at)
+         VALUES ($1::uuid, $2, 'viewer', NOW(), NOW())",
+    )
+    .bind(&setlist)
+    .bind(viewer_id)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        app.get(&format!("/setlists/{setlist}"), &viewer)
+            .await
+            .status,
+        StatusCode::OK
+    );
+    // ...but can't attach it to a gig of their own (whose public link
+    // would publish it).
+    let linked = app
+        .post(
+            "/gigs",
+            &viewer,
+            json!({ "venue": "Bar", "scheduled_at": "2030-03-01T22:00:00", "setlist_id": setlist }),
+        )
+        .await;
+    assert_eq!(linked.status, StatusCode::BAD_REQUEST, "{}", linked.body);
+    let gig = app
+        .post(
+            "/gigs",
+            &viewer,
+            json!({ "venue": "Bar", "scheduled_at": "2030-03-01T22:00:00" }),
+        )
+        .await;
+    let gig_id = gig.body["id"].as_str().unwrap().to_string();
+    let update = app
+        .patch(
+            &format!("/gigs/{gig_id}"),
+            &viewer,
+            json!({ "setlist_id": setlist }),
+        )
+        .await;
+    assert_eq!(update.status, StatusCode::BAD_REQUEST, "{}", update.body);
+
+    // A link made before this check doesn't publish it either.
+    sqlx::query("UPDATE gigs SET setlist_id = $1::uuid WHERE id = $2::uuid")
+        .bind(&setlist)
+        .bind(&gig_id)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let token = app
+        .post(&format!("/gigs/{gig_id}/share"), &viewer, json!({}))
+        .await
+        .body["share_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let public = app
+        .request(Method::GET, &format!("/public/gigs/{token}"), None, None)
+        .await;
+    assert_eq!(public.status, StatusCode::OK, "{}", public.body);
+    assert!(public.body["setlist"].is_null(), "{}", public.body);
+}
+
+#[tokio::test]
+async fn band_lists_show_public_links_only_to_managers() {
+    let app = app!();
+    let (_, owner) = app.user("links.owner", Role::User).await;
+    let (_, member) = app.user("links.member", Role::User).await;
+    let band = app.band(&owner, "Linkers").await;
+    app.join_band(&owner, &member, &band, None).await;
+
+    let setlist = app.setlist(&owner, "Band set", Some(&band)).await;
+    let shared = app
+        .post(&format!("/setlists/{setlist}/share"), &owner, json!({}))
+        .await;
+    assert!(shared.body["share_token"].is_string(), "{}", shared.body);
+    let gig = app
+        .post(
+            "/gigs",
+            &owner,
+            json!({ "venue": "Arena", "scheduled_at": "2030-03-01T22:00:00", "band_id": band }),
+        )
+        .await;
+    let gig_id = gig.body["id"].as_str().unwrap().to_string();
+    let gig_shared = app
+        .post(&format!("/gigs/{gig_id}/share"), &owner, json!({}))
+        .await;
+    assert!(
+        gig_shared.body["share_token"].is_string(),
+        "{}",
+        gig_shared.body
+    );
+
+    let token_of = |list: &Value, id: &str| {
+        list["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == id)
+            .map(|item| item["share_token"].is_string())
+    };
+    for (token, visible) in [(&owner, true), (&member, false)] {
+        let setlists = app.get(&format!("/bands/{band}/setlists"), token).await;
+        assert_eq!(
+            token_of(&setlists.body, &setlist),
+            Some(visible),
+            "{}",
+            setlists.body
+        );
+        let gigs = app.get(&format!("/bands/{band}/gigs"), token).await;
+        assert_eq!(
+            token_of(&gigs.body, &gig_id),
+            Some(visible),
+            "{}",
+            gigs.body
+        );
+    }
+}

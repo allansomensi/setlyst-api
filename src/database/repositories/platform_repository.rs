@@ -3,9 +3,13 @@ use chrono::Utc;
 use serde_json::Value;
 use sqlx::PgPool;
 use std::{
-    sync::RwLock,
+    sync::{
+        RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
+use tracing::error;
 use uuid::Uuid;
 
 /// `platform_settings` key of the platform switches.
@@ -29,6 +33,9 @@ pub trait PlatformRepository: Send + Sync {
 pub struct PlatformRepositoryImpl {
     db: PgPool,
     cache: RwLock<Option<(Instant, PlatformSettings)>>,
+    /// Bumped by every save: a read that started before it must not put
+    /// the older value it fetched back in the cache.
+    generation: AtomicU64,
 }
 
 impl PlatformRepositoryImpl {
@@ -36,6 +43,7 @@ impl PlatformRepositoryImpl {
         Self {
             db,
             cache: RwLock::new(None),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -47,8 +55,12 @@ impl PlatformRepositoryImpl {
             .map(|(_, settings)| settings.clone())
     }
 
-    fn remember(&self, settings: &PlatformSettings) {
-        if let Ok(mut cache) = self.cache.write() {
+    /// Caches `settings`, read when the generation was `generation`
+    /// (skipped when a save happened since).
+    fn remember(&self, settings: &PlatformSettings, generation: u64) {
+        if let Ok(mut cache) = self.cache.write()
+            && self.generation.load(Ordering::SeqCst) == generation
+        {
             *cache = Some((Instant::now(), settings.clone()));
         }
     }
@@ -60,8 +72,9 @@ impl PlatformRepository for PlatformRepositoryImpl {
         if let Some(settings) = self.cached() {
             return Ok(settings);
         }
+        let generation = self.generation.load(Ordering::SeqCst);
         let settings = self.load().await?;
-        self.remember(&settings);
+        self.remember(&settings, generation);
         Ok(settings)
     }
 
@@ -71,9 +84,15 @@ impl PlatformRepository for PlatformRepositoryImpl {
                 .bind(PLATFORM_SETTINGS_KEY)
                 .fetch_optional(&self.db)
                 .await?;
-        Ok(stored
-            .and_then(|value| serde_json::from_value(value).ok())
-            .unwrap_or_default())
+        Ok(match stored {
+            None => PlatformSettings::default(),
+            Some(value) => serde_json::from_value(value).unwrap_or_else(|e| {
+                // Falls back to an open platform: loudly, since every switch
+                // (maintenance, closed sign-ups, blocked domains) is lost.
+                error!(error = %e, "Stored platform settings are unreadable; using the defaults");
+                PlatformSettings::default()
+            }),
+        })
     }
 
     async fn save(&self, settings: &PlatformSettings, actor_id: Uuid) -> Result<(), ApiError> {
@@ -90,7 +109,12 @@ impl PlatformRepository for PlatformRepositoryImpl {
         .bind(actor_id)
         .execute(&self.db)
         .await?;
-        self.remember(settings);
+        // Under the cache lock, so a read finishing now can't slip its
+        // older value in between the bump and the store.
+        if let Ok(mut cache) = self.cache.write() {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            *cache = Some((Instant::now(), settings.clone()));
+        }
         Ok(())
     }
 }

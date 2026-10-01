@@ -195,7 +195,8 @@ impl EmailAdminRepository for EmailAdminRepositoryImpl {
     async fn retry(&self, id: Uuid) -> Result<bool, ApiError> {
         let updated = sqlx::query(
             "UPDATE email_outbox
-             SET status = 'pending', attempts = 0, scheduled_at = $2, locked_at = NULL
+             SET status = 'pending', attempts = 0, scheduled_at = $2, locked_at = NULL,
+                 last_error = NULL
              WHERE id = $1 AND status IN ('failed', 'skipped') AND payload <> '{}'::jsonb
                AND NOT (template = ANY($3))",
         )

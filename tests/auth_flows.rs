@@ -1111,7 +1111,7 @@ impl setlyst_api::email::worker::MailTransport for FlakyTransport {
         use std::sync::atomic::Ordering;
         if self
             .failures_left
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
             return Err("421 try again later".into());
@@ -2103,7 +2103,19 @@ async fn unverified_accounts_without_content_are_purged_after_a_week() {
     let (recent, _) = app
         .registered_user("recent.account", "recent@example.com")
         .await;
-    for id in [idle, busy, verified] {
+    // Verified once, then staff changed the address (which needs proving
+    // again): a real account, never purged.
+    let (reverify, reverify_token) = app
+        .registered_user("reverify.account", "reverify@example.com")
+        .await;
+    app.verify_email(&reverify_token, "reverify@example.com")
+        .await;
+    sqlx::query("UPDATE users SET email_verified_at = NULL WHERE id = $1")
+        .bind(reverify)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    for id in [idle, busy, verified, reverify] {
         sqlx::query(
             "UPDATE users SET created_at = created_at - INTERVAL '8 days', last_login_at = NULL WHERE id = $1",
         )
@@ -2122,6 +2134,7 @@ async fn unverified_accounts_without_content_are_purged_after_a_week() {
         (busy, true),
         (verified, true),
         (recent, true),
+        (reverify, true),
     ] {
         assert_eq!(
             app.state.user_repo.find_by_id(id).await.unwrap().is_some(),

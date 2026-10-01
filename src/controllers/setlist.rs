@@ -1537,6 +1537,11 @@ pub async fn find_band_setlists(
         .find_all_for_band(band_id, user_id, current_page, per_page)
         .await?;
     mark_pinned(&state, user_id, &mut setlists).await?;
+    // Same rule as for one setlist: only those who may manage it see its
+    // public link.
+    for setlist in &mut setlists {
+        withhold_share_token_from_non_managers(&state, user_id, setlist).await?;
+    }
 
     let total_pages = (total_items as f64 / per_page as f64).ceil() as i64;
 

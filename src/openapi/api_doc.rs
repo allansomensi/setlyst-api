@@ -81,7 +81,7 @@ use crate::{
         pin::{PinItemType, PinRef, PinnedItem, ReorderPinsPayload},
         platform::{
             MaintenanceMode, MaintenanceSettings, PlatformSettings, PublicMaintenance,
-            PublicPlatformStatus,
+            PublicPlatformStatus, UpdateMaintenanceSettings, UpdatePlatformSettings,
         },
         quota::{
             QuotaLimits, QuotaOverrides, QuotaReport, QuotaResource, QuotaUsageItem,
@@ -538,6 +538,8 @@ use utoipa::{
             PlatformSettings,
             PublicMaintenance,
             PublicPlatformStatus,
+            UpdatePlatformSettings,
+            UpdateMaintenanceSettings,
             AdminSupportTicket,
             AdminSupportTicketDetail,
             CreateTicketPayload,

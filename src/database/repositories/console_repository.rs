@@ -76,11 +76,16 @@ impl ConsoleRepository for ConsoleRepositoryImpl {
     async fn signups(&self, days: i64) -> Result<Vec<DailyCount>, ApiError> {
         let today = now().date();
         let first = today - Duration::days(days - 1);
+        // The days as `date` (a timestamptz series is estimated at 1 000
+        // rows and pushed the plan past Postgres' JIT threshold, which then
+        // compiled code on every overview for a few milliseconds of work).
         Ok(sqlx::query_as::<_, DailyCount>(
-            "SELECT d::date AS day, COUNT(u.id) AS count
-             FROM generate_series($1::date, $2::date, INTERVAL '1 day') AS d
-             LEFT JOIN users u ON u.created_at >= d AND u.created_at < d + INTERVAL '1 day'
-             GROUP BY d ORDER BY d",
+            "SELECT d.day, COALESCE(c.count, 0) AS count
+             FROM (SELECT generate_series($1::date, $2::date, INTERVAL '1 day')::date AS day) d
+             LEFT JOIN (SELECT created_at::date AS day, COUNT(*) AS count
+                        FROM users WHERE created_at >= $1::date
+                        GROUP BY 1) c ON c.day = d.day
+             ORDER BY d.day",
         )
         .bind(first)
         .bind(today)

@@ -323,6 +323,10 @@ pub async fn login_two_factor(
         return Err(account_locked(until));
     }
     ensure_can_sign_in(&user)?;
+    // Before the attempt is claimed and a code (or recovery code) spent:
+    // maintenance switched on after the challenge would otherwise burn
+    // them on a sign-in that is refused anyway.
+    account::ensure_sign_in_allowed(&state, &user).await?;
 
     let (code, recovery) = match (&payload.code, &payload.recovery_code) {
         (Some(code), None) => (Some(code), None),
@@ -1117,6 +1121,9 @@ async fn finish_google_sign_in(
     ip: &ClientIp,
 ) -> Result<Json<LoginOutcome>, ApiError> {
     ensure_can_sign_in(&user)?;
+    // Before linking the Google identity: a refused sign-in leaves nothing
+    // behind.
+    account::ensure_sign_in_allowed(state, &user).await?;
 
     if user.two_factor_enabled() {
         let challenge: TwoFactorChallengeResponse = account::create_challenge(

@@ -177,7 +177,7 @@ pub async fn export_users(
     }
     let users = state
         .user_repo
-        .export(&query.filter(), MAX_EXPORT_ROWS)
+        .export(&query.filter()?, MAX_EXPORT_ROWS)
         .await?;
     let mut out = String::with_capacity(users.len() * 160);
     push_row(

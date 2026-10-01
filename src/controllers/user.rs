@@ -174,7 +174,7 @@ pub async fn find_all_users(
 
     let (users, total_items) = state
         .user_repo
-        .find_all(page, per_page, &query.filter())
+        .find_all(page, per_page, &query.filter()?)
         .await?;
     Ok(Json(PaginatedResponse::new(
         users,

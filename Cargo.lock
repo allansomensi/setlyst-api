@@ -2979,6 +2979,7 @@ dependencies = [
  "genpdf",
  "hkdf 0.13.0",
  "hmac 0.13.0",
+ "idna",
  "ipnet",
  "jsonwebtoken",
  "lettre",

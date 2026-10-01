@@ -890,29 +890,43 @@ impl UserListQuery {
         .search_pattern()
     }
 
-    /// The filters as the repository takes them.
-    pub fn filter(&self) -> UserListFilter {
-        UserListFilter {
+    /// The filters as the repository takes them. An unknown `state` or
+    /// `sort` is refused rather than ignored: a misspelt filter would
+    /// otherwise list (or export) every account. Blank means unset.
+    pub fn filter(&self) -> Result<UserListFilter, crate::errors::api_error::ApiError> {
+        fn choice<'a>(
+            name: &str,
+            value: Option<&'a str>,
+            allowed: &[&str],
+        ) -> Result<Option<&'a str>, crate::errors::api_error::ApiError> {
+            match value.map(str::trim).filter(|v| !v.is_empty()) {
+                None => Ok(None),
+                Some(v) if allowed.contains(&v) => Ok(Some(v)),
+                Some(_) => Err(crate::errors::api_error::ApiError::BadRequest(format!(
+                    "`{name}` must be one of: {}.",
+                    allowed.join(", ")
+                ))),
+            }
+        }
+        Ok(UserListFilter {
             search: self.search_pattern(),
             role: self.role.clone(),
-            state: self
-                .state
-                .as_deref()
-                .filter(|s| ["active", "inactive", "banned"].contains(s))
-                .map(str::to_string),
+            state: choice("state", self.state.as_deref(), USER_STATE_FILTERS)?.map(str::to_string),
             verified: self.verified,
             two_factor: self.two_factor,
             created_from: self.created_from,
             created_to: self.created_to,
-            sort: self
-                .sort
-                .as_deref()
-                .filter(|s| ["username", "newest", "oldest", "last_login"].contains(s))
+            sort: choice("sort", self.sort.as_deref(), USER_SORTS)?
                 .unwrap_or("username")
                 .to_string(),
-        }
+        })
     }
 }
+
+/// What `state` takes on the staff user list.
+pub const USER_STATE_FILTERS: &[&str] = &["active", "inactive", "banned"];
+/// What `sort` takes on the staff user list.
+pub const USER_SORTS: &[&str] = &["username", "newest", "oldest", "last_login"];
 
 /// Filters of the staff user list (and its CSV export).
 #[derive(Debug, Clone, Default)]

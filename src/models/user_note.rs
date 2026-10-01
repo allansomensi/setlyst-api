@@ -27,6 +27,13 @@ fn validate_note(body: &str) -> Result<(), ValidationError> {
         error.message = Some("Must be between 1 and 2 000 characters.".into());
         return Err(error);
     }
+    // Postgres text can't hold NUL: refused here instead of failing the
+    // insert.
+    if body.contains('\0') {
+        let mut error = ValidationError::new("characters");
+        error.message = Some("Contains characters that aren't allowed.".into());
+        return Err(error);
+    }
     Ok(())
 }
 
