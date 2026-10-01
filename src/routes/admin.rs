@@ -1,5 +1,8 @@
 use crate::{
-    controllers::{admin, announcement, billing, moderation, release_note},
+    controllers::{
+        account, admin, announcement, billing, console, email_admin, incident, moderation,
+        platform, release_note, support, user_note,
+    },
     database::AppState,
 };
 use axum::{
@@ -52,14 +55,34 @@ pub fn create_routes(state: AppState) -> Router {
         .route("/gigs/{id}/share/unlock", post(admin::unlock_gig_share))
         .route("/shared-links", get(admin::list_shared_links))
         .route("/audit-logs", get(admin::list_audit_logs))
+        .route("/audit-logs/export", get(console::export_audit_logs))
+        .route("/overview", get(console::overview))
+        .route("/search", get(console::search))
+        .route("/users/export", get(console::export_users))
+        .route("/users/bulk", post(console::bulk_users))
+        .route("/users/{id}/sign-ins", get(account::list_user_sign_ins))
+        .route(
+            "/users/{id}/notes",
+            get(user_note::list_notes).post(user_note::create_note),
+        )
+        .route(
+            "/users/{id}/notes/{note_id}",
+            patch(user_note::update_note).delete(user_note::delete_note),
+        )
         .route(
             "/settings/quotas",
             get(admin::get_quota_defaults).put(admin::update_quota_defaults),
+        )
+        .route(
+            "/settings/platform",
+            get(platform::get_settings).put(platform::update_settings),
         )
         .merge(announcement_routes())
         .merge(release_note_routes())
         .merge(billing_routes())
         .merge(moderation_routes())
+        .merge(support_routes())
+        .merge(operations_routes())
         .with_state(state)
 }
 
@@ -169,4 +192,35 @@ fn moderation_routes() -> Router<AppState> {
             post(moderation::resolve_flag),
         )
         .route("/moderation/rescan", post(moderation::rescan))
+}
+
+/// `/admin/support`: the support inbox.
+fn support_routes() -> Router<AppState> {
+    Router::new()
+        .route("/support/tickets", get(support::admin_list))
+        .route("/support/summary", get(support::admin_summary))
+        .route(
+            "/support/tickets/{id}",
+            get(support::admin_get).patch(support::admin_update),
+        )
+        .route("/support/tickets/{id}/messages", post(support::admin_reply))
+}
+
+/// `/admin/emails` (delivery console) and `/admin/incidents` (status
+/// page).
+fn operations_routes() -> Router<AppState> {
+    Router::new()
+        .route("/emails", get(email_admin::list))
+        .route("/emails/summary", get(email_admin::summary))
+        .route("/emails/test", post(email_admin::send_test))
+        .route("/emails/{id}/retry", post(email_admin::retry))
+        .route("/emails/{id}/cancel", post(email_admin::cancel))
+        .route("/incidents", get(incident::list).post(incident::create))
+        .route(
+            "/incidents/{id}",
+            get(incident::get)
+                .patch(incident::update)
+                .delete(incident::delete),
+        )
+        .route("/incidents/{id}/updates", post(incident::post_update))
 }

@@ -13,6 +13,7 @@ use crate::{
             access::{ClientIp, Impersonation, redact_for_impersonation},
             token::Claims,
         },
+        platform::MaintenanceMode,
         user::{Status, active_ban},
     },
     utils::jwt::decode_jwt,
@@ -102,6 +103,16 @@ fn allowed_while_password_change_required(method: &Method, path: &str) -> bool {
 
 fn is_read_only(method: &Method) -> bool {
     matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+}
+
+/// `true` when maintenance mode `mode` refuses a request with `method`
+/// from an account that isn't staff.
+pub fn maintenance_blocks(mode: MaintenanceMode, method: &Method) -> bool {
+    match mode {
+        MaintenanceMode::Off => false,
+        MaintenanceMode::ReadOnly => !is_read_only(method),
+        MaintenanceMode::Full => true,
+    }
 }
 
 /// Rejects an account that can't currently use the platform.
@@ -227,6 +238,16 @@ pub async fn authenticate(
 
     let account = check_claims(&state, &claims, Some((req.method(), req.uri().path()))).await?;
 
+    // Maintenance mode never applies to staff, nor to their "view as"
+    // sessions (read-only anyway): they check the platform before
+    // reopening it.
+    if claims.imp.is_none() && !account.role.is_staff() {
+        let platform = state.platform_repo.get().await?;
+        if maintenance_blocks(platform.maintenance.mode, req.method()) {
+            return Err(ApiError::maintenance(&platform.maintenance));
+        }
+    }
+
     claims.role = account.role;
     claims.username = account.username;
     claims.status = account.status;
@@ -311,6 +332,17 @@ async fn redact_impersonation_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maintenance_modes() {
+        assert!(!maintenance_blocks(MaintenanceMode::Off, &Method::POST));
+        assert!(!maintenance_blocks(MaintenanceMode::ReadOnly, &Method::GET));
+        assert!(maintenance_blocks(
+            MaintenanceMode::ReadOnly,
+            &Method::PATCH
+        ));
+        assert!(maintenance_blocks(MaintenanceMode::Full, &Method::GET));
+    }
 
     #[test]
     fn password_change_allowlist() {

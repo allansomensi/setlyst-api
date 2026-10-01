@@ -234,6 +234,12 @@ pub enum EmailTemplate {
     Welcome {
         username: String,
     },
+    /// Sent by staff from the e-mail console to check that delivery works.
+    TestMessage {
+        username: String,
+        /// When it was requested (shown, so a late delivery is obvious).
+        requested_at: NaiveDateTime,
+    },
     /// Step-up re-authentication code for an account without a password.
     ReauthCode {
         username: String,
@@ -290,6 +296,7 @@ impl EmailTemplate {
             EmailTemplate::PaymentDisputed { .. } => "payment_disputed",
             EmailTemplate::PriceChange { .. } => "price_change",
             EmailTemplate::Welcome { .. } => "welcome",
+            EmailTemplate::TestMessage { .. } => "test_message",
             EmailTemplate::ReauthCode { .. } => "reauth_code",
             EmailTemplate::SecurityNotice { .. } => "security_notice",
         }
@@ -345,7 +352,9 @@ impl EmailTemplate {
             | EmailTemplate::TwoFactorDisabled { .. }
             | EmailTemplate::EmailChangedNotice { .. } => FooterReason::Security,
             EmailTemplate::AccountDeleted { .. } => FooterReason::Deleted,
-            EmailTemplate::Welcome { .. } => FooterReason::Account,
+            EmailTemplate::Welcome { .. } | EmailTemplate::TestMessage { .. } => {
+                FooterReason::Account
+            }
             EmailTemplate::Notification { category, .. } => match category {
                 Category::Security => FooterReason::Security,
                 other => FooterReason::Preference(*other),
@@ -1332,6 +1341,34 @@ impl EmailTemplate {
                 )),
                 ..Default::default()
             },
+            EmailTemplate::TestMessage {
+                username,
+                requested_at,
+            } => Content {
+                subject: l
+                    .pick(
+                        "Setlyst e-mail test",
+                        "Teste de e-mail do Setlyst",
+                        "Prueba de correo de Setlyst",
+                    )
+                    .into(),
+                heading: l
+                    .pick(
+                        "E-mail delivery works, {u}",
+                        "O envio de e-mails funciona, {u}",
+                        "El envío de correos funciona, {u}",
+                    )
+                    .replace("{u}", username),
+                paragraphs: vec![
+                    l.pick(
+                        "This message was requested from the staff console on {t} UTC to check that Setlyst can deliver e-mail. No action is needed.",
+                        "Esta mensagem foi solicitada no console da equipe em {t} UTC para verificar se o Setlyst consegue entregar e-mails. Nenhuma ação é necessária.",
+                        "Este mensaje se solicitó desde la consola del equipo el {t} UTC para comprobar que Setlyst puede entregar correos. No hace falta hacer nada.",
+                    )
+                    .replace("{t}", &requested_at.format("%Y-%m-%d %H:%M:%S").to_string()),
+                ],
+                ..Default::default()
+            },
             EmailTemplate::ReauthCode {
                 username,
                 code,
@@ -2024,6 +2061,10 @@ mod tests {
             },
             EmailTemplate::Welcome {
                 username: "ana".into(),
+            },
+            EmailTemplate::TestMessage {
+                username: "ana".into(),
+                requested_at: when,
             },
         ]
     }

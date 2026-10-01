@@ -110,6 +110,27 @@ pub mod actions {
     /// Staff opened private content (a song, a setlist, an account
     /// overview).
     pub const STAFF_CONTENT_VIEWED: &str = "staff.content_viewed";
+
+    // Platform operations.
+    /// Maintenance mode, sign-ups or blocked domains changed.
+    pub const PLATFORM_SETTINGS_UPDATED: &str = "settings.platform_updated";
+    pub const SUPPORT_TICKET_UPDATED: &str = "support.ticket_updated";
+    pub const SUPPORT_TICKET_REPLIED: &str = "support.ticket_replied";
+    pub const USER_NOTE_CREATED: &str = "user.note_created";
+    pub const USER_NOTE_UPDATED: &str = "user.note_updated";
+    pub const USER_NOTE_DELETED: &str = "user.note_deleted";
+    pub const INCIDENT_CREATED: &str = "incident.created";
+    pub const INCIDENT_UPDATED: &str = "incident.updated";
+    pub const INCIDENT_DELETED: &str = "incident.deleted";
+    pub const EMAIL_RETRIED: &str = "email.retried";
+    pub const EMAIL_CANCELED: &str = "email.canceled";
+    pub const EMAIL_TEST_SENT: &str = "email.test_sent";
+    /// A staff CSV export (users, audit log); `meta.kind` says which.
+    pub const STAFF_DATA_EXPORTED: &str = "staff.data_exported";
+    /// One staff action applied to several accounts; `meta.action`,
+    /// `meta.succeeded`, `meta.failed`. Each account also gets its own
+    /// entry.
+    pub const USER_BULK_ACTION: &str = "user.bulk_action";
 }
 
 /// Documents a consent can be given to (`legal_acceptances.document`).

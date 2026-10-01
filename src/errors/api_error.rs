@@ -151,6 +151,27 @@ pub mod codes {
     /// isn't authoritative for: sign in with the password and link Google
     /// from the account settings. 409.
     pub const ACCOUNT_LINK_REQUIRED: &str = "ACCOUNT_LINK_REQUIRED";
+
+    // Platform operations.
+    /// Maintenance mode is on: `meta.mode` (`read_only` or `full`),
+    /// `meta.message`, `meta.ends_at`. 503.
+    pub const MAINTENANCE_MODE: &str = "MAINTENANCE_MODE";
+    /// Sign-ups are closed (or maintenance is on). 403.
+    pub const REGISTRATION_CLOSED: &str = "REGISTRATION_CLOSED";
+    /// The address's domain can't be used for new addresses. 400.
+    pub const EMAIL_DOMAIN_BLOCKED: &str = "EMAIL_DOMAIN_BLOCKED";
+    /// Too many open support tickets, or too many opened today
+    /// (`meta.limit`, `meta.reason` = `open` or `daily`). 429.
+    pub const SUPPORT_TICKET_LIMIT: &str = "SUPPORT_TICKET_LIMIT";
+    /// The ticket is closed: no more replies. 409.
+    pub const TICKET_CLOSED: &str = "TICKET_CLOSED";
+    /// Only a resolved or closed ticket can be rated, once. 409.
+    pub const TICKET_NOT_RATEABLE: &str = "TICKET_NOT_RATEABLE";
+    /// The e-mail can't be sent again (it was delivered, is still queued,
+    /// or carried a one-time code that was wiped). 409.
+    pub const EMAIL_NOT_RETRYABLE: &str = "EMAIL_NOT_RETRYABLE";
+    /// No SMTP server is configured: nothing would be delivered. 409.
+    pub const EMAIL_NOT_CONFIGURED: &str = "EMAIL_NOT_CONFIGURED";
 }
 
 #[derive(Error, Debug)]
@@ -344,6 +365,42 @@ impl ApiError {
             StatusCode::CONFLICT,
             codes::ACCOUNT_LINK_REQUIRED,
             "An account with this e-mail already exists. Sign in with your password and link Google from your account settings.",
+        )
+    }
+
+    /// `MAINTENANCE_MODE` (503), with what clients show.
+    pub fn maintenance(maintenance: &crate::models::platform::MaintenanceSettings) -> Self {
+        Self::rule_with_meta(
+            StatusCode::SERVICE_UNAVAILABLE,
+            codes::MAINTENANCE_MODE,
+            match maintenance.mode {
+                crate::models::platform::MaintenanceMode::ReadOnly => {
+                    "Setlyst is in read-only mode for maintenance. Changes are paused for now."
+                }
+                _ => "Setlyst is down for maintenance. Please come back soon.",
+            },
+            json!({
+                "mode": maintenance.mode,
+                "message": maintenance.message,
+                "ends_at": maintenance.ends_at,
+                "retry_after_seconds": 60,
+            }),
+        )
+    }
+
+    pub fn registration_closed() -> Self {
+        Self::rule(
+            StatusCode::FORBIDDEN,
+            codes::REGISTRATION_CLOSED,
+            "New sign-ups are closed for now.",
+        )
+    }
+
+    pub fn email_domain_blocked() -> Self {
+        Self::rule(
+            StatusCode::BAD_REQUEST,
+            codes::EMAIL_DOMAIN_BLOCKED,
+            "Addresses from this e-mail provider can't be used. Please use another address.",
         )
     }
 

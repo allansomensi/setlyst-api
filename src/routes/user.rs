@@ -46,6 +46,7 @@ pub fn create_routes(state: AppState) -> Router {
         )
         .route("/me/security", get(account::get_security))
         .route("/me/data-export", get(account::export_personal_data))
+        .route("/me/sign-ins", get(account::list_my_sign_ins))
         .route("/me/sessions/revoke", post(account::revoke_my_sessions))
         .route(
             "/me/email/verification",

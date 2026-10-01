@@ -427,6 +427,7 @@ pub async fn start_email_change(
             "This is already your e-mail address.".into(),
         ));
     }
+    account::ensure_email_domain_allowed(&state, &new_email).await?;
     // No `EMAIL_TAKEN` here (it would tell anyone with a session which
     // addresses have an account): the owner of a taken address gets a
     // notice instead of the code, under the same limits, and the change
@@ -1334,4 +1335,41 @@ pub async fn delete_current_user(
         .await;
     info!(user_id = %user.id, "Account deleted by its owner");
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/users/me/sign-ins",
+    tags = ["Users"],
+    summary = "Recent sign-in attempts on the caller's account.",
+    description = "The last 50 sign-ins, failed attempts and lockouts of the last 90 days, newest first, with the address they came from (kept for six months), so the owner can spot access they don't recognize.",
+    security(("jwt_token" = [])),
+    responses((status = 200, description = "Sign-in activity.", body = [crate::models::console::SignInEvent]))
+)]
+pub async fn list_my_sign_ins(
+    State(state): State<AppState>,
+    access: AccessControl,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(
+        state.console_repo.sign_ins(access.user_id(), 50).await?,
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/users/{id}/sign-ins",
+    tags = ["Admin"],
+    summary = "Recent sign-in attempts on an account (admin).",
+    description = "Like `GET /users/me/sign-ins` for another account. Admin only (it shows network addresses).",
+    params(("id" = Uuid, Path, description = "User UUID")),
+    security(("jwt_token" = [])),
+    responses((status = 200, description = "Sign-in activity.", body = [crate::models::console::SignInEvent]))
+)]
+pub async fn list_user_sign_ins(
+    State(state): State<AppState>,
+    access: AccessControl,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    access.require_admin()?;
+    Ok(Json(state.console_repo.sign_ins(id, 100).await?))
 }

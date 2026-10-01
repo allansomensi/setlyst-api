@@ -87,9 +87,11 @@ pub const EXPORTED_USER_REFERENCES: &[&str] = &[
     "setlist_collaborators.user_id",
     "subscription_events.user_id",
     "subscriptions.user_id",
+    "support_tickets.user_id",
     "user_pins.user_id",
     "user_preferences.user_id",
     "user_quotas.user_id",
+    "user_staff_notes.user_id",
     "username_history.user_id",
     "verification_codes.user_id",
 ];
@@ -242,6 +244,14 @@ pub async fn personal_data(state: &AppState, user_id: Uuid) -> Result<Value, Api
         "announcements": rows(state,
             "SELECT announcement_id, seen_at, dismissed_at, acknowledged_at
              FROM announcement_receipts WHERE user_id = $1",
+            user_id).await?,
+        // The account's support requests with the public conversation
+        // (staff notes inside them are internal and left out).
+        "support_tickets": state.support_repo.export_for_user(user_id).await?,
+        // What the staff noted about the account (authors left out).
+        "staff_notes": rows(state,
+            "SELECT body, created_at, updated_at FROM user_staff_notes
+             WHERE user_id = $1 ORDER BY created_at",
             user_id).await?,
         // What the account did (with the address it came from) and what was
         // done to it; staff identities are left out.

@@ -141,7 +141,7 @@ async fn load_managed_target(
     path = "/api/v1/users",
     tags = ["Users"],
     summary = "List all users",
-    description = "Returns a paginated list of all users, optionally filtered by `q` (username, email or name). Requires Admin or Moderator role.",
+    description = "Returns a paginated list of all users, optionally filtered by `q` (username, email or name), `role`, `state` (`active`, `inactive`, `banned`), `verified`, `two_factor` and sign-up date (`created_from`, `created_to`), sorted by `sort` (`username`, `newest`, `oldest`, `last_login`). Requires Admin or Moderator role.",
     security(("jwt_token" = [])),
     params(UserListQuery),
     responses(
@@ -161,7 +161,6 @@ pub async fn find_all_users(
         per_page: query.per_page,
     }
     .resolve();
-    let search = query.search_pattern();
     // Searching accounts (by e-mail, names) is staff access to personal
     // data: recorded, with the search masked when it is an address.
     if let Some(q) = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
@@ -175,7 +174,7 @@ pub async fn find_all_users(
 
     let (users, total_items) = state
         .user_repo
-        .find_all(page, per_page, search.as_deref())
+        .find_all(page, per_page, &query.filter())
         .await?;
     Ok(Json(PaginatedResponse::new(
         users,

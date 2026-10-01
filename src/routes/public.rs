@@ -1,4 +1,7 @@
-use crate::{controllers::public, database::AppState};
+use crate::{
+    controllers::{incident, platform, public},
+    database::AppState,
+};
 use axum::{
     Router,
     routing::{get, post},
@@ -26,6 +29,8 @@ pub fn create_routes(state: AppState) -> Router {
         .route("/public/billing", get(public::billing_mode))
         .route("/public/plans", get(public::list_plans))
         .route("/public/release-notes", get(public::list_release_notes))
+        .route("/public/platform", get(platform::public_status))
+        .route("/public/incidents", get(incident::public_incidents))
         .merge(unsubscribe_routes)
         .with_state(state)
 }

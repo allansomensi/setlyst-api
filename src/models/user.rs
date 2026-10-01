@@ -864,6 +864,20 @@ pub struct UserListQuery {
     pub per_page: Option<i64>,
     /// Case-insensitive search over username, email and names.
     pub q: Option<String>,
+    /// Only accounts with this platform role.
+    pub role: Option<Role>,
+    /// `active`, `inactive` (deactivated) or `banned` (suspended now).
+    pub state: Option<String>,
+    /// Only accounts whose e-mail is (`true`) or isn't verified.
+    pub verified: Option<bool>,
+    /// Only accounts with (`true`) or without two-factor authentication.
+    pub two_factor: Option<bool>,
+    /// Only accounts created at or after this instant (UTC).
+    pub created_from: Option<NaiveDateTime>,
+    /// Only accounts created before this instant (UTC, exclusive).
+    pub created_to: Option<NaiveDateTime>,
+    /// `username` (default), `newest`, `oldest` or `last_login`.
+    pub sort: Option<String>,
 }
 
 impl UserListQuery {
@@ -875,4 +889,41 @@ impl UserListQuery {
         }
         .search_pattern()
     }
+
+    /// The filters as the repository takes them.
+    pub fn filter(&self) -> UserListFilter {
+        UserListFilter {
+            search: self.search_pattern(),
+            role: self.role.clone(),
+            state: self
+                .state
+                .as_deref()
+                .filter(|s| ["active", "inactive", "banned"].contains(s))
+                .map(str::to_string),
+            verified: self.verified,
+            two_factor: self.two_factor,
+            created_from: self.created_from,
+            created_to: self.created_to,
+            sort: self
+                .sort
+                .as_deref()
+                .filter(|s| ["username", "newest", "oldest", "last_login"].contains(s))
+                .unwrap_or("username")
+                .to_string(),
+        }
+    }
+}
+
+/// Filters of the staff user list (and its CSV export).
+#[derive(Debug, Clone, Default)]
+pub struct UserListFilter {
+    /// Escaped `ILIKE` pattern.
+    pub search: Option<String>,
+    pub role: Option<Role>,
+    pub state: Option<String>,
+    pub verified: Option<bool>,
+    pub two_factor: Option<bool>,
+    pub created_from: Option<NaiveDateTime>,
+    pub created_to: Option<NaiveDateTime>,
+    pub sort: String,
 }

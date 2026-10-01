@@ -37,6 +37,8 @@ Built with Rust for reliability and performance, using Axum, SQLx, and PostgreSQ
 - **Transactional e-mail** — Localized (`en`, `pt-BR`, `es`) templates delivered through an outbox and a background worker (SMTP via `lettre`), with per-category communication preferences and one-click unsubscribe links
 - **Announcements & release notes** — Staff-published announcements (modal, banner, notification, e-mail) targeted by role, plan and language, and editable "What's new" notes
 - **Plans & billing** — Plans with feature flags and limits (enforced only when switched on), trials, promo codes, promotions, credits, referral rewards and complimentary grants; card subscriptions through Stripe Checkout, with in-place plan changes and the Stripe billing portal
+- **Support desk** — Accounts open support requests from the app (categories, priorities, limits) and follow the conversation; staff answer from an inbox with assignment, internal notes, status workflow, satisfaction ratings and response-time metrics. Replies notify the requester in the app and by e-mail
+- **Platform operations** — Maintenance mode (`read_only` or `full`, staff are never locked out), closing sign-ups, blocked e-mail domains, status-page incidents and scheduled maintenance with a public timeline, an e-mail delivery console (outbox, failures, retry, test message), internal staff notes on accounts, a console overview and unified search, CSV exports of accounts and the audit log, bulk account actions and sign-in activity for every account
 - **Moderation** — Automatic checks of usernames, avatars and band logos (word list, blocked domains, optional image classification), user reports and a staff queue
 - **Rate Limiting** — Per-client-IP rate limiting (trusted-proxy aware) on sign-in, password recovery, Google sign-in and globally across all endpoints
 - **OpenAPI / Swagger UI** — Interactive API documentation available at `/swagger-ui`
@@ -185,11 +187,12 @@ Full interactive documentation is available via Swagger UI at `/swagger-ui` when
 | Metrics | `/api/v1/metrics` | User and admin dashboard metrics |
 | Backup | `/api/v1/backup` | Data export and import |
 | Status | `/api/v1/status` | Overall health, cached 10 s (version and details for staff at `/status/details`) |
-| Public | `/api/v1/public` | Legal version, plans, release notes, e-mail unsubscribe |
+| Public | `/api/v1/public` | Legal version, plans, release notes, platform state (maintenance, sign-ups), status incidents, e-mail unsubscribe |
+| Support | `/api/v1/support` | The caller's support requests (open, reply, close, rate) |
 | Billing | `/api/v1/billing` | The caller's plan, credits, promo codes, referrals, checkout, plan changes, the 7-day withdrawal and the billing portal |
 | Webhooks | `/api/v1/webhooks` | Stripe events (signature-verified, no auth) |
 | Announcements | `/api/v1/announcements` | Announcements for the caller |
-| Admin | `/api/v1/admin` | Staff console (content, audit log, limits, announcements, release notes, plans, promo codes, moderation) |
+| Admin | `/api/v1/admin` | Staff console (overview, search, content, audit log, limits, platform switches, support inbox, staff notes, incidents, e-mail console, CSV exports, bulk actions, announcements, release notes, plans, promo codes, moderation) |
 | Health | `/api/v1/health` | API health without touching the database — use it for the load balancer's health check |
 
 ### Authentication
@@ -260,6 +263,10 @@ Size limits: at most 200 items, and a songbook of at most 250 000 characters of 
 - **Beta and access tiers** — while `billing.enforced` is off (`/admin/billing/settings`, "Enforce plans"), the platform is in its beta: every verified account has every feature within the platform defaults (`GET /public/billing` tells clients). Switching it on ends the beta: accounts on a plan follow the plan; accounts without one get the free tier (1 band, no tours, public links, PDF or report exports). Either way, accounts that haven't verified their e-mail get very small limits and no paid features, and the sign-up trial only starts once the e-mail is verified. Admins and moderators have every feature, no quotas, and can't subscribe (`STAFF_CANNOT_SUBSCRIBE`).
 - **Public links** can be taken down by staff (`/admin/{setlists,gigs}/{id}/share/revoke`); the owner is notified and can't re-share until unlocked.
 - **Audit log** (`/admin/audit-logs`) records who did what, when and from where. Records also carry `updated_by` for "last modified by".
+- **Maintenance mode** (`/admin/settings/platform`): `read_only` refuses every change from non-staff accounts, `full` refuses everything (sign-in included); both answer `MAINTENANCE_MODE` (503, `Retry-After`) and close sign-ups. `registrations_open: false` closes sign-ups only (`REGISTRATION_CLOSED`), and `blocked_email_domains` keeps new addresses off those domains (`EMAIL_DOMAIN_BLOCKED`). Clients read the state at `GET /public/platform`. Changes apply at once on the instance that saved them and within 5 seconds on the others.
+- **Support** — at most 5 requests open per account and 10 opened a day (`SUPPORT_TICKET_LIMIT`). Resolved requests nobody came back to are closed after 14 days. Requests (without internal notes) and staff notes on the account are part of the personal data export.
+- **Incidents** published from `/admin/incidents` appear on `GET /public/incidents` (unresolved, and resolved in the last 30 days).
+- **Exports** — `/admin/users/export` and `/admin/audit-logs/export` (admins) take the list filters and return up to 50 000 rows as CSV, formula-safe; every export is audited.
 - **Errors** carry a stable machine-readable `code` (see `src/errors/api_error.rs`) for clients to translate.
 
 ---

@@ -3,7 +3,7 @@ use crate::{
     errors::api_error::{ApiError, codes},
     models::user::{
         BandInCommon, CreateUserPayload, ProfileUpdate, Role, Status, UpdateUserPayload, User,
-        UserPublic, UsernameHistoryEntry, clearable,
+        UserListFilter, UserPublic, UsernameHistoryEntry, clearable,
     },
     utils::{codes::referral_code, hashing::hash_password},
 };
@@ -145,34 +145,53 @@ async fn release_username(
 
 /// Optional case-insensitive search over the account's names; `$n` is a
 /// nullable, already-escaped `ILIKE` pattern.
-macro_rules! user_search_filter {
-    ($param:literal) => {
-        concat!(
-            "(",
-            $param,
-            "::text IS NULL OR u.username ILIKE ",
-            $param,
-            " OR u.email ILIKE ",
-            $param,
-            " OR u.first_name ILIKE ",
-            $param,
-            " OR u.last_name ILIKE ",
-            $param,
-            ")"
-        )
+/// The staff list's filters, `$1` to `$8`: search pattern, role, state
+/// (`active`, `inactive`, `banned`), verified, two-factor, created from,
+/// created to.
+macro_rules! user_list_filter {
+    () => {
+        "($1::text IS NULL OR u.username ILIKE $1 OR u.email ILIKE $1
+              OR u.first_name ILIKE $1 OR u.last_name ILIKE $1)
+         AND ($2::user_role IS NULL OR u.role = $2)
+         AND (CASE $3::text
+                WHEN 'active' THEN u.status = 'active'
+                    AND NOT (u.banned_at IS NOT NULL AND (u.banned_until IS NULL OR u.banned_until > (NOW() AT TIME ZONE 'utc')))
+                WHEN 'inactive' THEN u.status = 'inactive'
+                WHEN 'banned' THEN u.banned_at IS NOT NULL
+                    AND (u.banned_until IS NULL OR u.banned_until > (NOW() AT TIME ZONE 'utc'))
+                ELSE TRUE END)
+         AND ($4::boolean IS NULL OR (u.email_verified_at IS NOT NULL AND u.email IS NOT NULL) = $4)
+         AND ($5::boolean IS NULL OR (u.totp_enabled_at IS NOT NULL AND u.totp_secret_enc IS NOT NULL) = $5)
+         AND ($6::timestamp IS NULL OR u.created_at >= $6)
+         AND ($7::timestamp IS NULL OR u.created_at < $7)"
+    };
+}
+
+/// The staff list's order (`$8`).
+macro_rules! user_list_order {
+    () => {
+        " ORDER BY CASE WHEN $8 = 'newest' THEN u.created_at END DESC NULLS LAST,
+                   CASE WHEN $8 = 'oldest' THEN u.created_at END ASC NULLS LAST,
+                   CASE WHEN $8 = 'last_login' THEN u.last_login_at END DESC NULLS LAST,
+                   LOWER(u.username) ASC, u.id"
     };
 }
 
 #[async_trait::async_trait]
 pub trait UserRepository: Send + Sync {
-    /// `search` is an escaped `ILIKE` pattern matched against username,
-    /// email and names.
+    /// The staff list: one page of the accounts matching `filter`.
     async fn find_all(
         &self,
         page: i64,
         size: i64,
-        search: Option<&str>,
+        filter: &UserListFilter,
     ) -> Result<(Vec<UserPublic>, i64), ApiError>;
+    /// Every account matching `filter`, up to `limit` (CSV export).
+    async fn export(
+        &self,
+        filter: &UserListFilter,
+        limit: i64,
+    ) -> Result<Vec<UserPublic>, ApiError>;
     async fn find_by_id(&self, id: Uuid) -> Result<Option<UserPublic>, ApiError>;
     /// Full account row (with secrets) by username, case-insensitively.
     async fn find_by_username(&self, username: &str) -> Result<Option<User>, ApiError>;
@@ -454,29 +473,69 @@ impl UserRepository for UserRepositoryImpl {
         &self,
         page: i64,
         size: i64,
-        search: Option<&str>,
+        filter: &UserListFilter,
     ) -> Result<(Vec<UserPublic>, i64), ApiError> {
         let offset = (page - 1) * size;
         let count = sqlx::query_scalar(concat!(
             "SELECT COUNT(*) FROM users u WHERE ",
-            user_search_filter!("$1")
+            user_list_filter!()
         ))
-        .bind(search)
+        .bind(filter.search.as_deref())
+        .bind(filter.role.clone())
+        .bind(filter.state.as_deref())
+        .bind(filter.verified)
+        .bind(filter.two_factor)
+        .bind(filter.created_from)
+        .bind(filter.created_to)
         .fetch_one(&self.db);
         let users = sqlx::query_as::<_, UserPublic>(concat!(
             "SELECT ",
             user_public_columns!(),
             " FROM users u WHERE ",
-            user_search_filter!("$3"),
-            " ORDER BY LOWER(u.username) ASC LIMIT $1 OFFSET $2"
+            user_list_filter!(),
+            user_list_order!(),
+            " LIMIT $9 OFFSET $10"
         ))
+        .bind(filter.search.as_deref())
+        .bind(filter.role.clone())
+        .bind(filter.state.as_deref())
+        .bind(filter.verified)
+        .bind(filter.two_factor)
+        .bind(filter.created_from)
+        .bind(filter.created_to)
+        .bind(&filter.sort)
         .bind(size)
         .bind(offset)
-        .bind(search)
         .fetch_all(&self.db);
 
         let (count, users) = tokio::try_join!(count, users)?;
         Ok((users, count))
+    }
+
+    async fn export(
+        &self,
+        filter: &UserListFilter,
+        limit: i64,
+    ) -> Result<Vec<UserPublic>, ApiError> {
+        Ok(sqlx::query_as::<_, UserPublic>(concat!(
+            "SELECT ",
+            user_public_columns!(),
+            " FROM users u WHERE ",
+            user_list_filter!(),
+            user_list_order!(),
+            " LIMIT $9"
+        ))
+        .bind(filter.search.as_deref())
+        .bind(filter.role.clone())
+        .bind(filter.state.as_deref())
+        .bind(filter.verified)
+        .bind(filter.two_factor)
+        .bind(filter.created_from)
+        .bind(filter.created_to)
+        .bind(&filter.sort)
+        .bind(limit)
+        .fetch_all(&self.db)
+        .await?)
     }
 
     async fn find_by_id(&self, id: Uuid) -> Result<Option<UserPublic>, ApiError> {

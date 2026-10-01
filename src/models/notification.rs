@@ -49,6 +49,8 @@ pub enum NotificationType {
     SecurityAlert,
     /// Someone invited the recipient to collaborate on their setlist.
     SetlistInvitation,
+    /// The support team replied to one of the recipient's tickets.
+    SupportReply,
 }
 
 impl NotificationType {
@@ -67,7 +69,8 @@ impl NotificationType {
             | NotificationType::ModerationAction
             | NotificationType::SubscriptionChanged
             | NotificationType::TrialEnding
-            | NotificationType::CreditsGranted => Category::Account,
+            | NotificationType::CreditsGranted
+            | NotificationType::SupportReply => Category::Account,
             NotificationType::Announcement => Category::Announcements,
             NotificationType::ReleasePublished => Category::ProductUpdates,
             NotificationType::SecurityAlert => Category::Security,
@@ -91,6 +94,7 @@ impl NotificationType {
             NotificationType::CreditsGranted => "credits_granted",
             NotificationType::SecurityAlert => "security_alert",
             NotificationType::SetlistInvitation => "setlist_invitation",
+            NotificationType::SupportReply => "support_reply",
         }
     }
 }
@@ -305,6 +309,18 @@ impl Notification {
 
     /// `event` is `two_factor_enabled`, `two_factor_disabled`,
     /// `email_changed`, `password_changed` or `recovery_codes_regenerated`.
+    pub fn support_reply(user_id: Uuid, ticket_id: Uuid, number: i64, subject: &str) -> Self {
+        Self::new(
+            user_id,
+            NotificationType::SupportReply,
+            json!({
+                "ticket_id": ticket_id,
+                "ticket_number": number,
+                "subject": subject,
+            }),
+        )
+    }
+
     pub fn security_alert(user_id: Uuid, event: &str) -> Self {
         Self::new(
             user_id,

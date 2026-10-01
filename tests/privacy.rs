@@ -217,6 +217,16 @@ async fn every_reference_to_an_account_is_exported_or_excluded_on_purpose() {
         "login_failures.user_id",
         "reauth_attempts.user_id",
         "verification_code_requests.user_id",
+        // Support: the account's own messages are exported with its
+        // tickets (`support_tickets`); staff replies and assignments are
+        // the staff member's work, not the account's data.
+        "support_messages.author_id",
+        "support_tickets.assignee_id",
+        // Staff writing notes about accounts, and status page incidents:
+        // platform operations, not the author's personal data.
+        "user_staff_notes.author_id",
+        "status_incidents.created_by",
+        "status_incident_updates.author_id",
         // Provider references for Checkout pages, expired within a day;
         // the resulting subscription and payments are exported.
         "checkout_sessions.user_id",

@@ -20,6 +20,14 @@ fn s<'a>(data: &'a Value, key: &str) -> &'a str {
     data.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 
+/// A numeric field as text (`"?"` when missing).
+fn number(data: &Value, key: &str) -> String {
+    data[key]
+        .as_i64()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".into())
+}
+
 fn band_role(l: Locale, role: &str) -> String {
     match role {
         "owner" => l.pick("Lead", "Responsável", "Responsable"),
@@ -213,6 +221,23 @@ pub fn describe(kind: NotificationType, data: &Value, l: Locale) -> Notification
                 .replace("{r}", &collaborator_role(l, s(data, "role")))],
             cta_path: Some("/dashboard/setlists".into()),
         },
+        NotificationType::SupportReply => NotificationText {
+            title: l
+                .pick(
+                    "New reply to your support request #{n}",
+                    "Nova resposta ao seu chamado #{n}",
+                    "Nueva respuesta a tu solicitud de soporte #{n}",
+                )
+                .replace("{n}", &number(data, "ticket_number")),
+            lines: vec![l
+                .pick(
+                    "The Setlyst team answered \"{t}\". Open the request to read the reply and continue the conversation.",
+                    "A equipe do Setlyst respondeu \"{t}\". Abra o chamado para ler a resposta e continuar a conversa.",
+                    "El equipo de Setlyst respondió \"{t}\". Abre la solicitud para leer la respuesta y continuar la conversación.",
+                )
+                .replace("{t}", s(data, "subject"))],
+            cta_path: Some(format!("/dashboard/support/{}", s(data, "ticket_id"))),
+        },
         NotificationType::BandSuggestionCreated => NotificationText {
             title: l
                 .pick(
@@ -389,7 +414,8 @@ mod tests {
             "role": "member", "kind": "setlist", "title": "Sexta", "reason": "spam",
             "song_title": "Garota", "suggested_by": "ana", "status": "accepted",
             "action": "avatar_removed", "note": "n", "amount": 50, "version": "0.12.0",
-            "setlist_title": "Show do Beto", "invited_by": "beto"
+            "setlist_title": "Show do Beto", "invited_by": "beto",
+            "ticket_id": "t1", "ticket_number": 1042, "subject": "Login"
         });
         for kind in [
             NotificationType::BandRoleChanged,
@@ -407,6 +433,7 @@ mod tests {
             NotificationType::CreditsGranted,
             NotificationType::SecurityAlert,
             NotificationType::SetlistInvitation,
+            NotificationType::SupportReply,
         ] {
             for locale in Locale::ALL {
                 let text = describe(kind, &data, locale);

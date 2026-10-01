@@ -471,6 +471,7 @@ pub async fn register(
     };
 
     payload.validate()?;
+    account::ensure_sign_up_allowed(&state, &email).await?;
 
     if !payload.accept_terms {
         return Err(ApiError::rule(
@@ -949,6 +950,7 @@ pub async fn google_sign_in(
         // ownership and must not cost another account its address. Such a
         // sign-in gets the same answer as for a verified account: sign in
         // with the password (or recover it through the mailbox) and link.
+        account::ensure_sign_up_allowed(&state, &identity.email).await?;
         if !identity.is_authoritative_for_email() {
             return Err(ApiError::account_link_required());
         }
@@ -974,6 +976,7 @@ pub async fn google_sign_in(
     }
 
     // 3. A new account.
+    account::ensure_sign_up_allowed(&state, &identity.email).await?;
     if !payload.accept_terms || !payload.age_confirmed {
         return Err(signup_consent_error(&payload, &identity));
     }

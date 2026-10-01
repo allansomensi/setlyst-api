@@ -87,6 +87,7 @@ pub mod public;
 pub mod setlist;
 pub mod song;
 pub mod status;
+pub mod support;
 pub mod swagger;
 pub mod tour;
 pub mod trash;
@@ -155,6 +156,7 @@ fn protected_routes(state: AppState) -> Router {
         .nest("/announcements", announcement::create_routes(state.clone()))
         .nest("/tours", tour::create_routes(state.clone()))
         .nest("/trash", trash::create_routes(state.clone()))
+        .nest("/support", support::create_routes(state.clone()))
         .nest("/users/me/pins", pin::create_routes(state.clone()))
         // Authenticated answers are per-user: never let a browser, proxy
         // or service worker keep a copy.

@@ -18,6 +18,7 @@ use crate::{
         auth::{LoginResponse, TwoFactorChallengeResponse},
         communication::{Category, ChannelPrefs, CommunicationPreferences},
         notification::Notification,
+        platform::MaintenanceMode,
         security::{CodeSentResponse, VerificationCode, VerificationPurpose},
         user::{MAX_EMAIL_LENGTH, User, canonical_email},
         user_preferences::SUPPORTED_LANGUAGES,
@@ -252,6 +253,42 @@ pub fn decrypt_totp_secret(user_id: Uuid, stored: &str) -> Result<Vec<u8>, ApiEr
     })
 }
 
+/// Refuses a sign-in (or its second step) while maintenance mode shuts
+/// the platform to everyone but staff.
+pub async fn ensure_sign_in_allowed(state: &AppState, user: &User) -> Result<(), ApiError> {
+    if user.role.is_staff() {
+        return Ok(());
+    }
+    let platform = state.platform_repo.get().await?;
+    if platform.maintenance.mode == MaintenanceMode::Full {
+        return Err(ApiError::maintenance(&platform.maintenance));
+    }
+    Ok(())
+}
+
+/// Refuses a new account while maintenance is on (`MAINTENANCE_MODE`) or
+/// sign-ups are closed (`REGISTRATION_CLOSED`), and an address whose
+/// domain is blocked (`EMAIL_DOMAIN_BLOCKED`).
+pub async fn ensure_sign_up_allowed(state: &AppState, email: &str) -> Result<(), ApiError> {
+    let platform = state.platform_repo.get().await?;
+    if platform.maintenance.mode != MaintenanceMode::Off {
+        return Err(ApiError::maintenance(&platform.maintenance));
+    }
+    if !platform.registrations_open {
+        return Err(ApiError::registration_closed());
+    }
+    ensure_email_domain_allowed(state, email).await
+}
+
+/// Refuses an address whose domain is blocked (`EMAIL_DOMAIN_BLOCKED`).
+/// For addresses being added to an account, never for existing ones.
+pub async fn ensure_email_domain_allowed(state: &AppState, email: &str) -> Result<(), ApiError> {
+    if state.platform_repo.get().await?.is_email_blocked(email) {
+        return Err(ApiError::email_domain_blocked());
+    }
+    Ok(())
+}
+
 /// Signs `user` in: resets the failure counters (of the account and of
 /// the network the sign-in came from), records the login and issues the
 /// session token. `method` (`password`, `google`, `two_factor`) and `ip`
@@ -264,6 +301,7 @@ pub async fn issue_session(
     method: &str,
     ip: &Option<String>,
 ) -> Result<LoginResponse, ApiError> {
+    ensure_sign_in_allowed(state, user).await?;
     state
         .user_repo
         .reset_login_failures(user.id, Some(&ip_bucket(ip.as_deref())))
@@ -298,6 +336,7 @@ pub async fn create_challenge(
     ip: Option<&str>,
     pending_link: Option<(&str, &str)>,
 ) -> Result<TwoFactorChallengeResponse, ApiError> {
+    ensure_sign_in_allowed(state, user).await?;
     let token = random_token(32);
     let expires_at = now() + Duration::minutes(CHALLENGE_TTL_MINUTES);
     state

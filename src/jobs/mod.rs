@@ -272,6 +272,27 @@ pub fn spawn_all(state: AppState) {
         );
     }
 
+    // Resolved support requests nobody came back to are closed (daily).
+    {
+        let state = state.clone();
+        every(
+            "support_housekeeping",
+            StdDuration::from_secs(24 * 3600),
+            StdDuration::from_secs(9 * 60),
+            move || {
+                let state = state.clone();
+                async move {
+                    state
+                        .support_repo
+                        .close_stale_resolved(
+                            crate::controllers::support::RESOLVED_TICKET_CLOSE_DAYS,
+                        )
+                        .await
+                }
+            },
+        );
+    }
+
     info!("Background jobs started");
     accounts::spawn(state);
 }
