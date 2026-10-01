@@ -393,7 +393,9 @@ async fn release_notes_drafts_publication_and_edits() {
         "version": "0.13.0",
         "title": { "en": "Tours and more", "pt-BR": "Turnês e mais" },
         "items": [{ "kind": "new", "text": { "en": "Plan tours.", "pt-BR": "Planeje turnês." } }],
-        "released_on": "2026-09-30"
+        // v0.12 is dated the day the migrations ran: the same day, so
+        // this one (created after it) lists first.
+        "released_on": chrono::Utc::now().date_naive(),
     });
     let by_moderator = app
         .post("/admin/release-notes", &moderator, body.clone())
